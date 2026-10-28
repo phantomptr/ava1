@@ -126,11 +126,12 @@ fn an_extension_builds_on_the_core_and_cannot_redefine_it() {
                [[struct]]\nname = \"AppEcho\"\nfields = [{ name = \"text\", ty = \"str\" }]\n";
     let out =
         ava1_gen::extension_outputs(ext, &t, Path::new("app_gen.rs"), Path::new("gen")).unwrap();
-    let names: Vec<String> = out.iter().map(|(p, _)| p.display().to_string()).collect();
-    assert_eq!(
-        names,
-        ["app_gen.rs", "gen/ava1_app_gen.h", "gen/ava1_app_gen.c"]
+    let paths: Vec<&Path> = out.iter().map(|(p, _)| p.as_path()).collect();
+    let (h, c) = (
+        Path::new("gen").join("ava1_app_gen.h"),
+        Path::new("gen").join("ava1_app_gen.c"),
     );
+    assert_eq!(paths, [Path::new("app_gen.rs"), h.as_path(), c.as_path()]);
     let (rs, h, c) = (&out[0].1, &out[1].1, &out[2].1);
     assert!(rs.contains("use ava1::wire::") && rs.contains("pub mod conformance"));
     assert!(h.contains("#include \"ava1_gen.h\"") && h.contains("AVA1_APP_GEN_H"));

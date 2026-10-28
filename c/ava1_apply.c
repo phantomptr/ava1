@@ -791,8 +791,10 @@ static int lfile_open_fds(ava1_job_t *j, uint32_t id, int create, int *fdp, int 
             close(fd);
             return err;
         }
-        if (fstat(ob, &st) == 0 && (uint64_t)st.st_size < groups_of(e->size) * 32u)
-            (void)ftruncate(ob, (off_t)(groups_of(e->size) * 32u));
+        /* Best effort: a short outboard is grown again when its groups are written. */
+        if (fstat(ob, &st) == 0 && (uint64_t)st.st_size < groups_of(e->size) * 32u &&
+            ftruncate(ob, (off_t)(groups_of(e->size) * 32u)) != 0) {
+        }
     }
     *fdp = fd;
     *obp = ob;
@@ -1587,10 +1589,14 @@ static int reread_ranges(const chk_t *c, const ava1_file_range_t *rg, uint64_t s
     for (r = c->rg_first; r < c->rg_first + c->rg_n && !rc; r++) {
         uint64_t g, end = rg[r].offset + rg[r].len;
         for (g = rg[r].offset / AVA1_GROUP_LEN; g * AVA1_GROUP_LEN < end && !rc; g++) {
-            uint64_t gs = g * AVA1_GROUP_LEN, glen = size - gs < AVA1_GROUP_LEN ? size - gs : AVA1_GROUP_LEN, got = 0;
+            uint64_t gs = g * AVA1_GROUP_LEN, glen, got = 0;
             uint8_t cv[32], want[32];
+            if (gs >= size) break; /* a range never runs past the file; says so to the compiler too */
+            glen = size - gs < AVA1_GROUP_LEN ? size - gs : AVA1_GROUP_LEN;
             while (got < glen) {
-                ssize_t k = pread(c->fd, buf + got, (size_t)(glen - got), (off_t)(gs + got));
+                /* glen <= AVA1_GROUP_LEN, so this is glen - got; the bound is for the compiler. */
+                size_t room = AVA1_GROUP_LEN - (size_t)got, want = (size_t)(glen - got);
+                ssize_t k = pread(c->fd, buf + got, want < room ? want : room, (off_t)(gs + got));
                 if (k < 0 && errno == EINTR) continue;
                 if (k <= 0) {
                     rc = k < 0 ? errno : EIO;
@@ -2821,8 +2827,9 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     pthread_mutex_unlock(&j->mu);
     if (lf->ob_fd >= 0) {
         uint64_t n = groups_of(j->m.e[id].size) * 32u;
-        (void)ftruncate(lf->ob_fd, 0);
-        (void)ftruncate(lf->ob_fd, (off_t)n);
+        /* Best effort: the outboard is rewritten with the file's next bytes either way. */
+        if (ftruncate(lf->ob_fd, 0) != 0 || ftruncate(lf->ob_fd, (off_t)n) != 0) {
+        }
     }
     if (reason) emit_retry(j, id, reason);
 }

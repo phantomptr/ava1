@@ -450,7 +450,8 @@ static int gc_strike(const char *dir, const struct stat *st, int64_t now_unix) {
     if (n == 0 || (pboot != boot && now_unix - pstamp >= AVA1_GC_STRIKE_SPACING_S)) {
         n++;
         k = snprintf(buf, sizeof buf, "%d %llu %lld", n, (unsigned long long)boot, (long long)now_unix);
-        if (lseek(fd, 0, SEEK_SET) == 0 && ftruncate(fd, 0) == 0) (void)write(fd, buf, (size_t)k);
+        if (lseek(fd, 0, SEEK_SET) == 0 && ftruncate(fd, 0) == 0 && write(fd, buf, (size_t)k) != k) {
+        }
     }
     close(fd);
     {
