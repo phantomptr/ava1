@@ -4025,8 +4025,10 @@ mod tests {
             );
         // Deterministic failure: wait until a reader is parked on the read-ahead budget
         // — its reads stop advancing while it still holds its source session — and only
-        // then let the opener fail, so the failure lands with a reader parked.
-        tokio::time::timeout(Duration::from_secs(30), async {
+        // then let the opener fail, so the failure lands with a reader parked. Filling the
+        // 96 MiB budget from the slow source takes ~10 s on a fast machine and more than 30 s
+        // on a 3-core CI runner running the whole suite: the bound is generous on purpose.
+        tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 let a = reads.load(Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(150)).await;
