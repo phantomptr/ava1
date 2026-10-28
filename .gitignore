@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+crates/ava1/fuzz/artifacts/
+crates/ava1/fuzz/corpus/
+crates/ava1/fuzz/coverage/
+
+# C builds (make lib, make fuzz-c)
+/build/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# Editors and OS clutter
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc

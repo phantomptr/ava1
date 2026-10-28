@@ -1,0 +1,767 @@
+# AVA1 core messages (SPEC.md §3). After editing: `cargo run -p ava1-gen`. Applications extend this
+# schema with their own (SPEC.md §7.3, ava1-gen --ext); see docs/extending.md.
+# Field types: u8 u16 u32 u64, b16 b32 (fixed bytes), bytes (u32 length), str (u16 length, UTF-8).
+# `ext` fields are optional and tagged; decoders skip unknown tags.
+
+[[const]]
+name = "PROTOCOL_VERSION"
+ty = "u16"
+value = 1
+[[const]]
+name = "DEFAULT_PORT"
+ty = "u16"
+value = 9120
+[[const]]
+name = "MAX_LANES"
+ty = "u8"
+value = 8
+[[const]]
+name = "METHOD_NODE_INFO"
+ty = "u16"
+value = 1
+[[const]]
+name = "METHOD_PAIRING_OPEN"
+ty = "u16"
+value = 2
+[[const]]
+name = "METHOD_CRYPTO_BENCH"
+ty = "u16"
+value = 3
+[[const]]
+name = "STATUS_OK"
+ty = "u16"
+value = 0
+[[const]]
+name = "ERR_NOT_PAIRED"
+ty = "u16"
+value = 1
+[[const]]
+name = "ERR_PAIRING_CLOSED"
+ty = "u16"
+value = 2
+[[const]]
+name = "ERR_UNSUPPORTED_VERSION"
+ty = "u16"
+value = 3
+[[const]]
+name = "ERR_PROTOCOL"
+ty = "u16"
+value = 4
+[[const]]
+name = "ERR_BAD_JOIN"
+ty = "u16"
+value = 5
+[[const]]
+name = "ERR_UNKNOWN_METHOD"
+ty = "u16"
+value = 6
+[[const]]
+name = "ERR_INTERNAL"
+ty = "u16"
+value = 7
+[[const]]
+name = "ERR_BUSY"
+ty = "u16"
+value = 8
+
+# Noise XX handshake messages (SPEC.md §5). `noise` is the raw Noise message; its
+# payload is the struct named in the comment, encoded with these same rules.
+[[message]]
+name = "Hs1"
+type = 0x01
+fields = [{ name = "noise", ty = "bytes" }]   # payload: HelloInfo (plaintext under XX)
+
+[[message]]
+name = "Hs2"
+type = 0x02
+fields = [{ name = "noise", ty = "bytes" }]   # payload: ServerInfo (encrypted)
+
+[[message]]
+name = "Hs3"
+type = 0x03
+fields = [{ name = "noise", ty = "bytes" }]   # payload: ClientInfo (encrypted)
+
+# First sealed frame from the server, after Hs3: under XX the server learns the
+# client's key only in message 3, so "do I know you" cannot travel earlier.
+# launch_proof: sent only to the key in this server's trust slot, when the slot also
+# carries a launch token (SPEC.md §5.2). Older clients skip it.
+[[message]]
+name = "Welcome"
+type = 0x04
+# nonce_s: the pairing-code reveal (SPEC.md §4.6): BLAKE2b-256(nonce_s) must equal the
+# pair_commit the server sent in ServerInfo. Required, so it cannot be stripped.
+fields = [{ name = "knows_you", ty = "u8" }, { name = "nonce_s", ty = "b16" }]
+ext = [{ tag = 1, name = "launch_proof", ty = "b16" }]
+
+# Pairing is a PAKE keyed by a random code that only the node's display shows (SPEC.md
+# §4.6, §5.5). The client sends PairPakeClient, the node answers PairPakeServer, then the
+# client proves it derived the same key with PairConfirm and the node answers PairResult.
+# y: a CPace public value, scalar * G with G derived from the handshake hash and the code.
+[[message]]
+name = "PairPakeClient"
+type = 0x0D
+fields = [{ name = "y", ty = "b32" }]
+
+[[message]]
+name = "PairPakeServer"
+type = 0x0E
+fields = [{ name = "y", ty = "b32" }]
+
+# mac: keyed BLAKE2b-256(key = K, "client" || h): the client's key confirmation. Required.
+[[message]]
+name = "PairConfirm"
+type = 0x05
+fields = [{ name = "mac", ty = "b32" }]
+
+# mac: keyed BLAKE2b-256(key = K, "server" || h) when accepted, else zero: the node's key
+# confirmation, which the client must check before it stores the node. Required.
+[[message]]
+name = "PairResult"
+type = 0x06
+fields = [{ name = "accepted", ty = "u8" }, { name = "mac", ty = "b32" }]
+
+# A data lane (SPEC.md §9). Both nonces are fresh random per join and feed the lane
+# keys, so no two joins of one lane id ever share a key (§4.3).
+[[message]]
+name = "Join"
+type = 0x07
+fields = [
+  { name = "session_id", ty = "b16" },
+  { name = "lane_id", ty = "u16" },
+  { name = "client_nonce", ty = "b16" },
+  { name = "tag", ty = "b16" },
+]
+
+[[message]]
+name = "JoinAck"
+type = 0x08
+fields = [
+  { name = "lane_id", ty = "u16" },
+  { name = "server_nonce", ty = "b16" },
+  { name = "tag", ty = "b16" },
+]
+
+[[message]]
+name = "Ping"
+type = 0x09
+fields = [
+  { name = "seq", ty = "u32" },
+  { name = "t_us", ty = "u64" },
+]
+
+[[message]]
+name = "Pong"
+type = 0x0A
+fields = [
+  { name = "seq", ty = "u32" },
+  { name = "t_us", ty = "u64" },
+]
+
+[[message]]
+name = "Error"
+type = 0x0B
+fields = [
+  { name = "code", ty = "u16" },
+  { name = "message", ty = "str" },
+]
+
+[[message]]
+name = "Bye"
+type = 0x0C
+fields = [{ name = "reason", ty = "u8" }]
+
+[[message]]
+name = "RpcRequest"
+type = 0x60
+fields = [
+  { name = "method", ty = "u16" },
+  { name = "body", ty = "bytes" },
+]
+
+[[message]]
+name = "RpcResponse"
+type = 0x61
+fields = [
+  { name = "status", ty = "u16" },
+  { name = "body", ty = "bytes" },
+]
+
+[[struct]]
+name = "NodeInfo"
+fields = [
+  { name = "version", ty = "str" },
+  { name = "platform", ty = "str" },
+  { name = "name", ty = "str" },
+]
+ext = [{ tag = 1, name = "firmware", ty = "str" }]
+
+[[struct]]
+name = "HelloInfo"
+fields = [
+  { name = "version_min", ty = "u16" },
+  { name = "version_max", ty = "u16" },
+  { name = "caps", ty = "u64" },
+]
+
+[[struct]]
+name = "ServerInfo"
+fields = [
+  { name = "version", ty = "u16" },
+  { name = "caps", ty = "u64" },
+  { name = "session_id", ty = "b16" },
+  { name = "pair_commit", ty = "b32" },   # BLAKE2b-256(nonce_s), revealed in Welcome (SPEC.md §4.6)
+]
+ext = [{ tag = 1, name = "name", ty = "str" }]
+
+[[struct]]
+name = "ClientInfo"
+fields = [{ name = "nonce_c", ty = "b16" }]   # the client's pairing-code contribution (SPEC.md §4.6)
+# token: a node sending to another one (SPEC.md §18) shows the ticket that node's
+# c2c.allow handed out; it admits that one key for that one job.
+ext = [{ tag = 1, name = "name", ty = "str" }, { tag = 2, name = "token", ty = "b16" }]
+
+[[struct]]
+name = "PairingOpen"
+fields = [{ name = "seconds", ty = "u16" }]
+
+[[struct]]
+name = "CryptoBench"
+fields = [{ name = "mib", ty = "u16" }]
+
+[[struct]]
+name = "CryptoBenchResult"
+fields = [
+  { name = "bytes", ty = "u64" },
+  { name = "micros", ty = "u64" },
+]
+# micros = sealing `bytes` as 1 MiB frames (ava1_seal); open_micros = opening them;
+# backend = the ChaCha20 path in use ("avx2" or "portable").
+ext = [
+  { tag = 1, name = "open_micros", ty = "u64" },
+  { tag = 2, name = "backend", ty = "str" },
+]
+
+# ── Data plane (SPEC.md §11–§16) ─────────────────────────────────────────────
+# Every data-plane message has `job_id` first: routers read body[0..16].
+
+[[const]]
+name = "CAP_DATA_PLANE"
+ty = "u64"
+value = 1
+[[const]]
+name = "CAP_MGMT"        # the node serves the management methods 4 and up (SPEC.md §7.3)
+ty = "u64"
+value = 2
+[[const]]
+name = "CAP_SHARED_JOBS" # any paired device reads and cancels a transfer and takes over a parked one (SPEC.md §18.5)
+ty = "u64"
+value = 4
+[[const]]
+name = "METHOD_JOB_COPY"
+ty = "u16"
+value = 16
+[[const]]
+name = "METHOD_JOB_STATUS"
+ty = "u16"
+value = 17
+[[const]]
+name = "METHOD_JOB_CANCEL"
+ty = "u16"
+value = 18
+[[const]]
+name = "METHOD_DISK_CALIBRATE"
+ty = "u16"
+value = 19
+[[const]]
+name = "METHOD_C2C_ALLOW"   # this console may receive one job from another console (SPEC.md §18)
+ty = "u16"
+value = 22
+[[const]]
+name = "METHOD_C2C_SEND"    # this console sends to another console, directly (SPEC.md §18)
+ty = "u16"
+value = 23
+[[const]]
+name = "ERR_PATH"
+ty = "u16"
+value = 9
+[[const]]
+name = "ERR_NO_SPACE"
+ty = "u16"
+value = 10
+[[const]]
+name = "ERR_UNKNOWN_JOB"
+ty = "u16"
+value = 11
+[[const]]
+name = "ERR_IO"
+ty = "u16"
+value = 12
+[[const]]
+name = "ERR_VERIFY"
+ty = "u16"
+value = 13
+[[const]]
+name = "ERR_EXISTS"
+ty = "u16"
+value = 14
+[[const]]
+name = "ERR_CANCELLED"
+ty = "u16"
+value = 15
+[[const]]
+name = "ERR_CROSS_DEVICE"
+ty = "u16"
+value = 16
+[[const]]
+name = "ERR_CREDIT"
+ty = "u16"
+value = 17
+[[const]]
+name = "ERR_STALLED"   # a receiver ended a job whose sender kept the link alive but sent no data
+ty = "u16"
+value = 18
+[[const]]
+name = "ERR_PAIRING_CODE"   # the pairing code typed in the app is not the console's (SPEC.md §5.5)
+ty = "u16"
+value = 19
+# Job kinds, as seen by the node that receives JobOpen.
+[[const]]
+name = "JOB_UPLOAD"     # it receives the files
+ty = "u8"
+value = 1
+[[const]]
+name = "JOB_DOWNLOAD"   # it sends the files
+ty = "u8"
+value = 2
+[[const]]
+name = "JOB_COPY"       # it copies src → root locally (job.copy RPC)
+ty = "u8"
+value = 3
+[[const]]
+name = "POLICY_REPLACE"
+ty = "u8"
+value = 0
+[[const]]
+name = "POLICY_SKIP_EXISTING"
+ty = "u8"
+value = 1
+[[const]]
+name = "POLICY_VERIFY"
+ty = "u8"
+value = 2
+[[const]]
+name = "JF_SINGLE_FILE"   # root is a file path; the manifest has one file entry
+ty = "u32"
+value = 1
+[[const]]
+name = "JF_ORDERED"       # the receiver consumes in file order (download to zip)
+ty = "u32"
+value = 2
+[[const]]
+name = "JF_UNSAFE_READ"   # read outside the writable roots (system files, read-only)
+ty = "u32"
+value = 4
+[[const]]
+name = "JF_MOVE"          # job.copy: delete the source after a verified copy
+ty = "u32"
+value = 8
+[[const]]
+name = "JF_OVERWRITE"     # job.copy: replace destination files that already exist
+ty = "u32"                # (the engine's overwrite option); unset = refuse with ERR_EXISTS
+value = 16
+[[const]]
+name = "ENTRY_FILE"
+ty = "u8"
+value = 0
+[[const]]
+name = "ENTRY_DIR"
+ty = "u8"
+value = 1
+[[const]]
+name = "GROUP_SHIFT"
+ty = "u8"
+value = 20
+# SPEC.md §12.2: a file of at least this many bytes is a large file (Chunks); smaller
+# files travel whole as BundleRecords. A protocol constant: both sides use it.
+[[const]]
+name = "LARGE_CUTOFF"
+ty = "u32"
+value = 262144
+[[const]]
+name = "BN_NONE"
+ty = "u8"
+value = 0
+[[const]]
+name = "BN_NETWORK"
+ty = "u8"
+value = 1
+[[const]]
+name = "BN_SOURCE"
+ty = "u8"
+value = 2
+[[const]]
+name = "BN_DISK"
+ty = "u8"
+value = 3
+[[const]]
+name = "BN_WORKERS"
+ty = "u8"
+value = 4
+[[const]]
+name = "BN_CREDIT"
+ty = "u8"
+value = 5
+[[const]]
+name = "RETRY_VERIFY"
+ty = "u16"
+value = 1
+[[const]]
+name = "RETRY_IO"
+ty = "u16"
+value = 2
+[[const]]
+name = "RETRY_CHANGED"
+ty = "u16"
+value = 3
+
+[[struct]]
+name = "ManifestEntry"
+fields = [
+  { name = "file_id", ty = "u32" },
+  { name = "kind", ty = "u8" },
+  { name = "mode", ty = "u32" },
+  { name = "size", ty = "u64" },
+  { name = "mtime", ty = "u64" },        # seconds since the Unix epoch
+  { name = "path", ty = "str" },         # relative, '/'-separated (SPEC.md §11.2)
+]
+ext = [{ tag = 1, name = "root", ty = "b32" }]   # policy verify only
+
+[[struct]]
+name = "FileRun"            # files first..first+count are complete
+fields = [{ name = "first", ty = "u32" }, { name = "count", ty = "u32" }]
+
+[[struct]]
+name = "FileRange"          # bytes offset..offset+len of a file
+fields = [{ name = "file_id", ty = "u32" }, { name = "offset", ty = "u64" }, { name = "len", ty = "u64" }]
+
+[[struct]]
+name = "BundleRecord"       # one whole small file
+fields = [{ name = "file_id", ty = "u32" }, { name = "root", ty = "b32" }, { name = "data", ty = "bytes" }]
+
+[[struct]]
+name = "RootItem"
+fields = [{ name = "file_id", ty = "u32" }, { name = "root", ty = "b32" }]
+
+[[message]]
+name = "JobOpen"
+type = 0x20
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "kind", ty = "u8" },
+  { name = "policy", ty = "u8" },
+  { name = "flags", ty = "u32" },
+  { name = "root", ty = "str" },     # upload: destination; download: source
+]
+ext = [
+  { tag = 1, name = "src", ty = "str" },       # JOB_COPY source
+  { tag = 2, name = "credit", ty = "u64" },    # JOB_DOWNLOAD: credit the opener grants
+]
+
+[[message]]
+name = "JobOpenAck"
+type = 0x21
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "status", ty = "u16" },
+  { name = "credit", ty = "u64" },   # JOB_UPLOAD: bytes the sender may have outstanding
+  { name = "staged", ty = "u8" },    # 1 = writing under <root>.ava-part/
+  { name = "workers", ty = "u8" },
+]
+ext = [{ tag = 1, name = "message", ty = "str" }]
+
+[[message]]
+name = "ManifestPage"
+type = 0x22
+fields = [{ name = "job_id", ty = "b16" }, { name = "entries", ty = "records", of = "ManifestEntry" }]
+
+[[message]]
+name = "ManifestEnd"
+type = 0x23
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "files", ty = "u32" },
+  { name = "bytes", ty = "u64" },
+  { name = "manifest_hash", ty = "b32" },
+]
+
+[[message]]
+name = "JobMap"             # what the receiver already has; everything else is needed
+type = 0x24
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "status", ty = "u16" },
+  { name = "last", ty = "u8" },      # a map can span pages; 1 on the final one
+  { name = "done", ty = "records", of = "FileRun" },
+  { name = "partial", ty = "records", of = "FileRange" },   # durable ranges of unfinished files
+]
+# `held` (final page): bytes the drive already holds for this job's unfinished large files (the
+# allocated blocks of their part files, at most each file's size). A sender that checks free
+# space credits it: those bytes are on the drive already, durable or not (SPEC.md §11.5).
+ext = [{ tag = 1, name = "message", ty = "str" }, { tag = 2, name = "held", ty = "u64" }]
+
+[[message]]
+name = "Resume"             # fast path: same manifest as before
+type = 0x25
+fields = [{ name = "job_id", ty = "b16" }, { name = "manifest_hash", ty = "b32" }]
+
+[[message]]
+name = "Chunk"              # lanes only
+type = 0x26
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "file_id", ty = "u32" },
+  { name = "offset", ty = "u64" },
+  { name = "data", ty = "bytes" },
+]
+
+[[message]]
+name = "Bundle"             # lanes only
+type = 0x27
+fields = [{ name = "job_id", ty = "b16" }, { name = "records", ty = "records", of = "BundleRecord" }]
+
+[[message]]
+name = "Received"           # a lane frame is in the receiver's memory
+type = 0x28
+fields = [{ name = "job_id", ty = "b16" }, { name = "lane", ty = "u16" }, { name = "seq", ty = "u32" }]
+
+[[message]]
+name = "Credit"             # buffer space returned to the sender
+type = 0x29
+fields = [{ name = "job_id", ty = "b16" }, { name = "bytes", ty = "u64" }]
+
+[[message]]
+name = "Durable"            # synced and journaled
+type = 0x2A
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "files", ty = "records", of = "FileRun" },
+  { name = "ranges", ty = "records", of = "FileRange" },
+]
+
+[[message]]
+name = "FileRoot"           # a large file's BLAKE3 root, from its sender
+type = 0x2B
+fields = [{ name = "job_id", ty = "b16" }, { name = "file_id", ty = "u32" }, { name = "root", ty = "b32" }]
+
+[[message]]
+name = "FileRetry"          # the receiver dropped this file; send all of it again
+type = 0x2C
+fields = [{ name = "job_id", ty = "b16" }, { name = "file_id", ty = "u32" }, { name = "reason", ty = "u16" }]
+
+[[message]]
+name = "Status"             # every 250 ms, sent IGNORABLE; also the job.status reply body
+type = 0x2D
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "files_done", ty = "u32" },
+  { name = "files_total", ty = "u32" },
+  { name = "bytes_received", ty = "u64" },
+  { name = "bytes_durable", ty = "u64" },
+  { name = "bytes_total", ty = "u64" },
+  { name = "bottleneck", ty = "u8" },
+  { name = "workers", ty = "u8" },
+  { name = "lanes", ty = "u8" },
+  { name = "sequential", ty = "u8" },
+]
+ext = [
+  { tag = 1, name = "current", ty = "str" },
+  { tag = 2, name = "state", ty = "u8" },
+  { tag = 3, name = "result", ty = "bytes" },   # job.run: the finished job's output (a handler's text body)
+  { tag = 4, name = "code", ty = "u16" },       # a failed job's ERR_* code
+  { tag = 5, name = "unswept", ty = "u32" },    # durable-by-log (SPEC.md §15.7): done files not yet durable in place; absent = 0
+]
+
+[[message]]
+name = "JobDone"
+type = 0x2E
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "status", ty = "u16" },
+  { name = "files", ty = "u32" },
+  { name = "bytes", ty = "u64" },
+]
+ext = [
+  { tag = 1, name = "message", ty = "str" },
+  { tag = 2, name = "settling", ty = "u8" },    # 1: the log is durable but files are still being made durable in place (SPEC.md §15.7)
+]
+
+[[message]]
+name = "JobCancel"
+type = 0x2F
+fields = [{ name = "job_id", ty = "b16" }, { name = "reason", ty = "u16" }]
+
+# Job-scoped liveness (SPEC.md §12.8): a sender reading past data the receiver already
+# holds (a solid archive decoded from its start on resume) sends this at least every
+# 10 s; the receiver counts it as progress for that job. Older receivers ignore it.
+[[message]]
+name = "SkipProgress"
+type = 0x30
+fields = [{ name = "job_id", ty = "b16" }, { name = "bytes_skipped", ty = "u64" }]
+
+# RPC bodies (SPEC.md §16)
+[[struct]]
+name = "JobCopy"
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "src", ty = "str" },
+  { name = "dest", ty = "str" },
+  { name = "flags", ty = "u32" },
+]
+
+[[struct]]
+name = "JobRef"
+fields = [{ name = "job_id", ty = "b16" }]
+
+[[struct]]
+name = "DiskCalibrate"
+fields = [{ name = "dir", ty = "str" }, { name = "files", ty = "u32" }, { name = "size", ty = "u32" }]
+
+[[struct]]
+name = "CalPoint"
+fields = [
+  { name = "workers", ty = "u8" },
+  { name = "files_per_s", ty = "u32" },
+  { name = "create_us", ty = "u32" },
+  { name = "fsync_us", ty = "u32" },
+]
+
+[[struct]]
+name = "DiskCalibrateResult"
+fields = [{ name = "points", ty = "records", of = "CalPoint" }]
+
+# Node to node (SPEC.md §18). key: the sending node's identity; root: where the
+# job may write. The reply's token goes to the sender, which shows it in its ClientInfo.
+[[struct]]
+name = "C2cAllow"
+fields = [{ name = "job_id", ty = "b16" }, { name = "key", ty = "b32" }, { name = "root", ty = "str" }]
+
+[[struct]]
+name = "C2cTicket"
+fields = [{ name = "token", ty = "b16" }]
+
+# key: the receiving node's identity (the handshake must prove it); dest: its root.
+[[struct]]
+name = "C2cSend"
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "host", ty = "str" },
+  { name = "port", ty = "u16" },
+  { name = "key", ty = "b32" },
+  { name = "token", ty = "b16" },
+  { name = "src", ty = "str" },
+  { name = "dest", ty = "str" },
+  { name = "flags", ty = "u32" },
+]
+[[const]]
+name = "METHOD_JOB_RUN"
+ty = "u16"
+value = 20
+[[const]]
+name = "METHOD_JOB_LIST"
+ty = "u16"
+value = 21
+# Size constants of the application methods (SPEC.md §7.3-§7.4).
+[[const]]
+name = "RPC_TEXT_MAX"     # largest MgmtText text in a reply: RPC_REPLY_MAX (256 KiB) minus 16
+ty = "u32"
+value = 262128
+
+# Bodies shared by application methods and job.run (SPEC.md §7.1.1, §7.3). An application method
+# carries opaque text/JSON in MgmtText or a typed struct of its own extension schema.
+[[struct]]
+name = "MgmtText"
+fields = [{ name = "body", ty = "bytes" }]
+ext = [{ tag = 1, name = "more", ty = "u8" }]     # 1 = call again with the next offset (paged methods)
+
+[[struct]]
+name = "JobRun"
+fields = [{ name = "job_id", ty = "b16" }, { name = "op", ty = "u8" }, { name = "args", ty = "bytes" }]
+
+[[struct]]
+name = "JobEntry"
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "kind", ty = "u8" },
+  { name = "state", ty = "u8" },
+  { name = "files_done", ty = "u32" },
+  { name = "files_total", ty = "u32" },
+  { name = "bytes_done", ty = "u64" },
+  { name = "bytes_total", ty = "u64" },
+]
+
+[[struct]]
+name = "JobListResult"
+fields = [{ name = "jobs", ty = "records", of = "JobEntry" }]
+
+# Journal records (SPEC.md §14); never on the wire.
+[[struct]]
+name = "JnlOpen"
+fields = [
+  { name = "job_id", ty = "b16" },
+  { name = "manifest_hash", ty = "b32" },
+  { name = "kind", ty = "u8" },
+  { name = "flags", ty = "u32" },
+  { name = "staged", ty = "u8" },
+  { name = "root", ty = "str" },
+]
+
+[[struct]]
+name = "JnlBatch"
+fields = [
+  { name = "files", ty = "records", of = "FileRun" },
+  { name = "ranges", ty = "records", of = "FileRange" },
+  { name = "roots", ty = "records", of = "RootItem" },
+]
+# Durable-by-log (SPEC.md §15.7): present when the batch wrote small files to the pack log; the byte
+# range of this batch's PackFile records inside segment `pack.<segment>`.
+ext = [
+  { tag = 1, name = "pack_segment", ty = "u32" },
+  { tag = 2, name = "pack_offset", ty = "u64" },
+  { tag = 3, name = "pack_len", ty = "u64" },
+]
+
+[[struct]]
+name = "PackRef"            # where a batch's PackFile records live (journal snapshots only)
+fields = [
+  { name = "segment", ty = "u32" },
+  { name = "offset", ty = "u64" },
+  { name = "len", ty = "u64" },
+  { name = "first_file", ty = "u32" },
+  { name = "count", ty = "u32" },
+]
+
+[[struct]]
+name = "JnlSweep"           # journal kind 6: these files are now durable in place
+fields = [{ name = "files", ty = "records", of = "FileRun" }]
+
+[[struct]]
+name = "JnlReset"
+fields = [{ name = "file_id", ty = "u32" }]
+
+[[struct]]
+name = "JnlSnapshot"
+fields = [
+  { name = "done", ty = "records", of = "FileRun" },
+  { name = "ranges", ty = "records", of = "FileRange" },
+  { name = "roots", ty = "records", of = "RootItem" },
+]
+# Records cannot be extensions, so these carry the records' item streams as bytes: `unswept` the
+# FileRuns of done files not yet swept, `segments` the PackRefs whose files are not all swept.
+ext = [
+  { tag = 1, name = "unswept", ty = "bytes" },
+  { tag = 2, name = "segments", ty = "bytes" },
+]
+
+[[struct]]
+name = "JnlDone"
+fields = [{ name = "status", ty = "u16" }]
