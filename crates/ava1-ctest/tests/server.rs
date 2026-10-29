@@ -1031,6 +1031,66 @@ async fn the_c_server_notifies_only_once_welcome_is_sent() {
     assert_eq!(srv.pair_requests().0, 1, "the real request was not shown");
 }
 
+/// Completes the Noise handshake as `me` and resets the connection before the Welcome can
+/// be delivered (the server's Welcome send fails).
+async fn ghost(addr: &str, me: &Identity) {
+    use ava1::wire::Message;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    stream.set_zero_linger().unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    let mut hs = ava1::keys::Handshake::initiator(me).unwrap();
+    let hello = gen::HelloInfo {
+        version_min: gen::PROTOCOL_VERSION,
+        version_max: gen::PROTOCOL_VERSION,
+        caps: 0,
+    };
+    let noise = hs.write(&hello.to_bytes().unwrap()).unwrap();
+    w.send_msg(0, &gen::Hs1 { noise }).await.unwrap();
+    let m2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
+    hs.read(&m2.noise).unwrap();
+    let ci = gen::ClientInfo {
+        nonce_c: [7; 16],
+        name: Some("ghost".into()),
+        token: None,
+    };
+    let noise = hs.write(&ci.to_bytes().unwrap()).unwrap();
+    w.send_msg(0, &gen::Hs3 { noise }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_welcome_that_cannot_be_sent_gives_its_session_slot_back() {
+    // A known device whose link resets just as it is welcomed, 16 times over (as many as
+    // there are session slots): each slot must be given back, so the device still gets in.
+    {
+        let d = dir("welcome-fails");
+        let (me, mine) = paired_client(&d.join("peers"));
+        let srv = CServer::start_with(SECRET, &d.join("peers"), roomy(2000));
+        for _ in 0..16 {
+            ghost(&srv.addr(), &me).await;
+        }
+        wait_conns(&srv, 0).await;
+        let r = connect(&srv.addr(), me, mine, "c", fast()).await;
+        assert!(r.is_ok(), "the session slots leaked: {r:?}");
+    }
+    // A stranger doing the same during a pairing window must not use up the unpaired quota.
+    let d = dir("welcome-fails-unpaired");
+    let srv = CServer::start_with(
+        SECRET,
+        &d.join("peers"),
+        ffi::TestOpts {
+            max_welcomes_per_ip: 1000,
+            ..opts(60)
+        },
+    );
+    for _ in 0..2 {
+        ghost(&srv.addr(), &Identity::generate().unwrap()).await;
+    }
+    wait_conns(&srv, 0).await;
+    let r = stranger(&srv).await;
+    assert!(r.is_ok(), "the unpaired quota leaked: {r:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_whose_link_died_reconnects_to_the_c_server_with_all_its_lanes() {
     let d = dir("reconnect");

@@ -6,7 +6,8 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **AVA1 (Adaptive Verified Assembly, version 1)** is a protocol for moving large files and folders
-between two devices over TCP, fast and safely:
+between two devices over TCP, fast and safely. It was designed for sending files from a PC, phone or
+server to a PlayStation 5, and works between any two devices:
 
 - **Fast.** A transfer spreads over up to 8 parallel lanes. A governor adjusts lanes and chunk
   size to whatever is slowest at the moment (network, source disk, receiving disk) and reports it.

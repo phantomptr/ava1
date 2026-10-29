@@ -29,8 +29,11 @@ pub const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// `disk.calibrate` writes and fsyncs up to 20,000 files five times over.
 const CALIBRATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Liveness and handshake limits for a connection (SPEC.md §6). `Default` gives the spec
+/// defaults: ping every 2 s, dead after 12 s, a 10 s handshake, 8 KiB/s per frame.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
+    /// How often a `Ping` is sent.
     pub ping_every: Duration,
     /// No byte received (or taken by the peer) for this long: the connection is dead.
     pub dead_after: Duration,
@@ -51,14 +54,19 @@ impl Default for Timing {
     }
 }
 
+/// An RPC's reply (SPEC.md §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcReply {
+    /// `STATUS_OK` or an error code.
     pub status: u16,
+    /// The reply body; its message type depends on the method.
     pub body: Vec<u8>,
 }
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Frame>>>>;
 
+/// A client session with one node: its control connection, lanes and jobs (SPEC.md
+/// §5–§9). Dropping it ends the session; [`close`](Self::close) says goodbye first.
 pub struct Session {
     pub(crate) addr: SocketAddr,
     pub(crate) timing: Timing,
@@ -112,6 +120,10 @@ impl Drop for PendingEntry<'_> {
     }
 }
 
+/// Connects to `addr` and runs the client handshake, both within `timing.handshake`.
+/// `peers` says which servers are paired, and a server that proves our launch token
+/// (SPEC.md §5.2) is added to it. Check [`Session::pairing_pending`] before making calls.
+/// [`connect_expecting`] with no expected key.
 pub async fn connect(
     addr: &str,
     me: Arc<Identity>,
@@ -213,10 +225,12 @@ pub async fn connect_expecting(
 }
 
 impl Session {
+    /// The other device's static public key.
     pub fn peer_key(&self) -> [u8; 32] {
         self.est.peer_key
     }
 
+    /// The name the other device sent in the handshake; empty if none.
     pub fn peer_name(&self) -> &str {
         &self.est.peer_name
     }
@@ -228,10 +242,12 @@ impl Session {
         self.est.pairing.is_some()
     }
 
+    /// Round trip of the latest answered Ping (SPEC.md §6); `None` before the first Pong.
     pub fn rtt(&self) -> Option<Duration> {
         self.link.rtt()
     }
 
+    /// Whether the control connection has ended.
     pub fn is_closed(&self) -> bool {
         self.link.is_closed()
     }
@@ -331,6 +347,7 @@ impl Session {
         })
     }
 
+    /// Calls `node.info`. A non-OK status is returned as `Refused`.
     pub async fn node_info(&self) -> Result<gen::NodeInfo, Ava1Error> {
         let r = self.rpc(gen::METHOD_NODE_INFO, &[]).await?;
         if r.status != gen::STATUS_OK {
@@ -458,7 +475,9 @@ impl Session {
     }
 }
 
+/// An open data lane (SPEC.md §9). Dropping it closes the connection and frees its id.
 pub struct Lane {
+    /// The lane id, 1..=8.
     pub id: u16,
     link: Link,
     _outbox: Outbox,
@@ -478,20 +497,22 @@ impl Drop for LaneSlot {
 }
 
 impl Lane {
+    /// Waits until the lane's connection ends; returns why.
     pub async fn closed(&self) -> String {
         self.link.closed().await
     }
 
+    /// Whether the lane's connection has ended.
     pub fn is_closed(&self) -> bool {
         self.link.is_closed()
     }
 
+    /// Round trip of the lane's latest answered Ping; `None` before the first Pong.
     pub fn rtt(&self) -> Option<Duration> {
         self.link.rtt()
     }
 }
 
-/// Everything needed to join lanes, shared with jobs (SPEC.md §9, §12).
 /// What a lane asks the kernel for on each socket buffer (review 003 §1): a thread that
 /// is not in `recv` for 10-20 ms (the console opens a frame) must not close the sender's
 /// TCP window, and on Wi-Fi the per-lane window is today's ceiling.
@@ -526,6 +547,7 @@ pub(crate) async fn connect_lane_socket(addr: SocketAddr) -> std::io::Result<Tcp
     sock.connect(addr).await
 }
 
+/// Everything needed to join lanes, shared with jobs (SPEC.md §9, §12).
 pub(crate) struct Joiner {
     addr: SocketAddr,
     timing: Timing,
@@ -669,6 +691,7 @@ impl Session {
         )
     }
 
+    /// The capability bits the node advertised in `ServerInfo` (`CAP_*`, SPEC.md §5 step 2).
     pub fn peer_caps(&self) -> u64 {
         self.est.peer_caps
     }

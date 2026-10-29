@@ -4,9 +4,9 @@
 //! by a normal OS underneath: blocking writes on `spawn_blocking`, one sync batch every
 //! 250 ms run on a task of its own — the run loop keeps draining its inbox and answering
 //! the peer while the batch's fsyncs run (ruling 11) — the same journal (SPEC.md §14)
-//! and outboards, the same on-disk layout — so an engine can resume a job the console
-//! started and vice versa.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+//! and outboards, the same on-disk layout. (The formats are shared, the journals are not:
+//! each side resumes only the jobs it journaled itself; see `run_loop`.)
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ use crate::manifest::{self, Manifest};
 use crate::packlog::{Loc, LoggedGroup, PackLog, PackOpts};
 use crate::ranges::{runs, Need, RangeSet};
 use crate::router::{ConnTx, Inbound, JobLink};
-use crate::send::{next_ctl, Progress, SendError};
+use crate::send::{next_ctl, Progress, SendError, RECEIVER_SILENT_FATAL};
 use crate::verify::{self, Outboard, GROUP};
 use crate::wire::FrameMessage;
 
@@ -99,6 +99,11 @@ pub trait Sink: Send + Sync {
     fn resume_key(&self) -> Option<(String, bool)> {
         None
     }
+    /// A resume, before `prepare`: `journaled` is the staging decision the journal's Open
+    /// recorded, `all_done` whether the journal calls every file done. The sink settles its
+    /// own decision (taken when it was built, possibly before an earlier run's final rename)
+    /// on the journal's, so a job is staged, or not, the same way on every run of it.
+    fn resume_staged(&self, _journaled: bool, _all_done: bool) {}
     /// Called once per run, after `prepare` and the §13.4 re-check and before the map goes
     /// out, with what the journal says is durable: the finished files and the partial
     /// files' ranges. A sink whose bytes live in one ordered stream (the Stored zip) cuts
@@ -149,8 +154,9 @@ pub struct LocalSink {
     /// The staging decision, taken once at construction — the C receiver's rule
     /// (`staged = !single_file && !root.exists()`, ava1_recv.c:380-430). It is stable
     /// across a crash because the only transition is the atomic part→final rename, so
-    /// `root absent ⟺ part present` on every run (ruling 10).
-    staged: bool,
+    /// `root absent ⟺ part present` on every run (ruling 10). A resume settles it on the
+    /// journal's (`resume_staged`).
+    staged: AtomicBool,
     st: Mutex<LocalState>,
     /// Durable-by-log: whether small files go through the pack log (default on; the environment's
     /// `AVA1_LOG_SMALL=0` keeps the per-file fsync path), its options, and the log itself
@@ -194,8 +200,11 @@ impl Drop for CommitGuard<'_> {
 }
 
 impl LocalSink {
+    /// A sink that writes the job under `root`. With `single_file`, `root` is the one file the
+    /// job writes (`JF_SINGLE_FILE`). Otherwise the job is staged in `<root>.ava-part` when
+    /// `root` does not exist yet, a decision taken here, once (SPEC.md §11.6).
     pub fn new(root: PathBuf, single_file: bool) -> Self {
-        let staged = !single_file && !root.exists();
+        let staged = AtomicBool::new(!single_file && !root.exists());
         Self {
             root,
             single: single_file,
@@ -298,7 +307,7 @@ impl LocalSink {
     }
 
     fn base(&self) -> PathBuf {
-        if self.staged {
+        if self.staged.load(Ordering::Relaxed) {
             PathBuf::from(format!("{}.ava-part", self.root.display()))
         } else {
             self.root.clone()
@@ -325,7 +334,7 @@ impl LocalSink {
             .expect("an id the receiver validated against the manifest")
             .path;
         let p = self.base().join(rel);
-        if part && !self.staged {
+        if part && !self.staged.load(Ordering::Relaxed) {
             PathBuf::from(format!("{}.ava-part", p.display()))
         } else {
             p
@@ -749,7 +758,7 @@ impl Sink for LocalSink {
     fn finish(&self) -> io::Result<()> {
         let mut st = self.st.lock().unwrap();
         st.open.clear(); // small files were synced in their batches
-        if self.staged {
+        if self.staged.load(Ordering::Relaxed) {
             if self.root.exists() {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -765,31 +774,64 @@ impl Sink for LocalSink {
     }
 
     fn resume_key(&self) -> Option<(String, bool)> {
-        Some((self.root.to_string_lossy().into_owned(), self.staged))
+        Some((
+            self.root.to_string_lossy().into_owned(),
+            self.staged.load(Ordering::Relaxed),
+        ))
+    }
+
+    fn resume_staged(&self, journaled: bool, all_done: bool) {
+        if self.single {
+            return;
+        }
+        // The journal's decision stands, but for one case: a staged job whose tree is no longer
+        // in `.ava-part` while the root is there and every file is done was renamed into place
+        // by an earlier run that ended before it could say so (the Done record, or the JobDone,
+        // lost to a crash or a dropped session): it is finished in place. A root that appeared
+        // with the tree still in `.ava-part` stays staged, so the finish refuses it (ERR_EXISTS)
+        // as the C receiver does, instead of calling files done where they are not.
+        let part = PathBuf::from(format!("{}.ava-part", self.root.display()));
+        // (The C receiver's `staged_tree_landed`.)
+        let renamed = all_done && self.root.is_dir() && !part.exists();
+        self.staged.store(journaled && !renamed, Ordering::Relaxed);
     }
 }
 
+/// How one receive runs: the grant, the job's flags, where its journal lives, and the
+/// caller's progress counters and cancel switch.
 pub struct RecvOptions {
+    /// The job's credit grant in bytes (SPEC.md §12.4): sent in the `JobOpenAck` of an upload,
+    /// as `JobOpen` ext `credit` for a download, or as a `Credit` frame for a `Resume`.
     pub credit: u64,
     /// The job's flags; recorded in the journal's Open so a job reopened with different
     /// flags is refused/replaced exactly as the C receiver does (ruling Q4).
     pub flags: u32,
+    /// The jobs directory (SPEC.md §14.3); the job's own directory is
+    /// [`journal::job_dir`] inside it.
     pub jobs_dir: PathBuf,
     /// Must equal `flags & JF_ORDERED != 0`.
     pub ordered: bool,
+    /// Counters the receive loop updates as the job runs, for the caller to read.
     pub progress: Arc<Progress>,
+    /// Set to true to cancel: the receive loop sends `JobCancel(ERR_CANCELLED)` and returns
+    /// [`SendError::Cancelled`].
     pub cancel: Arc<AtomicBool>,
     /// How long a job may go without any progress (a data frame, a root, a finished disk
     /// batch or write) while the sender still owes bytes before the receiver ends it with
     /// `ERR_STALLED` (review 006 #2). `None` = `PROGRESS_DEADLINE` (3 x the default
-    /// `dead_after`), or `RESUME_PROGRESS_DEADLINE` for a resumed job.
+    /// `dead_after`), or `RESUME_PROGRESS_DEADLINE` for a resumed job. When set, it is also how
+    /// long a `receive_job` waits between manifest pages (else `RECEIVER_SILENT_FATAL`).
     pub progress_deadline: Option<Duration>,
 }
 
+/// What a finished receive reports.
 #[derive(Debug, Clone)]
 pub struct RecvReport {
+    /// The number of files in the job's manifest.
     pub files: u32,
+    /// The total size of the manifest's files, in bytes.
     pub bytes: u64,
+    /// The job's manifest.
     pub manifest: Arc<Manifest>,
 }
 
@@ -802,7 +844,9 @@ fn proto(e: impl std::fmt::Display) -> SendError {
 /// (`ERR_PATH`). Used for manifest validation on the receiver path.
 fn wire_path(e: manifest::PathError) -> SendError {
     let status = match e {
-        manifest::PathError::Gap(_) | manifest::PathError::SizeOverflow => gen::ERR_PROTOCOL,
+        manifest::PathError::Gap(_)
+        | manifest::PathError::SizeOverflow
+        | manifest::PathError::TooMany => gen::ERR_PROTOCOL,
         _ => gen::ERR_PATH,
     };
     SendError::Refused {
@@ -825,12 +869,52 @@ async fn next(link: &mut JobLink) -> Result<Inbound, SendError> {
 /// manifest from the peer every time — the on-disk `manifest` file is written for the C
 /// side's resume, never read back by Rust (ruling 20). The responder acks before its
 /// pages, the opener's ack confirms the open, so a JobOpenAck may come first either way.
-async fn read_manifest(link: &mut JobLink) -> Result<Manifest, SendError> {
+///
+/// Each page is checked as it arrives (ids consecutive, at most `MAX_ENTRIES` in all,
+/// SPEC.md §11.7), so an endless manifest is refused instead of buffered. A `JobCancel` ends
+/// the job as it does in the data phase, and a peer that sends no page (or ack) for `silent`
+/// is stalled: it is told `JobCancel(ERR_STALLED)` and the job ends, so it cannot hold the
+/// job (and its destination) for the whole life of a session it keeps alive with pings.
+/// Reads a job's manifest, giving up after `silent` without a page. With `after_ack`, the clock
+/// starts only at the `JobOpenAck`: a download's sender walks its source before it acks, for as
+/// long as that takes, and the link's own liveness covers a peer that is gone meanwhile.
+async fn read_manifest(
+    link: &mut JobLink,
+    silent: Duration,
+    after_ack: bool,
+) -> Result<Manifest, SendError> {
     let mut pages = Vec::new();
+    let mut entries = 0usize;
+    let far = tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
+    let mut deadline = if after_ack {
+        far
+    } else {
+        tokio::time::Instant::now() + silent
+    };
     loop {
-        let f = next_ctl(link).await?;
+        let Ok(f) = tokio::time::timeout_at(deadline, next_ctl(link)).await else {
+            let why = format!(
+                "the manifest stalled: nothing for {:.1} s while the sender is still connected",
+                silent.as_secs_f64()
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                link.control.send(&JobCancel {
+                    job_id: link.job_id,
+                    reason: gen::ERR_STALLED,
+                }),
+            )
+            .await;
+            return Err(SendError::Disconnected(why));
+        };
+        let f = f?;
         match f.ty {
-            ManifestPage::TYPE => pages.push(f.decode::<ManifestPage>().map_err(proto)?),
+            ManifestPage::TYPE => {
+                let p = f.decode::<ManifestPage>().map_err(proto)?;
+                entries = manifest::page_continues(entries, &p).map_err(wire_path)?;
+                pages.push(p);
+                deadline = tokio::time::Instant::now() + silent;
+            }
             ManifestEnd::TYPE => {
                 let e: ManifestEnd = f.decode().map_err(proto)?;
                 let m = Manifest::from_pages(pages).map_err(wire_path)?;
@@ -849,6 +933,13 @@ async fn read_manifest(link: &mut JobLink) -> Result<Manifest, SendError> {
                         message: a.message.unwrap_or_default(),
                     });
                 }
+                deadline = tokio::time::Instant::now() + silent;
+            }
+            JobCancel::TYPE => {
+                return Err(SendError::Refused {
+                    status: gen::ERR_CANCELLED,
+                    message: "the sender cancelled".into(),
+                });
             }
             _ => {}
         }
@@ -883,7 +974,9 @@ pub async fn download_open(
         })
         .await
         .map_err(|e| SendError::Disconnected(e.to_string()))?;
-    Ok(Arc::new(read_manifest(link).await?))
+    Ok(Arc::new(
+        read_manifest(link, RECEIVER_SILENT_FATAL, true).await?,
+    ))
 }
 
 /// The opener side of a download, data phase: the map is answered, then `run`.
@@ -939,12 +1032,20 @@ pub async fn receive_job(
         })
         .await
         .map_err(|e| SendError::Disconnected(e.to_string()))?;
-    let m = match read_manifest(link).await {
+    // The manifest phase's silence limit: the caller's progress deadline when it set one (tests),
+    // else the sender's own limit for a silent receiver.
+    let silent = o.progress_deadline.unwrap_or(RECEIVER_SILENT_FATAL);
+    let m = match read_manifest(link, silent, false).await {
         Ok(m) => m,
         Err(e) => {
             // The ack is already out; the sender learns about a bad manifest through the
-            // JobDone (its open loop reads both), not a second ack.
+            // JobDone (its open loop reads both), not a second ack. A cancel (the sender's
+            // own) or a stall (already answered with JobCancel) needs no JobDone.
             let status = match &e {
+                SendError::Refused { status, .. } if *status == gen::ERR_CANCELLED => {
+                    return Err(e)
+                }
+                SendError::Disconnected(_) => return Err(e),
                 SendError::Refused { status, .. } => *status,
                 _ => gen::ERR_PROTOCOL,
             };
@@ -1198,13 +1299,118 @@ async fn run(
     sink: Arc<dyn Sink>,
     o: RecvOptions,
 ) -> Result<RecvReport, SendError> {
+    // One receiver per job directory at a time (ruling 19). A retry that arrives while the run
+    // it replaces is still in its end sequence (a session that dropped as the job finished;
+    // a host's job task outlives its session) waits for it here, then replays the journal it
+    // leaves — never two writers on one journal, and never one staging rename racing another
+    // run's view of the destination.
+    let dir_lock = Arc::new(
+        job_dir_lock(&journal::job_dir(&o.jobs_dir, &link.job_id))
+            .lock_owned()
+            .await,
+    );
     let mut batch_handle: Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>> = None;
-    let outcome = run_loop(link, m, need_hint, sink, o, &mut batch_handle).await;
+    let outcome = run_loop(link, m, need_hint, sink, o, &mut batch_handle, &dir_lock).await;
     if let Some(h) = batch_handle.take() {
         let _ = h.await;
     }
     outcome
 }
+
+/// Held by a run for its whole life, and by the work it hands off (the sync batch, the
+/// finish), so that even a run whose future is dropped keeps its job directory until its
+/// detached work has ended.
+type DirLock = Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+/// The in-process lock of the job directory `dir`.
+fn job_dir_lock(dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Mutex::default).lock().unwrap();
+    locks.retain(|_, w| w.strong_count() > 0);
+    if let Some(l) = locks.get(dir).and_then(std::sync::Weak::upgrade) {
+        return l;
+    }
+    let l = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(dir.to_path_buf(), Arc::downgrade(&l));
+    l
+}
+
+/// A new job's journal, on the blocking pool: the manifest file (for the C side's resume),
+/// then the journal and its Open.
+async fn new_journal(dir: &Path, m: &Arc<Manifest>, open: &JnlOpen) -> Result<Journal, SendError> {
+    let (d2, m2, o2) = (dir.to_path_buf(), m.clone(), open.clone());
+    tokio::task::spawn_blocking(move || {
+        journal::write_manifest(&d2, &m2)?;
+        Journal::create(&d2, &o2)
+    })
+    .await
+    .map_err(proto)?
+    .map_err(SendError::from)
+}
+
+/// One journal append (a synced write) on the blocking pool; the journal comes back.
+async fn append_blocking(mut jnl: Journal, rec: Record) -> Result<Journal, SendError> {
+    tokio::task::spawn_blocking(move || jnl.append(&rec).map(|()| jnl))
+        .await
+        .map_err(proto)?
+        .map_err(SendError::from)
+}
+
+/// The §13.4 re-check of one partial file: the groups of `ranges` whose bytes the sink still
+/// holds and whose CV matches the outboard (a file of one group has no outboard: what reads
+/// back counts). The groups are split among a few threads, each with one buffer of its own.
+fn recheck(
+    sink: &dyn Sink,
+    ob: Option<&Outboard>,
+    id: u32,
+    size: u64,
+    ranges: &RangeSet,
+) -> RangeSet {
+    let groups: Vec<u64> = ranges
+        .iter()
+        .flat_map(|(s, e)| (s / GROUP..e.div_ceil(GROUP)).filter(move |g| g * GROUP < e))
+        .collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, RECHECK_PAR)
+        .min(groups.len().max(1));
+    let per = groups.len().div_ceil(threads).max(1);
+    let one = |part: &[u64]| -> Vec<u64> {
+        let mut buf = vec![0u8; GROUP as usize];
+        part.iter()
+            .copied()
+            .filter(|&g| {
+                let len = (size - g * GROUP).min(GROUP) as usize;
+                let b = &mut buf[..len];
+                sink.read_at(id, g * GROUP, b).is_ok()
+                    && (verify::groups(size) < 2
+                        || ob.and_then(|o| o.get(g)) == Some(verify::group_cv(b, g)))
+            })
+            .collect()
+    };
+    let good: Vec<u64> = if threads <= 1 {
+        one(&groups)
+    } else {
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = groups
+                .chunks(per)
+                .map(|p| sc.spawn(move || one(p)))
+                .collect();
+            hs.into_iter()
+                .flat_map(|h| h.join().expect("a re-check thread panicked"))
+                .collect()
+        })
+    };
+    let mut out = RangeSet::new();
+    for g in good {
+        out.insert(g * GROUP, (g * GROUP + GROUP).min(size));
+    }
+    out
+}
+
+/// The most threads one file's re-check reads and hashes on.
+const RECHECK_PAR: usize = 4;
 
 /// Sends the receiver's map (what it already has) to the sender.
 async fn send_need(link: &mut JobLink, job_id: [u8; 16], need: &Need) -> Result<(), SendError> {
@@ -1224,14 +1430,23 @@ async fn run_loop(
     sink: Arc<dyn Sink>,
     o: RecvOptions,
     batch_handle: &mut Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>>,
+    dir_lock: &DirLock,
 ) -> Result<RecvReport, SendError> {
     let job_id = link.job_id;
     let mut tm = StageTimes::new();
     let dir = journal::job_dir(&o.jobs_dir, &job_id);
-    std::fs::create_dir_all(&dir)?;
-    // The destination root and the staging decision go into the journal's Open, exactly as
-    // the C receiver records them (ava1_recv.c:380-430 decides, :1026-1040 writes), so
-    // either side can resume a job the other started. The sink supplies both (ruling Q1).
+    // The setup's file work (the job directory, the journal, the §13.4 re-check) runs on the
+    // blocking pool: a session's heartbeats share this runtime, and a re-check reads and hashes
+    // every durable byte of every partial file.
+    let d2 = dir.clone();
+    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&d2))
+        .await
+        .map_err(proto)??;
+    // The destination root and the staging decision go into the journal's Open, decided by
+    // the C receiver's rule (ava1_recv.c:380-430 decides, :1026-1040 writes); the sink
+    // supplies both (ruling Q1). The Open's kind is always JOB_DOWNLOAD here (this node takes
+    // the bytes, whichever side opened the job), while the C node records the kind of the
+    // JobOpen it received (JOB_UPLOAD), so neither side resumes a journal the other wrote.
     let (dest_root, staged) = sink.resume_key().unwrap_or((String::new(), false));
     let fresh = JnlOpen {
         job_id,
@@ -1249,7 +1464,11 @@ async fn run_loop(
     // arrives meanwhile waits in the inbox, which the credit window already bounds.
     let early_map = need_hint.is_none() && !sink.transient_relay();
     let mut need_sent = false;
-    let (mut jnl, open_rec) = match Journal::open(&dir) {
+    let d2 = dir.clone();
+    let opened = tokio::task::spawn_blocking(move || Journal::open(&d2))
+        .await
+        .map_err(proto)?;
+    let (mut jnl, open_rec) = match opened {
         Ok((j, recs)) => {
             for r in &recs {
                 st.apply(r);
@@ -1260,7 +1479,15 @@ async fn run_loop(
                     && jo.root == dest_root
                     && jo.manifest_hash == m.hash()
             }) {
-                Some(jo) => (j, jo), // resume: replay + the recorded Open
+                Some(jo) => {
+                    // resume: replay + the recorded Open, staged as the Open says
+                    let all_done =
+                        m.entries.iter().enumerate().all(|(i, e)| {
+                            e.kind != gen::ENTRY_FILE || st.done.contains(&(i as u32))
+                        });
+                    sink.resume_staged(jo.staged & 1 != 0, all_done);
+                    (j, jo)
+                }
                 None => {
                     drop(j); // one writer per directory (ruling 19): a different job
                     st = State::default(); // start over
@@ -1268,8 +1495,7 @@ async fn run_loop(
                         send_need(link, job_id, &Need::default()).await?;
                         need_sent = true;
                     }
-                    journal::write_manifest(&dir, &m)?;
-                    let j = Journal::create(&dir, &fresh)?;
+                    let j = new_journal(&dir, &m, &fresh).await?;
                     st.apply(&Record::Open(fresh.clone()));
                     (j, fresh.clone())
                 }
@@ -1280,8 +1506,7 @@ async fn run_loop(
                 send_need(link, job_id, &Need::default()).await?;
                 need_sent = true;
             }
-            journal::write_manifest(&dir, &m)?;
-            let j = Journal::create(&dir, &fresh)?;
+            let j = new_journal(&dir, &m, &fresh).await?;
             st.apply(&Record::Open(fresh.clone()));
             (j, fresh.clone())
         }
@@ -1303,7 +1528,7 @@ async fn run_loop(
         for id in lost {
             let rec = Record::Reset(id);
             st.apply(&rec);
-            jnl.append(&rec)?;
+            jnl = append_blocking(jnl, rec).await?;
         }
         let (j, s) = sweep_logged(&sink, jnl, st, true).await?;
         jnl = j;
@@ -1331,33 +1556,35 @@ async fn run_loop(
             )));
         };
         let size = e.size;
-        let mut ob = open_outboard(&dir.join(format!("{id}.ob")), verify::groups(size))?;
-        let mut good = RangeSet::new();
-        for (s, e) in r.iter() {
-            if sink.transient_relay() {
-                good.insert(s, e);
-                continue;
+        let (s2, path, relay) = (
+            sink.clone(),
+            dir.join(format!("{id}.ob")),
+            sink.transient_relay(),
+        );
+        let (ob, good) = tokio::task::spawn_blocking(move || {
+            let ob = open_outboard(&path, verify::groups(size))?;
+            let good = if relay {
+                r.clone()
+            } else {
+                recheck(&*s2, ob.as_ref(), id, size, &r)
+            };
+            if good.covered() == r.covered() {
+                return Ok::<_, SendError>((ob, Some(good)));
             }
-            let mut g = s / GROUP;
-            while g * GROUP < e {
-                let len = (size - g * GROUP).min(GROUP) as usize;
-                let mut buf = vec![0u8; len];
-                let ok = sink.read_at(id, g * GROUP, &mut buf).is_ok()
-                    && (verify::groups(size) < 2
-                        || ob.as_ref().and_then(|o| o.get(g)) == Some(verify::group_cv(&buf, g)));
-                if ok {
-                    good.insert(g * GROUP, g * GROUP + len as u64);
-                }
-                g += 1;
+            // A mismatch: the file starts over, with a fresh outboard.
+            Ok((open_outboard(&path, verify::groups(size))?, None))
+        })
+        .await
+        .map_err(proto)??;
+        let good = match good {
+            Some(g) => g,
+            None => {
+                let rec = Record::Reset(id);
+                st.apply(&rec);
+                jnl = append_blocking(jnl, rec).await?;
+                RangeSet::new()
             }
-        }
-        if good.covered() != r.covered() {
-            let rec = Record::Reset(id);
-            st.apply(&rec);
-            jnl.append(&rec)?;
-            ob = open_outboard(&dir.join(format!("{id}.ob")), verify::groups(size))?;
-            good = RangeSet::new();
-        }
+        };
         st.ranges.insert(id, good.clone());
         large.insert(
             id,
@@ -1388,7 +1615,10 @@ async fn run_loop(
             crate::diag::line(format_args!(
                 "ava1: the sink cannot resume this job ({why}); starting it over"
             ));
-            jnl = Journal::create(&dir, &open_rec)?;
+            let (d2, o2) = (dir.clone(), open_rec.clone());
+            jnl = tokio::task::spawn_blocking(move || Journal::create(&d2, &o2))
+                .await
+                .map_err(proto)??;
             st = State::default();
             st.apply(&Record::Open(open_rec.clone()));
             large.clear();
@@ -1451,6 +1681,13 @@ async fn run_loop(
     let total_files = m.files() as usize;
     let mut done: BTreeSet<u32> = st.done.clone();
     let mut pending_small: Vec<u32> = Vec::new();
+    // Small files handed to a write and not yet done: in a bundle write, written and pending,
+    // or in the sync batch that is running. A duplicate record for one of them (a sender
+    // requeues the frames of a lane that died before their Received came back, though they
+    // may have arrived) is dropped like one for a done file (SPEC.md §15.2): writing it again
+    // would truncate a file the batch may already have synced and journaled, and push the id
+    // twice. Its frame is acknowledged and its credit returned as for any frame.
+    let mut small_held: HashSet<u32> = HashSet::new();
     // A zero-byte file is already complete: its zero range yields no chunks and, in an
     // ordered download, no bundle either (the ordered sender sends every file as chunks),
     // so no frame will ever arrive to mark it done — and the ordered cursor would stall
@@ -1473,6 +1710,7 @@ async fn run_loop(
             .await
             .map_err(proto)??;
         pending_small.push(id);
+        small_held.insert(id);
     }
     let granted = o.credit;
     let mut credit_back = 0u64;
@@ -1541,6 +1779,7 @@ async fn run_loop(
                     pending_small.push(id);
                 }
                 for (id, why) in w.retry {
+                    small_held.remove(&id); // not written: the resend must be taken
                     link.control
                         .send(&gen::FileRetry { job_id, file_id: id, reason: why })
                         .await
@@ -1558,6 +1797,9 @@ async fn run_loop(
                             last_progress = Instant::now();
                         }
                         fold_batch(&mut done, &mut large, &pg, &m, &out);
+                        for id in &out.small {
+                            small_held.remove(id); // done now
+                        }
                         inflight_small = 0;
                         jnl = Some(out.jnl);
                         st = Some(out.st);
@@ -1581,19 +1823,30 @@ async fn run_loop(
                 // returned, the sender's in-flight mirror (the C receiver's w_avail).
                 if len > outstanding {
                     if let Some(l) = link.lane(lane) {
-                        // The sealed Error on the offending lane (SPEC.md §12.4): the peer's
-                        // link closes that lane when it reads it, which the sender observes
-                        // exactly as the C receiver's explicit close: its lane dies.
-                        let _ =
-                            l.tx.send(&gen::Error {
-                                code: gen::ERR_CREDIT,
-                                message: "a frame larger than the credit granted".into(),
-                            })
-                            .await;
+                        // The sealed Error on the offending lane, then the lane is closed
+                        // (SPEC.md §12.4), as the C receiver does: a peer that ignored the
+                        // Error could otherwise go on making this side take (and open) 16 MiB
+                        // frames on it. The flush and the close run off the loop, which must
+                        // not stop reading (ruling 11) behind a peer that does not read.
+                        let (opener, router) = (link.opener().cloned(), link.router());
+                        tokio::spawn(async move {
+                            let _ =
+                                l.tx.send(&gen::Error {
+                                    code: gen::ERR_CREDIT,
+                                    message: "a frame larger than the credit granted".into(),
+                                })
+                                .await;
+                            l.tx.flush(Duration::from_secs(2)).await;
+                            l.close();
+                            // By id, so only while the id still holds this lane: a lane joined
+                            // on it since is not the one that overran.
+                            if let Some(op) = opener.filter(|_| router.is_current(&l)) {
+                                op.close(lane);
+                            }
+                        });
                     }
-                    // Ruling: lane only. The sealed Error ends that lane when the peer reads
-                    // it (SPEC.md §12.4); the session and the job stay, other lanes go on,
-                    // and the refused frame is requeued by the sender as for any dead lane.
+                    // Ruling: lane only. The session and the job stay, other lanes go on, and
+                    // the refused frame is requeued by the sender as for any dead lane.
                     continue;
                 }
                 link.control
@@ -1651,7 +1904,7 @@ async fn run_loop(
                                     id = r.file_id
                                 )));
                             }
-                            if done.contains(&r.file_id) {
+                            if done.contains(&r.file_id) || small_held.contains(&r.file_id) {
                                 continue;
                             }
                             // The C receiver's apply_record: a size mismatch is a file that
@@ -1697,6 +1950,7 @@ async fn run_loop(
                                     reorder.insert((r.file_id, 0), (true, r.data));
                                 }
                             } else {
+                                small_held.insert(r.file_id);
                                 jobs.push((r.file_id, r.root, r.data));
                             }
                         }
@@ -1707,11 +1961,17 @@ async fn run_loop(
                             // The bundle's credit returns when its files are on disk (the
                             // backpressure the window exists for), not when it arrived.
                             let (s2, gate) = (sink.clone(), write_gate.clone());
+                            // The write holds the job directory until it ends: a dropped job
+                            // aborts this task but not the blocking write under it.
+                            let held = dir_lock.clone();
                             writes.spawn(async move {
                                 let _permit = gate.acquire_owned().await.map_err(proto)?;
-                                tokio::task::spawn_blocking(move || write_bundle(&*s2, jobs, len))
-                                    .await
-                                    .map_err(proto)?
+                                tokio::task::spawn_blocking(move || {
+                                    let _held = held;
+                                    write_bundle(&*s2, jobs, len)
+                                })
+                                .await
+                                .map_err(proto)?
                             });
                             continue;
                         }
@@ -1770,6 +2030,7 @@ async fn run_loop(
                                 .await
                                 .map_err(proto)??;
                             pending_small.push(fid);
+                            small_held.insert(fid);
                         } else {
                             apply_chunk(&sink, &m, &dir, &mut large, fid, off, data).await?;
                         }
@@ -1900,12 +2161,15 @@ async fn run_loop(
                 let st0 = st.take().expect("a finished job has no batch in flight");
                 // Every logged file durable in place before the end (and before a staged tree's rename:
                 // the sweep addresses files by path); an engine has no thread to settle behind JobDone.
-                let (mut jnl, mut st) = sweep_logged(&sink, jnl0, st0, true).await?;
+                let (jnl, mut st) = sweep_logged(&sink, jnl0, st0, true).await?;
                 sink.log_cleanup();
-                let s2 = sink.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || s2.finish())
-                    .await
-                    .map_err(proto)?
+                let (s2, held) = (sink.clone(), dir_lock.clone());
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    let _held = held;
+                    s2.finish()
+                })
+                .await
+                .map_err(proto)?
                 {
                     // A failure after every byte is durable: report it, never ask for a resend.
                     let status = if e.kind() == io::ErrorKind::AlreadyExists {
@@ -1915,7 +2179,7 @@ async fn run_loop(
                     };
                     let rec = Record::Done(status);
                     st.apply(&rec);
-                    jnl.append(&rec)?;
+                    append_blocking(jnl, rec).await?;
                     link.control
                         .send(&JobDone {
                             job_id,
@@ -1934,7 +2198,7 @@ async fn run_loop(
                 }
                 let rec = Record::Done(0);
                 st.apply(&rec);
-                jnl.append(&rec)?;
+                append_blocking(jnl, rec).await?;
                 link.control
                     .send(&JobDone {
                         job_id,
@@ -1976,7 +2240,11 @@ async fn run_loop(
                     &mut pending_small,
                     &mut large,
                 )?;
-                *batch_handle = Some(tokio::task::spawn(batch_task(snap)));
+                let held = dir_lock.clone();
+                *batch_handle = Some(tokio::task::spawn(async move {
+                    let _held = held;
+                    batch_task(snap).await
+                }));
             }
         }
     }
@@ -3766,5 +4034,805 @@ mod tests {
         assert_eq!(st.done.len(), 7);
         assert!(!st.done.contains(&3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's link whose inbox the test fills through the router, and the reading half of the
+    /// control connection, where the test sees what the receiver sends.
+    struct Wired {
+        link: JobLink,
+        router: Arc<Router>,
+        peer: FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        _keep: (
+            crate::link::Link,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            mpsc::Receiver<crate::conn::Frame>,
+        ),
+    }
+
+    fn quiet() -> Timing {
+        Timing {
+            ping_every: Duration::from_secs(3600),
+            dead_after: Duration::from_secs(3600),
+            handshake: Duration::from_secs(1),
+            min_frame_rate: crate::link::MIN_FRAME_RATE,
+        }
+    }
+
+    /// A connection's sending side (`drive` over a pipe) and the reader of its far end.
+    #[allow(clippy::type_complexity)]
+    fn piped() -> (
+        crate::link::Outbox,
+        FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        (
+            crate::link::Link,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            mpsc::Receiver<crate::conn::Frame>,
+        ),
+    ) {
+        let (a, b) = duplex(1 << 20);
+        let (ar, aw) = split(a);
+        let (br, bw) = split(b);
+        let (tx, rx) = mpsc::channel(crate::link::DELIVER_DEPTH);
+        let (link, outbox) =
+            crate::link::drive(FrameReader::new(ar), FrameWriter::new(aw), quiet(), tx);
+        (outbox, FrameReader::new(br), (link, bw, rx))
+    }
+
+    fn wired(job: [u8; 16], opener: Option<Arc<dyn crate::router::LaneOpener>>) -> Wired {
+        let router = Arc::new(Router::default());
+        let (outbox, peer, keep) = piped();
+        let link = JobLink::new(job, router.clone(), ConnTx::new(outbox), opener);
+        Wired {
+            link,
+            router,
+            peer,
+            _keep: keep,
+        }
+    }
+
+    fn frame_of<M: FrameMessage>(m: &M, channel: u32) -> crate::conn::Frame {
+        crate::conn::Frame {
+            ty: M::TYPE,
+            flags: 0,
+            channel,
+            body: m.to_bytes().unwrap(),
+        }
+    }
+
+    fn opts(tag: &str, credit: u64, deadline: Option<Duration>) -> RecvOptions {
+        let jobs_dir = std::env::temp_dir().join(format!("ava1-recv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        RecvOptions {
+            credit,
+            flags: 0,
+            jobs_dir,
+            ordered: false,
+            progress: Arc::default(),
+            cancel: Arc::default(),
+            progress_deadline: deadline,
+        }
+    }
+
+    fn upload_open(job: [u8; 16]) -> JobOpen {
+        JobOpen {
+            job_id: job,
+            kind: gen::JOB_UPLOAD,
+            policy: 0,
+            flags: 0,
+            root: String::new(),
+            src: None,
+            credit: None,
+        }
+    }
+
+    fn small_manifest(sizes: &[u64]) -> Manifest {
+        Manifest {
+            entries: sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| Entry {
+                    kind: gen::ENTRY_FILE,
+                    mode: 0o644,
+                    size,
+                    mtime: 0,
+                    path: format!("f{i}"),
+                    root: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// SPEC.md §11.7: the pages are checked as they arrive, so a manifest whose ids jump is
+    /// refused at that page — not buffered, with every page after it, until a ManifestEnd that
+    /// a hostile peer never has to send.
+    #[tokio::test]
+    async fn a_manifest_page_that_breaks_the_ids_is_refused_when_it_arrives() {
+        let job = [0x51; 16];
+        let mut w = wired(job, None);
+        let o = opts("gap", 64 << 20, None);
+        let jobs_dir = o.jobs_dir.clone();
+        let m = small_manifest(&[1, 2, 3]);
+        let mut pages = m.pages(job);
+        assert_eq!(pages.len(), 1);
+        let mut late = pages[0].clone();
+        pages[0].entries.truncate(2);
+        late.entries.drain(..2);
+        late.entries[0].file_id = 7; // a gap: 2 is missing
+        w.router.route_control(frame_of(&pages[0], 0)).await;
+        w.router.route_control(frame_of(&late, 0)).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_job(&mut w.link, upload_open(job), Arc::new(NoopSink), o),
+        )
+        .await
+        .expect("a gap in the manifest's ids was buffered instead of refused");
+        assert!(
+            matches!(r, Err(SendError::Refused { status, .. }) if status == gen::ERR_PROTOCOL),
+            "{r:?}"
+        );
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+    }
+
+    /// Reads control frames until one of type `ty` (or none within 5 s).
+    async fn until(
+        peer: &mut FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        ty: u8,
+    ) -> crate::conn::Frame {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let f = peer.recv().await.expect("the control connection ended");
+                if f.ty == ty {
+                    return f;
+                }
+            }
+        })
+        .await
+        .expect("the frame never came")
+    }
+
+    /// A peer that opens an upload and then sends nothing more (while it keeps the session
+    /// alive) must not hold the job forever: the manifest phase has a deadline, and the sender
+    /// is told `JobCancel(ERR_STALLED)`.
+    #[tokio::test]
+    async fn a_manifest_that_never_comes_ends_the_job_at_the_deadline() {
+        let job = [0x52; 16];
+        let mut w = wired(job, None);
+        let o = opts("silent", 64 << 20, Some(Duration::from_millis(300)));
+        let jobs_dir = o.jobs_dir.clone();
+        let t = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_job(&mut w.link, upload_open(job), Arc::new(NoopSink), o),
+        )
+        .await
+        .expect("the manifest phase waited past its deadline");
+        assert!(matches!(r, Err(SendError::Disconnected(_))), "{r:?}");
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        until(&mut w.peer, JobOpenAck::TYPE).await;
+        let c: JobCancel = until(&mut w.peer, JobCancel::TYPE).await.decode().unwrap();
+        assert_eq!(c.reason, gen::ERR_STALLED);
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+    }
+
+    /// A `JobCancel` during the manifest ends the job there, as it does in the data phase.
+    #[tokio::test]
+    async fn a_cancel_during_the_manifest_ends_the_job() {
+        let job = [0x53; 16];
+        let mut w = wired(job, None);
+        let o = opts("cancel", 64 << 20, None);
+        let jobs_dir = o.jobs_dir.clone();
+        let m = small_manifest(&[1]);
+        w.router.route_control(frame_of(&m.pages(job)[0], 0)).await;
+        let cancel = JobCancel {
+            job_id: job,
+            reason: gen::ERR_CANCELLED,
+        };
+        w.router.route_control(frame_of(&cancel, 0)).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_job(&mut w.link, upload_open(job), Arc::new(NoopSink), o),
+        )
+        .await
+        .expect("the cancel was ignored during the manifest");
+        assert!(
+            matches!(r, Err(SendError::Refused { status, .. }) if status == gen::ERR_CANCELLED),
+            "{r:?}"
+        );
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+    }
+
+    /// A blocking-side gate: `pass` counts the caller in and waits until the test opens it.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        cv: std::sync::Condvar,
+        entered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate {
+        fn pass(&self) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut g = self.open.lock().unwrap();
+            while !*g {
+                g = self.cv.wait(g).unwrap();
+            }
+        }
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+        async fn entered(&self, n: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.entered.load(Ordering::SeqCst) < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the gate was never reached");
+        }
+    }
+
+    /// Small-file writes and syncs held at a gate each, counting the writes.
+    #[derive(Default)]
+    struct GatedSink {
+        write: Gate,
+        sync: Gate,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Sink for GatedSink {
+        fn prepare(&self, _: &Manifest) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_at(&self, _: u32, _: u64, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_whole(&self, _: u32, _: &[u8]) -> io::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.write.pass();
+            Ok(())
+        }
+        fn sync(&self, _: &[u32]) -> io::Result<()> {
+            self.sync.pass();
+            Ok(())
+        }
+        fn read_at(&self, _: u32, _: u64, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        fn commit(&self, _: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn finish(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Opens both gates when the test ends, however it ends: a failed assertion must not leave
+    /// a blocking thread parked at a gate (the runtime's shutdown would wait on it forever).
+    struct OpenOnDrop(Arc<GatedSink>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.write.open();
+            self.0.sync.open();
+        }
+    }
+
+    /// SPEC.md §15.2: a duplicate record for a small file that is being written, or written and
+    /// in the sync batch, is dropped — never written again (a second write truncates the file,
+    /// possibly after the batch synced and journaled it, so a crash leaves a short file the
+    /// journal calls done). Its frame is still acknowledged and its credit returned, so the
+    /// sender (which requeued it after a lane death) is not left waiting.
+    #[tokio::test]
+    async fn a_duplicate_bundle_while_the_first_is_in_flight_is_not_written_again() {
+        let job = [0x54; 16];
+        let w = wired(job, None);
+        let Wired {
+            mut link,
+            router,
+            mut peer,
+            _keep,
+        } = w;
+        let o = opts("dup", 64 << 20, None);
+        let jobs_dir = o.jobs_dir.clone();
+        let data = b"tiny file".to_vec();
+        let m = Arc::new(small_manifest(&[data.len() as u64]));
+        let sink = Arc::new(GatedSink::default());
+        let _open = OpenOnDrop(sink.clone());
+        let s2: Arc<dyn Sink> = sink.clone();
+        let task = tokio::spawn(async move { run(&mut link, m, None, s2, o).await });
+        let bundle = Bundle {
+            job_id: job,
+            records: vec![gen::BundleRecord {
+                file_id: 0,
+                root: *blake3::hash(&data).as_bytes(),
+                data: data.clone(),
+            }],
+        };
+        let len = frame_of(&bundle, 0).body.len() as u64;
+        // The first copy is being written; a second arrives.
+        router.route_lane(1, frame_of(&bundle, 0)).await;
+        sink.write.entered(1).await;
+        router.route_lane(1, frame_of(&bundle, 1)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            sink.writes.load(Ordering::SeqCst),
+            1,
+            "a duplicate of a file being written was written again"
+        );
+        // The file is written and its batch is syncing; a third copy arrives.
+        sink.write.open();
+        sink.sync.entered(1).await;
+        router.route_lane(1, frame_of(&bundle, 2)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            sink.writes.load(Ordering::SeqCst),
+            1,
+            "a duplicate of a file in the sync batch was written again"
+        );
+        sink.sync.open();
+        // Every copy is acknowledged and its credit comes back before the job is done.
+        let (mut received, mut credit) = (0, 0u64);
+        let done = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let f = peer.recv().await.expect("the control connection ended");
+                match f.ty {
+                    Received::TYPE => received += 1,
+                    Credit::TYPE => credit += f.decode::<Credit>().unwrap().bytes,
+                    JobDone::TYPE => return f.decode::<JobDone>().unwrap(),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the job never finished");
+        assert_eq!(done.status, gen::STATUS_OK);
+        assert_eq!(received, 3);
+        assert_eq!(credit, 3 * len);
+        task.await.unwrap().unwrap();
+        assert_eq!(sink.writes.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+    }
+
+    /// The lanes a test opener was asked to close.
+    #[derive(Default)]
+    struct Closes(Mutex<Vec<u16>>);
+
+    impl crate::router::LaneOpener for Closes {
+        fn open(&self) -> crate::router::BoxFut<'_, Result<u16, crate::Ava1Error>> {
+            Box::pin(async { Err(crate::Ava1Error::Lost("no lanes in this test".into())) })
+        }
+        fn close(&self, id: u16) {
+            self.0.lock().unwrap().push(id);
+        }
+    }
+
+    /// SPEC.md §12.4: a lane frame past the credit outstanding is answered with a sealed
+    /// `Error{ERR_CREDIT}` on that lane and the lane is closed — the receiver does not leave it
+    /// open for a peer that ignores the Error to keep pushing 16 MiB frames through.
+    #[tokio::test]
+    async fn a_frame_past_the_credit_gets_err_credit_and_its_lane_is_closed() {
+        let job = [0x55; 16];
+        let closes = Arc::new(Closes::default());
+        let w = wired(job, Some(closes.clone()));
+        let Wired {
+            mut link,
+            router,
+            _keep,
+            ..
+        } = w;
+        let (lane_out, mut lane_peer, _lane_keep) = piped();
+        let gen_no = router.lane_up(4, lane_out);
+        let closer = router.lane_closer(4, gen_no).expect("the lane is up");
+        let o = opts("credit", 1000, None);
+        let jobs_dir = o.jobs_dir.clone();
+        let m = Arc::new(small_manifest(&[10]));
+        let task = tokio::spawn(async move {
+            let _ = run(&mut link, m, None, Arc::new(NoopSink), o).await;
+        });
+        let mut body = vec![0u8; 2000];
+        body[..16].copy_from_slice(&job);
+        router
+            .route_lane(
+                4,
+                crate::conn::Frame {
+                    ty: Chunk::TYPE,
+                    flags: 0,
+                    channel: 0,
+                    body,
+                },
+            )
+            .await;
+        let f = until(&mut lane_peer, gen::Error::TYPE).await;
+        assert_eq!(f.decode::<gen::Error>().unwrap().code, gen::ERR_CREDIT);
+        tokio::time::timeout(Duration::from_secs(5), closer.notified())
+            .await
+            .expect("the lane was not closed after ERR_CREDIT");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while closes.0.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dialling side's opener was not asked to close the lane");
+        assert_eq!(*closes.0.lock().unwrap(), vec![4]);
+        task.abort();
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+    }
+
+    /// A `LocalSink` with optional gates at the entry of `prepare` and of `finish`.
+    struct HookSink {
+        inner: LocalSink,
+        prepare: Option<Arc<Gate>>,
+        finish: Option<Arc<Gate>>,
+    }
+
+    impl Sink for HookSink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            if let Some(g) = &self.prepare {
+                g.pass();
+            }
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, d: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, d)
+        }
+        fn write_whole(&self, id: u32, d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, d)
+        }
+        fn write_whole_root(&self, id: u32, root: &[u8; 32], d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole_root(id, root, d)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn enable_log(&self, dir: &Path) {
+            self.inner.enable_log(dir)
+        }
+        fn sync_batch(&self, small: &[u32], large: &[u32]) -> io::Result<Vec<LoggedGroup>> {
+            self.inner.sync_batch(small, large)
+        }
+        fn batch_journaled(&self, g: &[LoggedGroup]) {
+            self.inner.batch_journaled(g)
+        }
+        fn unswept(&self) -> usize {
+            self.inner.unswept()
+        }
+        fn log_pressure(&self) -> bool {
+            self.inner.log_pressure()
+        }
+        fn sweep(&self, force: bool) -> io::Result<Vec<u32>> {
+            self.inner.sweep(force)
+        }
+        fn sweep_journaled(&self, ids: &[u32]) {
+            self.inner.sweep_journaled(ids)
+        }
+        fn recover_log(&self, st: &State) -> io::Result<Vec<u32>> {
+            self.inner.recover_log(st)
+        }
+        fn log_cleanup(&self) {
+            self.inner.log_cleanup()
+        }
+        fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, b)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            self.inner.commit(id)
+        }
+        fn sync_committed(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync_committed(ids)
+        }
+        fn finish(&self) -> io::Result<()> {
+            if let Some(g) = &self.finish {
+                g.pass();
+            }
+            self.inner.finish()
+        }
+        fn resume_key(&self) -> Option<(String, bool)> {
+            self.inner.resume_key()
+        }
+        fn resume_staged(&self, journaled: bool, all_done: bool) {
+            self.inner.resume_staged(journaled, all_done)
+        }
+    }
+
+    fn staged_opts(jobs_dir: &Path) -> RecvOptions {
+        RecvOptions {
+            credit: 64 << 20,
+            flags: 0,
+            jobs_dir: jobs_dir.to_path_buf(),
+            ordered: false,
+            progress: Arc::default(),
+            cancel: Arc::default(),
+            progress_deadline: None,
+        }
+    }
+
+    /// A retry that starts while the first attempt is still in its end sequence (the session
+    /// dropped as the download finished; the first attempt's finish runs on regardless) must
+    /// not end with "appeared during the download". The retry's sink was built before the first
+    /// attempt renamed the staged tree into place, so it too decided to stage; the job directory
+    /// admits one receiver at a time, and the retry settles its staging on the journal (an
+    /// already-renamed tree is finished in place), so both end well and the files are at the root.
+    #[tokio::test]
+    async fn a_retry_that_overlaps_the_first_attempts_finish_ends_with_the_files_in_place() {
+        let job = [0x56; 16];
+        let d = std::env::temp_dir().join(format!("ava1-recv-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (root, jobs) = (d.join("got"), d.join("jobs"));
+        let data = b"the only file".to_vec();
+        let m = Arc::new(small_manifest(&[data.len() as u64]));
+        let bundle = Bundle {
+            job_id: job,
+            records: vec![gen::BundleRecord {
+                file_id: 0,
+                root: *blake3::hash(&data).as_bytes(),
+                data: data.clone(),
+            }],
+        };
+        let (f1, p2) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+        struct OpenGates(Vec<Arc<Gate>>);
+        impl Drop for OpenGates {
+            fn drop(&mut self) {
+                for g in &self.0 {
+                    g.open();
+                }
+            }
+        }
+        let _open = OpenGates(vec![f1.clone(), p2.clone()]);
+        // The first attempt: every file arrives, and it stops at the door of `finish`.
+        let Wired {
+            link: mut link1,
+            router: router1,
+            _keep: _keep1,
+            ..
+        } = wired(job, None);
+        let sink1: Arc<dyn Sink> = Arc::new(HookSink {
+            inner: LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()),
+            prepare: None,
+            finish: Some(f1.clone()),
+        });
+        let (m1, o1) = (m.clone(), staged_opts(&jobs));
+        let first = tokio::spawn(async move { run(&mut link1, m1, None, sink1, o1).await });
+        router1.route_lane(1, frame_of(&bundle, 0)).await;
+        f1.entered(1).await;
+        // The retry, on a new session, while the first is held in its finish: the root is not
+        // there yet, so its sink stages too.
+        let Wired {
+            link: mut link2,
+            _keep: _keep2,
+            ..
+        } = wired(job, None);
+        let sink2: Arc<dyn Sink> = Arc::new(HookSink {
+            inner: LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()),
+            prepare: Some(p2.clone()),
+            finish: None,
+        });
+        let (m2, o2) = (m.clone(), staged_opts(&jobs));
+        let second = tokio::spawn(async move { run(&mut link2, m2, None, sink2, o2).await });
+        // Give the retry the chance to get as far as it can.
+        let _ = tokio::time::timeout(Duration::from_millis(500), p2.entered(1)).await;
+        f1.open();
+        let r1 = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first attempt never ended")
+            .unwrap();
+        p2.open();
+        let r2 = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the retry never ended")
+            .unwrap();
+        assert!(r1.is_ok(), "the first attempt: {:?}", r1.err());
+        assert!(r2.is_ok(), "the retry: {:?}", r2.err());
+        assert_eq!(std::fs::read(root.join("f0")).unwrap(), data);
+        assert!(
+            !d.join("got.ava-part").exists(),
+            "a staging tree was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The other side of the same rule: a staged job whose root appeared from elsewhere while
+    /// its tree is still in `.ava-part` is refused at the end (`ERR_EXISTS`, as the C receiver,
+    /// ctest `a_staged_tree_is_not_moved_over_a_root_that_appeared`) — also when the run that
+    /// ends it is a resume whose sink, seeing the root, would have decided not to stage. Its
+    /// done files are in `.ava-part`; reporting the job done in place would lose them.
+    #[tokio::test]
+    async fn a_resume_of_a_staged_job_whose_root_appeared_is_refused_not_finished_in_place() {
+        let job = [0x57; 16];
+        let d = std::env::temp_dir().join(format!("ava1-recv-appeared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (root, jobs) = (d.join("got"), d.join("jobs"));
+        let data = b"the only file".to_vec();
+        let m = Arc::new(small_manifest(&[data.len() as u64]));
+        // The first attempt: the file is written and journaled in `.ava-part`, then the session
+        // ends before the finish (it is held at the door, and the run is dropped there).
+        let f1 = Arc::new(Gate::default());
+        let Wired {
+            link: mut link1,
+            router: router1,
+            _keep: _keep1,
+            ..
+        } = wired(job, None);
+        let sink1: Arc<dyn Sink> = Arc::new(HookSink {
+            inner: LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()),
+            prepare: None,
+            finish: Some(f1.clone()),
+        });
+        let (m1, o1) = (m.clone(), staged_opts(&jobs));
+        let first = tokio::spawn(async move { run(&mut link1, m1, None, sink1, o1).await });
+        let bundle = Bundle {
+            job_id: job,
+            records: vec![gen::BundleRecord {
+                file_id: 0,
+                root: *blake3::hash(&data).as_bytes(),
+                data: data.clone(),
+            }],
+        };
+        router1.route_lane(1, frame_of(&bundle, 0)).await;
+        f1.entered(1).await;
+        // Someone else's folder appears at the root; the held finish then refuses it.
+        std::fs::create_dir_all(&root).unwrap();
+        f1.open();
+        let r1 = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first attempt never ended")
+            .unwrap();
+        assert!(
+            matches!(&r1, Err(SendError::Refused { status, .. }) if *status == gen::ERR_EXISTS),
+            "{r1:?}"
+        );
+        assert_eq!(std::fs::read(d.join("got.ava-part/f0")).unwrap(), data);
+        // Remove the Done the refusal journaled: the state of a run that ended (a crash, a
+        // dropped session) after the batch and before its finish.
+        let dir = journal::job_dir(&jobs, &job);
+        let (_, recs) = Journal::open(&dir).unwrap();
+        let open = match &recs[0] {
+            Record::Open(o) => o.clone(),
+            r => panic!("expected the Open record, got {r:?}"),
+        };
+        assert_eq!(open.staged, 1);
+        let mut j = Journal::create(&dir, &open).unwrap();
+        for r in recs
+            .iter()
+            .skip(1)
+            .filter(|r| !matches!(r, Record::Done(_)))
+        {
+            j.append(r).unwrap();
+        }
+        drop(j);
+        // The resume: its sink sees the root and would write in place.
+        let Wired {
+            link: mut link2,
+            _keep: _keep2,
+            ..
+        } = wired(job, None);
+        let sink2: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()));
+        let r2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(&mut link2, m.clone(), None, sink2, staged_opts(&jobs)),
+        )
+        .await
+        .expect("the resume never ended");
+        assert!(
+            matches!(&r2, Err(SendError::Refused { status, .. }) if *status == gen::ERR_EXISTS),
+            "a resume called the job done while its files are in .ava-part: {r2:?}"
+        );
+        assert_eq!(std::fs::read(d.join("got.ava-part/f0")).unwrap(), data);
+        assert!(!root.join("f0").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Setup of a resumed job (run by hand: `cargo test --release -p ava1 --lib
+    /// resume_setup_probe -- --ignored --nocapture`): a single-file job with 512 MiB durable
+    /// in its part file is resumed on a current-thread runtime, and a ticker on the same
+    /// runtime records its longest gap — how long setup held the runtime thread (the §13.4
+    /// re-check reads and hashes every durable group). Prints the setup time and that gap.
+    #[tokio::test]
+    #[ignore]
+    async fn resume_setup_probe() {
+        const DURABLE: u64 = 512 << 20;
+        let job = [0x58; 16];
+        let d = std::env::temp_dir().join(format!("ava1-recv-rprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (root, jobs) = (d.join("big.bin"), d.join("jobs"));
+        let size = 2 * DURABLE;
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size,
+                mtime: 0,
+                path: "big.bin".into(),
+                root: None,
+            }],
+        });
+        // The state a first run leaves: the durable half in the part file, its CVs in the
+        // outboard, the range in the journal.
+        let dir = journal::job_dir(&jobs, &job);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..DURABLE as usize)
+            .map(|i| ((i * 31) >> 7) as u8)
+            .collect();
+        std::fs::write(d.join("big.bin.ava-part"), &data).unwrap();
+        let mut ob = Outboard::open(&dir.join("0.ob"), verify::groups(size)).unwrap();
+        for (g, chunk) in data.chunks(GROUP as usize).enumerate() {
+            ob.put(g as u64, &verify::group_cv(chunk, g as u64))
+                .unwrap();
+        }
+        ob.sync().unwrap();
+        drop(ob);
+        let open = JnlOpen {
+            job_id: job,
+            manifest_hash: m.hash(),
+            kind: gen::JOB_DOWNLOAD,
+            flags: 0,
+            staged: 0,
+            root: root.to_string_lossy().into_owned(),
+        };
+        journal::write_manifest(&dir, &m).unwrap();
+        let mut j = Journal::create(&dir, &open).unwrap();
+        j.append(&Record::Batch(JnlBatch {
+            files: Vec::new(),
+            ranges: vec![FileRange {
+                file_id: 0,
+                offset: 0,
+                len: DURABLE,
+            }],
+            roots: Vec::new(),
+            pack_len: None,
+            pack_offset: None,
+            pack_segment: None,
+        }))
+        .unwrap();
+        drop(j);
+        let gap = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = {
+            let gap = gap.clone();
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let g = last.elapsed().as_micros() as u64;
+                    gap.fetch_max(g, Ordering::Relaxed);
+                    last = Instant::now();
+                }
+            })
+        };
+        let Wired {
+            mut link,
+            mut peer,
+            _keep,
+            ..
+        } = wired(job, None);
+        let o = staged_opts(&jobs);
+        let cancel = o.cancel.clone();
+        let sink: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), true).with_log(false, PackOpts::default()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gap.store(0, Ordering::Relaxed);
+        let t = Instant::now();
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let map: gen::JobMap = until(&mut peer, gen::JobMap::TYPE).await.decode().unwrap();
+        let setup = t.elapsed();
+        assert_eq!(
+            map.partial.len(),
+            1,
+            "the durable range survived the re-check"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        let _ = task.await;
+        ticker.abort();
+        eprintln!(
+            "RESUME setup={:.0}ms longest runtime stall={:.0}ms ({} MiB re-checked)",
+            setup.as_secs_f64() * 1000.0,
+            gap.load(Ordering::Relaxed) as f64 / 1000.0,
+            DURABLE >> 20
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

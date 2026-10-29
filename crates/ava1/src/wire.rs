@@ -1,55 +1,81 @@
 //! Encoding rules shared by every generated message (SPEC.md §3).
 
+/// Why a message body did not decode (SPEC.md §3).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
+    /// The body ends inside a field.
     #[error("message ends early")]
     Short,
+    /// Bytes are left over after the message (the count).
     #[error("{0} unexpected bytes after the message")]
     Trailing(usize),
+    /// A `str` field is not valid UTF-8.
     #[error("text field is not valid UTF-8")]
     Utf8,
+    /// A known extension tag appears twice (the tag).
     #[error("extension tag {0} appears twice")]
     DupExt(u16),
 }
 
+/// Why a message could not be encoded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
+    /// A `str` field is longer than 65535 bytes (its length).
     #[error("text field of {0} bytes is over 65535")]
     StrTooLong(usize),
+    /// A `bytes` field, extension value or records list is longer than `u32::MAX` bytes (its
+    /// length).
     #[error("byte field of {0} bytes is over 4 GiB")]
     BytesTooLong(usize),
 }
 
+/// Appends fields in the SPEC.md §3 encoding to a buffer.
 #[derive(Default)]
 pub struct Writer {
+    /// The bytes written so far.
     pub buf: Vec<u8>,
 }
 
 impl Writer {
+    /// An empty writer.
     pub fn new() -> Self {
         Self::default()
     }
+    /// An empty writer with room for `n` bytes: a body encoded into it in one pass is
+    /// copied once, never regrown (a large `bytes` field otherwise reallocates at its tail).
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(n),
+        }
+    }
+    /// Appends one byte.
     pub fn u8(&mut self, v: u8) {
         self.buf.push(v);
     }
+    /// Appends `v` little-endian.
     pub fn u16(&mut self, v: u16) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    /// Appends `v` little-endian.
     pub fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    /// Appends `v` little-endian.
     pub fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    /// Appends `v` as is, with no length (a `b16` or `b32` field).
     pub fn fixed(&mut self, v: &[u8]) {
         self.buf.extend_from_slice(v);
     }
+    /// Appends a `bytes` field: u32 length, then `v`. Fails if `v` is over `u32::MAX` bytes.
     pub fn bytes(&mut self, v: &[u8]) -> Result<(), EncodeError> {
         let n = u32::try_from(v.len()).map_err(|_| EncodeError::BytesTooLong(v.len()))?;
         self.u32(n);
         self.fixed(v);
         Ok(())
     }
+    /// Appends a `str` field: u16 length, then the UTF-8. Fails if `v` is over 65535 bytes.
     pub fn str(&mut self, v: &str) -> Result<(), EncodeError> {
         let n = u16::try_from(v.len()).map_err(|_| EncodeError::StrTooLong(v.len()))?;
         self.u16(n);
@@ -93,42 +119,52 @@ impl Writer {
     }
 }
 
+/// Reads fields in the SPEC.md §3 encoding from a byte slice, front to back.
 pub struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
+    /// A reader at the start of `b`.
     pub fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
+    /// The next `n` bytes; `Short` if fewer are left.
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.pos.checked_add(n).ok_or(DecodeError::Short)?;
         let s = self.b.get(self.pos..end).ok_or(DecodeError::Short)?;
         self.pos = end;
         Ok(s)
     }
+    /// Reads one byte.
     pub fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
+    /// Reads a little-endian `u16`.
     pub fn u16(&mut self) -> Result<u16, DecodeError> {
         Ok(u16::from_le_bytes(self.fixed::<2>()?))
     }
+    /// Reads a little-endian `u32`.
     pub fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.fixed::<4>()?))
     }
+    /// Reads a little-endian `u64`.
     pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.fixed::<8>()?))
     }
+    /// Reads `N` raw bytes (a `b16` or `b32` field).
     pub fn fixed<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
         let mut a = [0u8; N];
         a.copy_from_slice(self.take(N)?);
         Ok(a)
     }
+    /// Reads a `bytes` field: u32 length, then that many bytes.
     pub fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
     }
+    /// Reads a `str` field: u16 length, then UTF-8 (`Utf8` if it is not valid).
     pub fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.u16()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::Utf8)
@@ -144,6 +180,7 @@ impl<'a> Reader<'a> {
         }
         Ok(out)
     }
+    /// `Trailing` if any bytes are left unread; call it once the message is read.
     pub fn finish(&self) -> Result<(), DecodeError> {
         match self.b.len() - self.pos {
             0 => Ok(()),
@@ -152,10 +189,16 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A message from `schema/ava1.toml`, encoded and decoded by generated code (SPEC.md §3).
 pub trait Message: Sized {
+    /// The message's name in the schema.
     const NAME: &'static str;
+    /// Appends the message's encoding to `w`.
     fn encode_into(&self, w: &mut Writer) -> Result<(), EncodeError>;
+    /// Decodes a whole body. A short body, trailing bytes, invalid UTF-8 or a repeated known
+    /// extension is an error; unknown extensions are skipped.
     fn decode(b: &[u8]) -> Result<Self, DecodeError>;
+    /// The message's encoding.
     fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let mut w = Writer::new();
         self.encode_into(&mut w)?;
@@ -165,6 +208,7 @@ pub trait Message: Sized {
 
 /// A message that travels as a frame of its own type.
 pub trait FrameMessage: Message {
+    /// The frame type this message travels as.
     const TYPE: u8;
 }
 
@@ -172,6 +216,7 @@ pub trait FrameMessage: Message {
 pub struct SplitMix(pub u64);
 
 impl SplitMix {
+    /// The next value of the SplitMix64 sequence.
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
@@ -179,14 +224,17 @@ impl SplitMix {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+    /// A value in `0..n`, by modulo (slightly biased). Panics if `n` is 0.
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
+    /// Fills `b`, one `next_u64` (its low byte) per byte.
     pub fn fill(&mut self, b: &mut [u8]) {
         for x in b {
             *x = self.next_u64() as u8;
         }
     }
+    /// A string of 0..=`max` lowercase ASCII letters.
     pub fn ascii(&mut self, max: usize) -> String {
         let n = self.below(max as u64 + 1) as usize;
         (0..n)

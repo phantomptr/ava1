@@ -646,6 +646,13 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
             return 0;
         }
         pthread_mutex_lock(&j->mu);
+        if (s->have_map) {
+            /* The map is final once its last page is in: the reader may already be reading
+             * skip and the durable range sets without the lock, so a later map (a Resume's
+             * answer, or a peer's stray one) must not touch them. Re-sending is always safe. */
+            pthread_mutex_unlock(&j->mu);
+            return 0;
+        }
         ava1_r_init(&it, m.done, m.done_len);
         while (ava1_file_run_next(&it, &r) == 1) {
             uint32_t f;

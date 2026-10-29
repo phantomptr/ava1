@@ -83,6 +83,19 @@ jobs:
       - run: cargo build -p ava1 -p ava1-gen --examples
       - run: cargo test -p ava1-gen
 
+  msrv:
+    name: rust build (MSRV, rust-version in Cargo.toml)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: The toolchain Cargo.toml names
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - run: cargo +"$MSRV" build -p ava1 -p ava1-gen --examples --locked
+
   ctest:
     name: C interop ${{ matrix.shard }}/2
     runs-on: ubuntu-24.04
@@ -182,7 +195,7 @@ jobs:
   gate:
     name: ci gate
     if: always()
-    needs: [lint, test, windows, ctest, sanitize, c, fuzz, package]
+    needs: [lint, test, windows, msrv, ctest, sanitize, c, fuzz, package]
     runs-on: ubuntu-24.04
     steps:
       - name: Every job passed

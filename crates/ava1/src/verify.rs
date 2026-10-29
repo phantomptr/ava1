@@ -56,6 +56,8 @@ pub struct FileHasher {
 }
 
 impl FileHasher {
+    /// A hasher for a file of `size` bytes with no groups known yet (an empty file's
+    /// root is known at once).
     pub fn new(size: u64) -> Self {
         let n = groups(size);
         Self {
@@ -69,7 +71,9 @@ impl FileHasher {
         }
     }
 
-    /// `data` is all of group `index` (shorter only for the last group).
+    /// `data` is all of group `index` (shorter only for the last group). Panics when `index` is
+    /// past the last group: callers index groups of the bytes they read from the file's own
+    /// extent, so that is a caller bug, never input.
     pub fn add_group(&mut self, index: u64, data: &[u8]) {
         if self.cvs.is_empty() {
             self.single = Some(*blake3::hash(data).as_bytes());
@@ -78,16 +82,22 @@ impl FileHasher {
         }
     }
 
+    /// Records group `index`'s chaining value computed elsewhere (an outboard, on resume).
+    /// Ignored for a file of fewer than two groups or an `index` past the last group.
     pub fn set_cv(&mut self, index: u64, cv: [u8; 32]) {
         if let Some(slot) = self.cvs.get_mut(index as usize) {
             *slot = Some(cv);
         }
     }
 
+    /// Group `index`'s chaining value if known; always `None` for a file of fewer than two
+    /// groups.
     pub fn cv(&self, index: u64) -> Option<[u8; 32]> {
         self.cvs.get(index as usize).copied().flatten()
     }
 
+    /// The group indices still needed before [`root`](Self::root) can answer; `[0]` for
+    /// an unhashed file of one group.
     pub fn missing(&self) -> Vec<u64> {
         if self.cvs.is_empty() {
             return if self.single.is_some() {
@@ -101,6 +111,7 @@ impl FileHasher {
             .collect()
     }
 
+    /// The file's BLAKE3 root (SPEC.md §13.1) once every group is known, else `None`.
     pub fn root(&self) -> Option<[u8; 32]> {
         if self.cvs.is_empty() {
             return self.single;
@@ -109,6 +120,7 @@ impl FileHasher {
         all.map(|v| root_from_cvs(&v))
     }
 
+    /// The file size this hasher was made for, in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -141,6 +153,9 @@ pub struct Outboard {
 }
 
 impl Outboard {
+    /// Opens or creates the outboard at `path` for a file of `groups` groups and reads
+    /// the slots it already holds. Fails with `InvalidInput` when `groups` is more than
+    /// [`MAX_OUTBOARD_GROUPS`].
     pub fn open(path: &Path, groups: u64) -> io::Result<Self> {
         // The group count comes from a size a peer declared: refuse an absurd one before
         // allocating `groups * 32` bytes for it.
@@ -181,10 +196,14 @@ impl Outboard {
         })
     }
 
+    /// Group `i`'s CV, or `None` when it is not known yet or `i` is past the last group.
     pub fn get(&self, i: u64) -> Option<[u8; 32]> {
         self.slots.get(i as usize).copied().flatten()
     }
 
+    /// Stages group `i`'s CV in the shadow file (`<path>.tmp`); it reaches the outboard at
+    /// the next [`sync`](Self::sync). Panics when `i` is past the last group. After a
+    /// write error the instance is poisoned and refuses every later `put` and `sync`.
     pub fn put(&mut self, i: u64, cv: &[u8; 32]) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(
@@ -219,6 +238,8 @@ impl Outboard {
         }
     }
 
+    /// Makes the staged CVs durable: syncs the shadow and renames it over the outboard
+    /// (only syncs the outboard when nothing was staged).
     pub fn sync(&mut self) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(

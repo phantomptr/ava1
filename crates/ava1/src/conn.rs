@@ -25,7 +25,9 @@ pub(crate) const NONCE_CEILING: u64 = u64::MAX - 1;
 /// (review 003 §5 of 01).
 #[derive(Debug, Clone)]
 pub enum FrameBody {
+    /// A body the frame owns.
     Owned(Vec<u8>),
+    /// A body shared with the sender's bookkeeping, which keeps it for a resend.
     Shared(Arc<Vec<u8>>),
 }
 
@@ -51,15 +53,24 @@ impl From<Arc<Vec<u8>>> for FrameBody {
     }
 }
 
+/// A received frame: its header fields and its body, opened (MAC stripped) when the
+/// reader is keyed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    /// Frame type (SPEC.md §2).
     pub ty: u8,
+    /// Header flags as received ([`FLAG_SEALED`], [`FLAG_IGNORABLE`]).
     pub flags: u8,
+    /// The header's channel; its meaning depends on the frame type (an RPC's request id, for
+    /// example).
     pub channel: u32,
+    /// The plaintext body.
     pub body: Vec<u8>,
 }
 
 impl Frame {
+    /// Decodes the body as `M`: `Unexpected` if the frame is of another type, `Decode` if the
+    /// body is malformed.
     pub fn decode<M: FrameMessage>(&self) -> Result<M, Ava1Error> {
         if self.ty != M::TYPE {
             return Err(Ava1Error::Unexpected(self.ty));
@@ -83,7 +94,10 @@ pub(crate) fn now_us() -> u64 {
 /// moved for `idle`, or one frame slower than `min_rate` bytes/s after an `idle` grace.
 #[derive(Debug, Clone, Copy)]
 pub struct Pace {
+    /// Longest a connection may go with no byte moved.
     pub idle: Duration,
+    /// Bytes per second one frame must at least move at, after the `idle` grace (0 counts
+    /// as 1).
     pub min_rate: u32,
 }
 
@@ -93,6 +107,8 @@ impl Pace {
     }
 }
 
+/// Writes frames to a byte stream, sealed once [`set_key`](Self::set_key) has been called
+/// (SPEC.md §4.4). Once a write fails part-way, every later send fails with `Lost`.
 pub struct FrameWriter<W> {
     w: W,
     key: Option<Zeroizing<[u8; 32]>>,
@@ -103,6 +119,7 @@ pub struct FrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
+    /// A writer that sends unsealed frames with no pace bound until configured.
     pub fn new(w: W) -> Self {
         Self {
             w,
@@ -138,10 +155,15 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.ctr = n;
     }
 
+    /// Sends one frame (sealed when keyed). Fails with `Header(TooLong)` when the body plus MAC
+    /// is over `MAX_BODY`, `Lost` when the writer is broken or the nonce space is spent, and
+    /// `Timeout`, `Closed` or `Io` when the write itself fails.
     pub async fn send(&mut self, ty: u8, channel: u32, body: &[u8]) -> Result<(), Ava1Error> {
         self.send_with_flags(ty, 0, channel, body).await
     }
 
+    /// `send` with `FLAG_IGNORABLE`: a receiver that does not know `ty` skips the frame
+    /// (SPEC.md §2).
     pub async fn send_ignorable(
         &mut self,
         ty: u8,
@@ -231,6 +253,8 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
+    /// Encodes `m` and sends it as a frame of type `M::TYPE` on `channel`; `Encode` if a field
+    /// is over its length limit.
     pub async fn send_msg<M: FrameMessage>(
         &mut self,
         channel: u32,
@@ -240,6 +264,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.send(M::TYPE, channel, &b).await
     }
 
+    /// Flushes and shuts down the underlying stream's write side.
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.w.shutdown().await
     }
@@ -250,6 +275,8 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 }
 
+/// Reads frames from a byte stream, opened once [`set_key`](Self::set_key) has been called
+/// (SPEC.md §4.4).
 pub struct FrameReader<R> {
     r: R,
     key: Option<Zeroizing<[u8; 32]>>,
@@ -296,6 +323,24 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Ok(())
     }
 
+    /// Appends bytes to `buf` until it holds `len`. The body is read into the vector's
+    /// spare capacity, never zero-filled first: the fill was a whole extra pass over every
+    /// frame body.
+    async fn fill_vec(&mut self, buf: &mut Vec<u8>, len: usize) -> Result<(), Ava1Error> {
+        while buf.len() < len {
+            // `take` bounds the read: bytes past this body belong to the next frame.
+            let want = (len - buf.len()) as u64;
+            let n = (&mut self.r).take(want).read_buf(buf).await?;
+            if n == 0 {
+                return Err(Ava1Error::Closed);
+            }
+            if let Some(p) = &self.progress {
+                p.store(now_us(), Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     /// Open every following frame with `key`; the counter restarts at 0 (see
     /// `FrameWriter::set_key`: handshake and lane join only).
     pub fn set_key(&mut self, key: [u8; 32]) {
@@ -313,10 +358,16 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         self.ctr = n;
     }
 
+    /// Sets the largest body `recv` accepts, MAC included; capped at `MAX_BODY`.
     pub fn set_max_body(&mut self, n: u32) {
         self.max_body = n.min(MAX_BODY);
     }
 
+    /// Reads the next frame. Fails with `Header` on bad magic, a bad CRC or a body over the
+    /// reader's limit; `Closed` at end of stream; `Lost` when a paced body arrives too slowly or
+    /// the nonce space is spent; `BadTag` when a keyed reader gets an unsealed frame or one that
+    /// fails to open; `Unexpected` when an unkeyed reader gets a sealed frame. The connection is
+    /// to be closed after any of these (SPEC.md §2, §4.4).
     pub async fn recv(&mut self) -> Result<Frame, Ava1Error> {
         let mut hb = [0u8; HEADER_LEN];
         self.fill(&mut hb).await?;
@@ -324,17 +375,18 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         if h.body_len > self.max_body {
             return Err(HeaderError::TooLong(h.body_len).into());
         }
-        let mut body = vec![0u8; h.body_len as usize];
+        let len = h.body_len as usize;
+        let mut body = Vec::with_capacity(len);
         match self.pace {
-            None => self.fill(&mut body).await?,
+            None => self.fill_vec(&mut body, len).await?,
             Some(p) => {
-                let budget = p.frame_budget(body.len());
-                tokio::time::timeout(budget, self.fill(&mut body))
+                let budget = p.frame_budget(len);
+                tokio::time::timeout(budget, self.fill_vec(&mut body, len))
                     .await
                     .map_err(|_| {
                         Ava1Error::Lost(format!(
                             "a {}-byte frame took over {} ms to arrive",
-                            body.len(),
+                            len,
                             budget.as_millis()
                         ))
                     })??;

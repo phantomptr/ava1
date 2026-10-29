@@ -3,7 +3,12 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+/// Positioned reads from one open file. Readers run on their own threads, so each holds
+/// its own `ReadAt`.
 pub trait ReadAt: Send {
+    /// Reads up to `buf.len()` bytes starting at byte `off` of the file and returns how many
+    /// were read; 0 means `off` is at or past the end. May return fewer bytes than asked
+    /// (see [`read_full_at`]).
     fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<usize>;
 }
 
@@ -21,19 +26,28 @@ pub fn read_full_at(r: &mut dyn ReadAt, off: u64, buf: &mut [u8]) -> io::Result<
     Ok(n)
 }
 
+/// What a [`Source`] reports about one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceMeta {
+    /// Length in bytes; 0 for a directory.
     pub size: u64,
     /// Seconds since the Unix epoch.
     pub mtime: u64,
+    /// Permission bits. [`LocalSource`] reports the file mode's `0o7777` bits on Unix, and
+    /// `0o755` for a directory or `0o644` for a file on other platforms.
     pub mode: u32,
+    /// Whether the entry is a directory.
     pub is_dir: bool,
 }
 
+/// A tree a sender reads files from: local disk ([`LocalSource`]) or any other backend.
+/// `rel` is always a path relative to the source's root (module docs).
 pub trait Source: Send + Sync {
+    /// Opens the file at `rel` for positioned reads.
     fn open(&self, rel: &str) -> io::Result<Box<dyn ReadAt>>;
     /// Direct children of `rel`: (name, metadata).
     fn list(&self, rel: &str) -> io::Result<Vec<(String, SourceMeta)>>;
+    /// Metadata of the entry at `rel` ("" is the root).
     fn stat(&self, rel: &str) -> io::Result<SourceMeta>;
     /// Called once when the upload that reads this source is ending, before its readers
     /// are joined. A source whose reads can park on something other than a disk (a
@@ -49,6 +63,7 @@ pub struct SeekReader<T> {
 }
 
 impl<T> SeekReader<T> {
+    /// Wraps `inner`; the first read always seeks.
     pub fn new(inner: T) -> Self {
         Self { inner, pos: None }
     }
@@ -71,6 +86,7 @@ pub struct LocalSource {
 }
 
 impl LocalSource {
+    /// A source rooted at the directory or file `root`. Symlinks under it are followed.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }

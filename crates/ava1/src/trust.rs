@@ -1,16 +1,23 @@
 //! The trust slot in the payload ELF (SPEC.md §5.1).
 
+/// The 9 bytes a trust slot starts with.
 pub const MAGIC: &[u8; 9] = b"AVA1TRUST";
+/// Size of a trust slot: magic, state, 6 zero bytes, a 32-byte key, a 16-byte launch token.
 pub const SLOT_LEN: usize = 64;
 /// Slot states: never stamped, a key, a key and a launch token (SPEC.md §5.2).
 pub const STATE_EMPTY: u8 = 0;
+/// Slot state: a key is stamped.
 pub const STATE_KEY: u8 = 1;
+/// Slot state: a key and a launch token are stamped.
 pub const STATE_LAUNCH: u8 = 2;
 
+/// Why an ELF cannot be stamped.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
+    /// No trust slot was found.
     #[error("this ELF has no AVA1 trust slot")]
     NoSlot,
+    /// More than one slot was found (the count), so which to stamp is ambiguous.
     #[error("this ELF has {0} AVA1 trust slots; expected exactly one")]
     Many(usize),
 }

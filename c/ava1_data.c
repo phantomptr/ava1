@@ -31,6 +31,7 @@ uint32_t ava1_data_test_map_delay_ms;
 int ava1_data_test_ack_fail;
 int ava1_data_test_feeder_fail;
 uint32_t ava1_data_test_feed_delay_ms;
+uint32_t ava1_data_test_feed_check_delay_ms, ava1_data_test_reprep_delay_ms;
 int ava1_data_test_reserve_fail;
 int ava1_data_test_lane_alloc_fail;
 int ava1_data_test_fb_force;
@@ -391,6 +392,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     D.admitted = 0;
     __atomic_store_n(&g_unswept_total, 0, __ATOMIC_RELAXED); /* a new data layer holds no job's log bytes */
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
+    ava1_data_test_feed_check_delay_ms = ava1_data_test_reprep_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
     ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
@@ -676,6 +678,21 @@ static void feed_control(ava1_job_t *j, ava1_inframe_t *f) {
     }
 }
 
+/* The feeder has queued (or dropped) the frame it checked against m. */
+static void feed_done(ava1_job_t *j) {
+    pthread_mutex_lock(&j->mu);
+    j->feeding--;
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+void ava1_data_feed_hold(ava1_job_t *j, int hold) {
+    pthread_mutex_lock(&j->mu);
+    j->feed_hold = hold;
+    while (hold && j->feeding) pthread_cond_wait(&j->cv, &j->mu);
+    pthread_mutex_unlock(&j->mu);
+}
+
 /* One held lane frame to the apply engine (SPEC.md §12.2: the cutoff decides how a file
  * travels; the engine checks the rest). Takes the frame. */
 static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
@@ -683,7 +700,8 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
     const char *bad = NULL;
     int ok, rc = 0;
     pthread_mutex_lock(&j->mu);
-    ok = j->prepared && !j->finished && !j->stopping;
+    ok = j->prepared && !j->feed_hold && !j->finished && !j->stopping;
+    if (ok) j->feeding++; /* the job thread does not replace m until this frame is queued (feed_done) */
     if (ok && f->type == AVA1_TYPE_CHUNK) {
         ava1_chunk_t c;
         if (ava1_chunk_decode(f->body, f->len, &c) != 0) bad = "a malformed Chunk";
@@ -711,10 +729,12 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         return;
     }
     if (bad) {
+        feed_done(j);
         free_frame(f);
         ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, bad);
         return;
     }
+    if (ava1_data_test_feed_check_delay_ms) ava1_platform_sleep_ms(ava1_data_test_feed_check_delay_ms);
     if (ava1_data_test_reserve_fail || ava1_apply_reserve(j, f->len) != 0) {
         /* Received already told the sender the frame is here. A live job that cannot take
          * it has lost the frame for good (the sender got its ack), so it ends loudly; an
@@ -723,6 +743,7 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         pthread_mutex_lock(&j->mu);
         fin = j->finished || j->stopping;
         pthread_mutex_unlock(&j->mu);
+        feed_done(j);
         if (!fin) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame beyond the granted credit");
         free_frame(f);
         return;
@@ -737,6 +758,7 @@ static void feed_lane(ava1_job_t *j, ava1_inframe_t *f) {
         rc = ava1_apply_bundle_pooled(j, f->body, f->len, f->cap, &b);
     }
     free(f); /* the body is the engine's now */
+    feed_done(j);
     if (rc == AVA1_E_PROTO) ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "a data frame does not fit the manifest");
     else if (rc != 0) ava1_data_fail_soon(j, AVA1_ERR_INTERNAL, "out of memory");
 }

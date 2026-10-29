@@ -6,70 +6,117 @@
 //! (`use ava1::wire::...`); in C it is `ava1_<name>_gen.{h,c}`, which includes `ava1_gen.h`.
 //! Constants and types keep the `AVA1_` / `ava1_` prefix either way, so an application's names
 //! read like the protocol's.
+#![warn(missing_docs)]
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+/// A parsed schema: the `[[const]]`, `[[message]]` and `[[struct]]` entries of one TOML file,
+/// in file order.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
+    /// The `[[const]]` entries.
     #[serde(default, rename = "const")]
     pub consts: Vec<Const>,
+    /// The `[[message]]` entries: frame messages, each with a frame type.
     #[serde(default, rename = "message")]
     pub messages: Vec<Msg>,
+    /// The `[[struct]]` entries: bodies with no frame type (RPC bodies, records items, journal
+    /// records).
     #[serde(default, rename = "struct")]
     pub structs: Vec<Msg>,
 }
 
+/// A named integer constant (`[[const]]`): `pub const` in Rust, `#define AVA1_<name>` in C.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Const {
+    /// SCREAMING_SNAKE name, without the C `AVA1_` prefix.
     pub name: String,
+    /// `u8`, `u16`, `u32` or `u64`.
     pub ty: String,
+    /// The value; it must fit `ty`.
     pub value: u64,
+    /// Documentation, emitted as a doc comment on the generated item.
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
+/// A `[[message]]` or `[[struct]]` entry.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Msg {
+    /// CamelCase name: the Rust type; the C type is `ava1_<snake_name>_t`.
     pub name: String,
+    /// The frame type (key `type`): required on a message, absent on a struct.
     #[serde(default, rename = "type")]
     pub frame_type: Option<u8>,
+    /// The fixed fields, encoded in this order.
     #[serde(default)]
     pub fields: Vec<Field>,
+    /// The optional, tagged extension fields; sorted by tag after parsing.
     #[serde(default)]
     pub ext: Vec<Ext>,
+    /// Documentation, emitted as a doc comment on the generated type.
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
+/// A fixed field of a message or struct.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
+    /// snake_case name.
     pub name: String,
+    /// The wire type.
     pub ty: Ty,
+    /// For `records` only: the struct each item is.
     #[serde(default)]
     pub of: Option<String>,
+    /// Documentation, emitted as a doc comment on the generated field.
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
+/// An extension field: optional, identified on the wire by its tag.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ext {
+    /// The tag, unique within its message and never 0.
     pub tag: u16,
+    /// snake_case name.
     pub name: String,
+    /// The wire type; `records` is not allowed.
     pub ty: Ty,
+    /// Documentation, emitted as a doc comment on the generated field.
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
+/// A field's wire type (SPEC.md §3). Integers are little-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ty {
+    /// An unsigned 8-bit integer.
     U8,
+    /// An unsigned 16-bit integer.
     U16,
+    /// An unsigned 32-bit integer.
     U32,
+    /// An unsigned 64-bit integer.
     U64,
+    /// 16 raw bytes.
     B16,
+    /// 32 raw bytes.
     B32,
+    /// A u32 length, then that many bytes.
     Bytes,
+    /// A u16 length, then that many bytes of UTF-8.
     Str,
+    /// A list of one struct (named by `of`), encoded as `bytes`: each item a u32 length and the
+    /// item's encoding.
     Records,
 }
 
@@ -140,10 +187,50 @@ fn is_snake(n: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The lines of a `doc`, without the blank lines around it; none when there is no doc.
+fn doc_lines(doc: Option<&str>) -> Vec<&str> {
+    doc.map(|d| d.trim().lines().map(str::trim_end).collect())
+        .unwrap_or_default()
+}
+
+/// A `doc` lands inside C comments: it may not end one or open another.
+fn check_doc(what: &str, doc: Option<&str>) -> Result<(), String> {
+    match doc {
+        Some(d) if d.contains("*/") || d.contains("/*") => {
+            Err(format!("{what}: a doc may not contain `/*` or `*/`"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `doc` as Rust doc comments, each line at `indent`.
+fn rust_doc(o: &mut String, indent: &str, doc: Option<&str>) {
+    for l in doc_lines(doc) {
+        let sep = if l.is_empty() { "" } else { " " };
+        let _ = writeln!(o, "{indent}///{sep}{l}");
+    }
+}
+
+/// `doc` as a C comment at `indent`: `/* text */` on one line, or a block whose further lines
+/// start with ` * `.
+fn c_doc(o: &mut String, indent: &str, doc: Option<&str>) {
+    let lines = doc_lines(doc);
+    for (i, l) in lines.iter().enumerate() {
+        let lead = if i == 0 { "/*" } else { " *" };
+        let sep = if l.is_empty() { "" } else { " " };
+        let end = if i + 1 == lines.len() { " */" } else { "" };
+        let _ = writeln!(o, "{indent}{lead}{sep}{l}{end}");
+    }
+}
+
+/// Parses and checks a schema: names (casing, reserved words, collisions in either language),
+/// const ranges, frame types, extension tags, `records` targets and docs. Extension fields come
+/// back sorted by tag.
 pub fn parse(src: &str) -> Result<Schema, String> {
     let mut s: Schema = toml::from_str(src).map_err(|e| e.to_string())?;
     let mut const_names = HashSet::new();
     for c in &s.consts {
+        check_doc(&c.name, c.doc.as_deref())?;
         let max = match c.ty.as_str() {
             "u8" => u64::from(u8::MAX),
             "u16" => u64::from(u16::MAX),
@@ -195,6 +282,15 @@ pub fn parse(src: &str) -> Result<Schema, String> {
         }
         if !names.insert(m.name.clone()) {
             return Err(format!("{}: name used twice", m.name));
+        }
+        check_doc(&m.name, m.doc.as_deref())?;
+        for (n, doc) in m
+            .fields
+            .iter()
+            .map(|f| (&f.name, &f.doc))
+            .chain(m.ext.iter().map(|e| (&e.name, &e.doc)))
+        {
+            check_doc(&format!("{}.{n}", m.name), doc.as_deref())?;
         }
         // Two messages may differ in Rust yet collide in C (`FooBar` / `Foo_bar` cannot
         // happen with CamelCase, but `AB` and `A_b`-style splits can): compare C names.
@@ -390,12 +486,14 @@ fn rust_sample(t: Ty, of: Option<&str>) -> String {
 }
 
 fn emit_rust_msg(o: &mut String, m: &Msg) {
+    rust_doc(o, "", m.doc.as_deref());
     let _ = writeln!(
         o,
         "#[derive(Debug, Clone, PartialEq, Eq, Default)]\npub struct {} {{",
         m.name
     );
     for f in &m.fields {
+        rust_doc(o, "    ", f.doc.as_deref());
         let _ = writeln!(
             o,
             "    pub {}: {},",
@@ -404,6 +502,7 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
         );
     }
     for e in &m.ext {
+        rust_doc(o, "    ", e.doc.as_deref());
         let _ = writeln!(
             o,
             "    pub {}: Option<{}>,",
@@ -492,6 +591,7 @@ fn emit_rust_msg(o: &mut String, m: &Msg) {
 pub struct Target<'a> {
     /// For the "do not edit" banner: the schema the files come from and how to remake them.
     pub source: &'a str,
+    /// What to do to regenerate, as a phrase ("run `make gen`").
     pub regenerate: &'a str,
     /// None for the core; `Some("app")` names an extension (`ava1_app_gen.h`,
     /// `ava1_app_message_names`, `ava1_app_roundtrip`).
@@ -526,8 +626,22 @@ pub const CORE: Target<'static> = Target {
     ext: None,
 };
 
+/// The Rust module: constants, one type per message and struct with its `Message` (and, for a
+/// message, `FrameMessage`) impl, and the conformance helpers `ALL`, `sample` and `roundtrip`.
 pub fn emit_rust(s: &Schema, t: &Target) -> String {
-    let mut o = t.banner("// ", "// ", "");
+    // The module doc carries the "do not edit" banner.
+    let mut o = String::new();
+    let what = match t.ext {
+        None => "The AVA1 core messages, structs and constants (SPEC.md §3)".to_string(),
+        Some(n) => format!(
+            "The `{n}` extension's structs and constants, beside the AVA1 core ones in `ava1::gen`"
+        ),
+    };
+    let _ = writeln!(
+        o,
+        "//! {what}.\n//!\n//! Generated by ava1-gen from `{}`. Do not edit:\n//! {} after changing the schema.",
+        t.source, t.regenerate
+    );
     o.push_str("#![allow(clippy::field_reassign_with_default, clippy::single_match, clippy::match_single_binding)]\n\n");
     let wire = if t.ext.is_some() {
         "ava1::wire"
@@ -544,6 +658,7 @@ pub fn emit_rust(s: &Schema, t: &Target) -> String {
         "use {wire}::{{DecodeError, EncodeError, {frame}Message, Reader, SplitMix, Writer}};\n"
     );
     for c in &s.consts {
+        rust_doc(&mut o, "", c.doc.as_deref());
         let _ = writeln!(o, "pub const {}: {} = {};", c.name, c.ty, c.value);
     }
     o.push('\n');
@@ -657,6 +772,8 @@ fn c_get(t: Ty, r: &str, n: &str, of: Option<&str>) -> String {
     }
 }
 
+/// The C header: `#define`s for the constants and frame types, one `typedef struct` per message
+/// and struct, and the prototypes of their codecs.
 pub fn emit_c_header(s: &Schema, t: &Target) -> String {
     let mut o = t.banner("/* ", " * ", " */");
     let guard = t.c_header().replace('.', "_").to_uppercase();
@@ -672,6 +789,7 @@ pub fn emit_c_header(s: &Schema, t: &Target) -> String {
     for c in &s.consts {
         // ULL: every constant has one type wide enough for a u64 value, whatever the
         // target's int and long are.
+        c_doc(&mut o, "", c.doc.as_deref());
         let _ = writeln!(o, "#define AVA1_{} {}ULL", c.name, c.value);
     }
     o.push('\n');
@@ -686,11 +804,14 @@ pub fn emit_c_header(s: &Schema, t: &Target) -> String {
     o.push('\n');
     for m in s.structs.iter().chain(&s.messages) {
         let sn = snake(&m.name);
+        c_doc(&mut o, "", m.doc.as_deref());
         o.push_str("typedef struct {\n");
         for f in &m.fields {
+            c_doc(&mut o, "    ", f.doc.as_deref());
             o.push_str(&c_decl(f.ty, &cid(&f.name)));
         }
         for e in &m.ext {
+            c_doc(&mut o, "    ", e.doc.as_deref());
             let _ = writeln!(o, "    int has_{};", e.name);
             o.push_str(&c_decl(e.ty, &cid(&e.name)));
         }
@@ -733,6 +854,8 @@ pub fn emit_c_header(s: &Schema, t: &Target) -> String {
     o
 }
 
+/// The C source: each message's and struct's encoder and decoder (and, for a struct, its
+/// records helpers), the message name table and the conformance `roundtrip`.
 pub fn emit_c_source(s: &Schema, t: &Target) -> String {
     let mut o = t.banner("/* ", " * ", " */");
     let _ = write!(

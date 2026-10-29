@@ -147,11 +147,13 @@ static int set_dir(ava1_jnl_t *j, const char *dir) {
     return 0;
 }
 
-/* tmp → fsync → rename → fsync(dir). The caller owns same-directory placement. */
-static int write_file_atomic(const char *dir, const char *name, const uint8_t *a, size_t an,
-                             const uint8_t *b, size_t bn) {
+/* tmp → fsync → rename → fsync(dir). The caller owns same-directory placement. *renamed (optional)
+ * is 1 once the rename is done, even when the directory's fsync then fails: `name` is the new file. */
+static int write_file_atomic_r(const char *dir, const char *name, const uint8_t *a, size_t an,
+                               const uint8_t *b, size_t bn, int *renamed) {
     char tmp[600], fin[600];
     int fd, rc;
+    if (renamed) *renamed = 0;
     snprintf(tmp, sizeof tmp, "%s/%s.tmp", dir, name);
     path_in(dir, name, fin, sizeof fin);
     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -161,8 +163,14 @@ static int write_file_atomic(const char *dir, const char *name, const uint8_t *a
     if (rc == 0 && (rc = ava1_fsync_retry(fd, NULL, NULL, NULL)) != 0) rc = -rc;
     close(fd);
     if (rc == 0 && rename(tmp, fin) != 0) rc = -errno; /* same directory */
+    if (rc == 0 && renamed) *renamed = 1;
     if (rc == 0) rc = sync_dir(dir);
     return rc;
+}
+
+static int write_file_atomic(const char *dir, const char *name, const uint8_t *a, size_t an,
+                             const uint8_t *b, size_t bn) {
+    return write_file_atomic_r(dir, name, a, an, b, bn, NULL);
 }
 
 int ava1_jnl_create(ava1_jnl_t *j, const char *dir, const ava1_jnl_open_t *o) {
@@ -267,9 +275,17 @@ int ava1_jnl_append(ava1_jnl_t *j, uint8_t kind, const uint8_t *body, size_t len
     size_t rn;
     uint8_t *rec = frame_rec(kind, body, len, &rn);
     int rc;
+    off_t end;
     if (!rec) return -ENOMEM;
+    /* Where this record starts: the file's end, not j->len, which lags behind a record that was
+     * written but whose fsync failed (that record is in the file and stays there). */
+    end = lseek(j->fd, 0, SEEK_END);
     rc = write_all_fd(j->fd, rec, rn);
     free(rec);
+    /* A short write (ENOSPC, EIO) left part of a record: cut it off, or the next record would land
+     * behind it and a replay, which stops at the torn one, would never see that record or any after. */
+    if (rc != 0 && end >= 0 && ftruncate(j->fd, end) != 0) {
+    }
     /* The record is written; only its fsync is retried (appending it again would duplicate it). */
     if (rc == 0 && (rc = ava1_fsync_retry(j->fd, NULL, NULL, NULL)) != 0) rc = -rc;
     if (rc == 0) j->len += rn;
@@ -289,15 +305,17 @@ int ava1_jnl_compact(ava1_jnl_t *j, const uint8_t *open_body, size_t open_len,
     size_t total = sizeof MAGIC + an + bn + dn;
     uint8_t *all = (a && b && (d || !done_body)) ? malloc(total) : NULL;
     char p[600];
-    int rc = -ENOMEM;
+    int rc = -ENOMEM, renamed = 0;
     if (all) {
         memcpy(all, MAGIC, sizeof MAGIC);
         memcpy(all + sizeof MAGIC, a, an);
         memcpy(all + sizeof MAGIC + an, b, bn);
         if (d) memcpy(all + sizeof MAGIC + an + bn, d, dn);
-        rc = write_file_atomic(j->dir, "journal", all, total, NULL, 0);
+        rc = write_file_atomic_r(j->dir, "journal", all, total, NULL, 0, &renamed);
     }
-    if (rc == 0) {
+    /* Once renamed, the old journal is unlinked whatever the directory's fsync said: later records
+     * must go to the new one, never to the orphaned inode a restart cannot see. */
+    if (renamed) {
         close(j->fd);
         path_in(j->dir, "journal", p, sizeof p);
         j->fd = open(p, O_WRONLY | O_APPEND);
@@ -356,23 +374,37 @@ void ava1_job_dir(const char *jobs_dir, const uint8_t job_id[16], char *out, siz
     snprintf(out, cap, "%s/%s", jobs_dir, hex);
 }
 
+/* = AVA1_PATH_CAP (ava1_internal.h) plus a name */
+#define RM_PATH_CAP (2 * AVA1_MAX_PATH + 64 + 256)
+
 static int rm_tree(const char *p) {
     DIR *d;
     struct dirent *e;
     struct stat st;
-    char q[1100];
+    char *q;
     /* lstat, not stat: a symlink is removed, never followed — Rust's remove_dir_all has
      * the same rule, and following one here would delete a tree outside the job dir. */
     if (lstat(p, &st) != 0) return -errno;
     if (!S_ISDIR(st.st_mode)) return unlink(p) == 0 ? 0 : -errno;
+    /* A staged tree's paths run to AVA1_PATH_CAP; the buffer is on the heap, as a tree can be
+     * hundreds of levels deep (one per path component) and each level is a frame here. */
+    q = malloc(RM_PATH_CAP);
+    if (!q) return -ENOMEM;
     d = opendir(p);
-    if (!d) return -errno;
+    if (!d) {
+        int e2 = errno;
+        free(q);
+        return -e2;
+    }
     while ((e = readdir(d)) != NULL) {
+        int w;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        snprintf(q, sizeof q, "%s/%s", p, e->d_name);
+        w = snprintf(q, RM_PATH_CAP, "%s/%s", p, e->d_name);
+        if (w < 0 || w >= RM_PATH_CAP) continue; /* a cut path names something else (or p itself) */
         (void)rm_tree(q);
     }
     closedir(d);
+    free(q);
     return rmdir(p) == 0 ? 0 : -errno;
 }
 

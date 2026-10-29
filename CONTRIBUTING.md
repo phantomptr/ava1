@@ -28,5 +28,22 @@ CI also runs the interop tests under ASan + UBSan and fuzzes the decoders.
   bounded, no new dependency without a strong reason. Code in `c/third_party` is vendored and
   unmodified.
 
+## Releasing
+
+1. Set `version` in the root `Cargo.toml`, add its section to `CHANGELOG.md`, and run `make check`
+   and `make package`.
+2. Tag the commit `vX.Y.Z` and push the tag. The release workflow checks that the tag matches
+   `Cargo.toml` and creates a GitHub pre-release with the C sources archive and the changelog
+   section as its notes.
+3. Promote the pre-release to a full release on GitHub. That publishes `ava1-gen` and then `ava1`
+   to crates.io; docs.rs builds the documentation from there.
+
+crates.io credentials: each crate lists this repository, workflow `release.yml` and environment
+`crates-io` as a trusted publisher (crates.io → the crate → Settings → Trusted Publishing), so
+the workflow needs no stored token. A crate has to exist before it can have a trusted
+publisher: for a crate's first release, add a `CARGO_REGISTRY_TOKEN` repository secret (a
+crates.io API token with the publish-new and publish-update scopes), and delete it once trusted
+publishing is set up.
+
 By contributing you agree that your contribution is dual licensed under MIT OR Apache-2.0, as in
 the [README](README.md#license).

@@ -160,6 +160,9 @@ int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit);
 /* Records a failure found off the job thread (a sender job's on_frame hook, a worker):
  * the job thread ends the job within one 25 ms tick (ruling C4). Never blocks on I/O. */
 void ava1_data_fail_soon(ava1_job_t *j, uint16_t status, const char *what);
+/* hold 1: the feeder hands no more lane frames to the engine, and any it is handing over is queued
+ * when this returns (the job thread is about to replace the manifest); hold 0 lets it go again. */
+void ava1_data_feed_hold(ava1_job_t *j, int hold);
 
 /* Tests only (0 in the payload): JobOpen's work waits this long before it starts, and an
  * OK map this long before it is sent. */
@@ -169,6 +172,8 @@ extern uint32_t ava1_data_test_map_delay_ms;
 extern int ava1_data_test_ack_fail;        /* JobOpenAck's send "fails" with this code */
 extern int ava1_data_test_feeder_fail;     /* a job's feeder thread "cannot start" */
 extern uint32_t ava1_data_test_feed_delay_ms; /* the feeder waits this long after taking lane frames */
+extern uint32_t ava1_data_test_feed_check_delay_ms; /* ... and this long between checking one and queuing it */
+extern uint32_t ava1_data_test_reprep_delay_ms;     /* a new manifest's re-prepare waits this long first */
 extern int ava1_data_test_reserve_fail;    /* ava1_apply_reserve "fails" for every lane frame */
 extern int ava1_data_test_lane_alloc_fail; /* the lane frame's calloc "fails" */
 extern int ava1_data_test_fb_force;   /* every Received goes through the waiting-send fallback */

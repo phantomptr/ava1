@@ -807,3 +807,109 @@ fn a_repeated_file_retry_is_queued_once() {
         "a file id past the manifest closes the session"
     );
 }
+
+/// A JobMap after the final page (`last = 1`) must not change what the sender reads: the
+/// reader thread already reads the durable ranges without the job lock, so a late map that
+/// grew (reallocated) a file's range set raced it. The late map is ignored; every byte the
+/// first map did not cover is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_map_after_the_last_page_changes_nothing() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        ava1_ctest::c_set_read_allowed(true);
+        let d = dir("dl-late-map");
+        let src = d.join("console/tree");
+        std::fs::create_dir_all(&src).unwrap();
+        // a.bin holds the reader past its 32 MiB read-ahead while no lane drains it.
+        std::fs::write(src.join("a.bin"), vec![0x11u8; 48 << 20]).unwrap();
+        std::fs::write(src.join("b.bin"), vec![0x22u8; 8 << 20]).unwrap();
+        let (me, mine) = paired_client(&d.join("peers"));
+        let srv = CServer::start_data(
+            SECRET,
+            &d.join("peers"),
+            &d.join("jobs"),
+            200,
+            2000,
+            2000,
+            0,
+        );
+        let job = [0x6bu8; 16];
+        let s = connect(&srv.addr(), me, mine, "rust", calm())
+            .await
+            .unwrap();
+        let mut link = s.job(job);
+        srv.knob("chunk_bytes", 0);
+        link.control
+            .send(&JobOpen {
+                job_id: job,
+                kind: gen::JOB_DOWNLOAD,
+                root: src.to_str().unwrap().into(),
+                credit: Some(128 << 20),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ack: JobOpenAck = next_control_of(&mut link, JobOpenAck::TYPE)
+            .await
+            .decode()
+            .unwrap();
+        assert_eq!(ack.status, 0);
+        next_control_of(&mut link, ManifestEnd::TYPE).await;
+        link.control
+            .send(&JobMap {
+                job_id: job,
+                status: 0,
+                last: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // The reader waits inside a.bin.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A second final map claiming every file durable, in disjoint 1 MiB pieces (the
+        // range set grows past its first allocation).
+        let mut partial = Vec::new();
+        for id in 0..3u32 {
+            for k in (0..48u64).step_by(2) {
+                partial.push(gen::FileRange {
+                    file_id: id,
+                    offset: k << 20,
+                    len: 1 << 20,
+                });
+            }
+        }
+        link.control
+            .send(&JobMap {
+                job_id: job,
+                status: 0,
+                last: 1,
+                partial,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _lane = link.opener().unwrap().open().await.unwrap();
+        let want = 56u64 << 20;
+        let t = std::time::Instant::now();
+        while srv.sent_chunk_bytes() < want && t.elapsed() < Duration::from_secs(20) {
+            while let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(50), link.rx.recv()).await
+            {}
+        }
+        // Chunk messages are counted whole (a few header bytes each over the data).
+        let sent = srv.sent_chunk_bytes();
+        assert!(
+            sent >= want,
+            "the late map changed what was read: {sent} < {want}"
+        );
+        let _ = link
+            .control
+            .send(&JobCancel {
+                job_id: job,
+                reason: 0,
+            })
+            .await;
+    })
+    .await
+    .expect("the test hung");
+}

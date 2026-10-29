@@ -191,14 +191,32 @@ void ava1_frame_pool_trim(void) {
     pthread_mutex_unlock(&P.mu);
 }
 
+/* Slicing-by-8 tables (built once): the pack log checksums every small file's bytes, which the
+ * bit-at-a-time loop held to a few tens of MB/s. Same polynomial, same results. */
+static uint32_t CRC_T[8][256];
+static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+
+static void crc_init(void) {
+    uint32_t i, c;
+    int k;
+    for (i = 0; i < 256; i++) {
+        c = i;
+        for (k = 0; k < 8; k++) c = (c & 1u) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+        CRC_T[0][i] = c;
+    }
+    for (i = 0; i < 256; i++)
+        for (k = 1; k < 8; k++) CRC_T[k][i] = (CRC_T[k - 1][i] >> 8) ^ CRC_T[0][CRC_T[k - 1][i] & 0xFFu];
+}
+
 uint32_t ava1_crc32c(const uint8_t *p, size_t n) {
     uint32_t crc = 0xFFFFFFFFu;
-    size_t i;
-    int k;
-    for (i = 0; i < n; i++) {
-        crc ^= p[i];
-        for (k = 0; k < 8; k++) crc = (crc & 1u) ? (crc >> 1) ^ 0x82F63B78u : crc >> 1;
+    (void)pthread_once(&crc_once, crc_init);
+    for (; n >= 8; p += 8, n -= 8) {
+        uint32_t lo = crc ^ ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+        crc = CRC_T[7][lo & 0xFFu] ^ CRC_T[6][(lo >> 8) & 0xFFu] ^ CRC_T[5][(lo >> 16) & 0xFFu] ^ CRC_T[4][lo >> 24] ^
+              CRC_T[3][p[4]] ^ CRC_T[2][p[5]] ^ CRC_T[1][p[6]] ^ CRC_T[0][p[7]];
     }
+    while (n--) crc = (crc >> 8) ^ CRC_T[0][(crc ^ *p++) & 0xFFu];
     return crc ^ 0xFFFFFFFFu;
 }
 

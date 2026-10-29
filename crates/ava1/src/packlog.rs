@@ -16,6 +16,7 @@ use crate::gen::BundleRecord;
 use crate::journal::State;
 use crate::wire::Message;
 
+/// The first 8 bytes of every pack segment (SPEC.md §15.7).
 pub const MAGIC: &[u8; 8] = b"AVA1PCK1";
 const HDR: u64 = 8;
 const REC_MAX: u32 = 1 << 26;
@@ -23,8 +24,11 @@ const REC_MAX: u32 = 1 << 26;
 /// Where one small file's record sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Loc {
+    /// The file id the record carries.
     pub id: u32,
+    /// The segment the record is in (`<job dir>/pack.<seg>`).
     pub seg: u32,
+    /// The byte offset of the record's frame in its segment.
     pub off: u64,
     /// The record's whole length on disk (frame included).
     pub len: u32,
@@ -34,18 +38,25 @@ pub struct Loc {
 /// them: what the journal's pack extension names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedGroup {
+    /// The segment that holds the records (the extension's `pack_segment`).
     pub segment: u32,
+    /// Where the group's first record starts in the segment (`pack_offset`).
     pub offset: u64,
+    /// The byte length from the first record's start to the last record's end (`pack_len`).
     pub len: u64,
+    /// The group's records, in segment order.
     pub files: Vec<Loc>,
 }
 
 impl LoggedGroup {
+    /// The file ids of the group's records.
     pub fn ids(&self) -> BTreeSet<u32> {
         self.files.iter().map(|l| l.id).collect()
     }
 }
 
+/// The pack log's tuning (SPEC.md §15.7: `PACK_SEGMENT`, `UNSWEPT_MAX`, `SWEEP_AGE`); the
+/// defaults are the spec's 64 MiB, 256 MiB and 3 s.
 #[derive(Debug, Clone, Copy)]
 pub struct PackOpts {
     /// Bytes per segment; a record that would pass it starts the next one.
@@ -79,6 +90,8 @@ struct Usw {
     at: Instant,
 }
 
+/// One job's pack log (SPEC.md §15.7): its segments `<dir>/pack.<n>`, the records appended but
+/// not yet claimed by a batch, and the queue of done files waiting for the sweep.
 pub struct PackLog {
     dir: PathBuf,
     opts: PackOpts,
@@ -90,6 +103,9 @@ pub struct PackLog {
     /// Taken by a sweep that has not been journaled yet.
     sweeping: HashMap<u32, Vec<Loc>>,
     unswept_bytes: u64,
+    /// `recover` or `cleanup` has accounted for the segments already in the directory: from
+    /// then on a segment number at or past `segs.len()` holds nothing a journal record needs.
+    settled: bool,
 }
 
 fn frame(body: &[u8]) -> Vec<u8> {
@@ -127,6 +143,10 @@ fn pack_name(dir: &Path, seg: u32) -> PathBuf {
 }
 
 impl PackLog {
+    /// A pack log for the job directory `dir`. Touches no file: the first segment is created by
+    /// the first [`append`](Self::append). Until [`recover`](Self::recover) or
+    /// [`cleanup`](Self::cleanup) has run, a new segment never overwrites a `pack.<n>` already in
+    /// the directory (it may hold a crashed run's journaled records): that append fails instead.
     pub fn new(dir: &Path, opts: PackOpts) -> Self {
         Self {
             dir: dir.to_path_buf(),
@@ -136,9 +156,11 @@ impl PackLog {
             usw: VecDeque::new(),
             sweeping: HashMap::new(),
             unswept_bytes: 0,
+            settled: false,
         }
     }
 
+    /// The options this log was made with.
     pub fn opts(&self) -> PackOpts {
         self.opts
     }
@@ -162,7 +184,8 @@ impl PackLog {
     }
 
     /// Starts the next segment: the file with its magic, its directory entry synced so a
-    /// journal record may name it.
+    /// journal record may name it. Once the log is settled a leftover file of that number holds
+    /// nothing live (a crashed run's unjournaled tail) and is truncated; before, it is refused.
     fn roll(&mut self) -> io::Result<()> {
         if let Some(last) = self.segs.last_mut() {
             last.closed = true;
@@ -172,12 +195,23 @@ impl PackLog {
         }
         let n = self.segs.len() as u32;
         let p = pack_name(&self.dir, n);
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&p)?;
+        let mut o = OpenOptions::new();
+        o.read(true).write(true);
+        if self.settled {
+            o.create(true).truncate(true);
+        } else {
+            o.create_new(true);
+        }
+        let f = o.open(&p).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    e.kind(),
+                    format!("{} exists and the log was not recovered", p.display()),
+                )
+            } else {
+                e
+            }
+        })?;
         crate::verify::write_all_at(&f, MAGIC, 0)?;
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
@@ -346,6 +380,9 @@ impl PackLog {
     /// found again in the pack ranges it kept and handed to `remake`, which makes the file
     /// right in place (it returns whether the record was usable); each found file joins the
     /// sweep queue, due at once. Returns the files whose record could not be found.
+    ///
+    /// Every re-opened segment is closed (opened read-only, never appended to): it goes as soon
+    /// as its found files are swept, and the next `append` starts a segment past all of them.
     pub fn recover(
         &mut self,
         st: &State,
@@ -373,7 +410,7 @@ impl PackLog {
                     tail: flen,
                     nusw: 0,
                     dirty: false,
-                    closed: false,
+                    closed: true,
                 };
             }
             let end = (p.offset + p.len).min(flen);
@@ -413,6 +450,7 @@ impl PackLog {
                 pos += len as u64;
             }
         }
+        self.settled = true;
         Ok(st
             .unswept
             .iter()
@@ -432,6 +470,7 @@ impl PackLog {
         }
         self.segs.clear();
         self.unswept_bytes = 0;
+        self.settled = true;
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
                 if e.file_name().to_string_lossy().starts_with("pack.") {
@@ -574,6 +613,75 @@ mod tests {
         assert_eq!(lost, vec![2]);
         assert_eq!(q.unswept(), 1);
         let _ = a;
+    }
+
+    /// Three journaled records across two segments, then the crash: the directory and the
+    /// replayed state that names them.
+    fn two_segments(tag: &str) -> (PathBuf, State) {
+        let d = tmp(tag);
+        let opts = PackOpts {
+            segment: 250,
+            max_unswept: 1 << 20,
+            age: Duration::ZERO,
+        };
+        let mut p = PackLog::new(&d, opts);
+        for i in 1..=3u32 {
+            p.append(&rec(i, &[i as u8; 60])).unwrap();
+        }
+        let (_, groups) = p.take_batch(&[1, 2, 3]).unwrap();
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let mut st = State::default();
+        for g in &groups {
+            let ids = g.ids();
+            st.unswept.extend(ids.iter().copied());
+            st.packs.push(crate::gen::PackRef {
+                segment: g.segment,
+                offset: g.offset,
+                len: g.len,
+                first_file: *ids.first().unwrap(),
+                count: ids.last().unwrap() - ids.first().unwrap() + 1,
+            });
+        }
+        drop(p);
+        (d, st)
+    }
+
+    #[test]
+    fn recovered_segments_go_once_swept_without_waiting_for_cleanup() {
+        let (d, st) = two_segments("rec-free");
+        let mut q = PackLog::new(&d, PackOpts::default());
+        assert!(q.recover(&st, |_| Ok(true)).unwrap().is_empty());
+        let due = q.due(true, 10);
+        assert_eq!(due.len(), 3);
+        q.swept(&due.iter().map(|l| l.id).collect::<Vec<_>>());
+        // I3: nobody holds either segment any more, so neither is left behind
+        assert!(!pack_name(&d, 0).exists() && !pack_name(&d, 1).exists());
+    }
+
+    #[test]
+    fn an_append_after_recovery_starts_a_segment_of_its_own() {
+        // the recovered segments are read-only handles; the tail one has room for this record
+        let (d, st) = two_segments("rec-append");
+        let before = std::fs::read(pack_name(&d, 1)).unwrap();
+        let mut q = PackLog::new(&d, PackOpts::default());
+        assert!(q.recover(&st, |_| Ok(true)).unwrap().is_empty());
+        let l = q.append(&rec(9, b"new")).unwrap();
+        assert_eq!(l.seg, 2, "never into a recovered segment");
+        assert_eq!(q.read(&l).unwrap().data, b"new");
+        assert_eq!(std::fs::read(pack_name(&d, 1)).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unrecovered_log_never_overwrites_a_segment_on_disk() {
+        let (d, _st) = two_segments("no-recover");
+        let before = std::fs::read(pack_name(&d, 0)).unwrap();
+        let mut q = PackLog::new(&d, PackOpts::default());
+        let e = q.append(&rec(9, b"new")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read(pack_name(&d, 0)).unwrap(), before);
+        // once cleanup has settled the directory (nothing unswept), numbering starts over
+        q.cleanup();
+        assert_eq!(q.append(&rec(9, b"new")).unwrap().seg, 0);
     }
 
     /// A one-segment pack of five records of different sizes: the file bytes, each record's

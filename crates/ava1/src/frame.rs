@@ -2,7 +2,9 @@
 
 use crate::crc32c::crc32c;
 
+/// The two bytes every frame header starts with (SPEC.md §2).
 pub const MAGIC: [u8; 2] = *b"A1";
+/// Length of a frame header in bytes (SPEC.md §2).
 pub const HEADER_LEN: usize = 16;
 /// Largest body any AVA1 frame may carry.
 pub const MAX_BODY: u32 = 16 * 1024 * 1024;
@@ -21,25 +23,37 @@ pub const FLAG_SEALED: u8 = 0x01;
 /// A receiver that does not know this frame type skips it instead of closing.
 pub const FLAG_IGNORABLE: u8 = 0x02;
 
+/// A frame header (SPEC.md §2). Its 16 encoded bytes end with a CRC-32C of the first 12.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
+    /// Frame type.
     pub ty: u8,
+    /// Flags: [`FLAG_SEALED`], [`FLAG_IGNORABLE`]; other bits are passed through unchecked.
     pub flags: u8,
+    /// Channel; its meaning depends on the frame type (an RPC's request id, for example).
     pub channel: u32,
+    /// Body length in bytes, MAC included when sealed. [`Header::decode`] refuses more than
+    /// [`MAX_BODY`].
     pub body_len: u32,
 }
 
+/// Why a frame header was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderError {
+    /// The first two bytes are not [`MAGIC`].
     #[error("not an AVA1 frame (bad magic)")]
     BadMagic,
+    /// The CRC-32C of bytes 0..12 does not match bytes 12..16.
     #[error("frame header checksum mismatch")]
     BadCrc,
+    /// The body length is over [`MAX_BODY`] or the reader's lower cap; also returned for a
+    /// body too large to send.
     #[error("frame body of {0} bytes is over the limit")]
     TooLong(u32),
 }
 
 impl Header {
+    /// The 16 header bytes, CRC included. Does not check `body_len` against `MAX_BODY`.
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut b = [0u8; HEADER_LEN];
         b[0..2].copy_from_slice(&MAGIC);
@@ -52,6 +66,7 @@ impl Header {
         b
     }
 
+    /// Parses a header, checking the magic, the CRC and `body_len <= MAX_BODY`, in that order.
     pub fn decode(b: &[u8; HEADER_LEN]) -> Result<Self, HeaderError> {
         if b[0..2] != MAGIC {
             return Err(HeaderError::BadMagic);

@@ -12,8 +12,11 @@ use zeroize::Zeroize;
 
 use crate::Ava1Error;
 
+/// The Noise protocol name (SPEC.md §4.2).
 pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2b";
+/// The Noise prologue (SPEC.md §4.2).
 pub const PROLOGUE: &[u8] = b"AVA1 v1";
+/// Length of the Poly1305 MAC after every sealed body (SPEC.md §4.4).
 pub const MAC_LEN: usize = 16;
 
 /// A node's long-lived X25519 key pair (project 2 adds an Ed25519 key for tickets).
@@ -29,6 +32,10 @@ impl Drop for Identity {
 }
 
 impl Identity {
+    /// The identity whose X25519 secret is `secret`; the public key is derived from it.
+    /// `[u8; 32]` is `Copy`: this wipes only its own copy, and the caller's array stays as it
+    /// was. A caller that holds the secret should keep it in `zeroize::Zeroizing` (or wipe it
+    /// after this call).
     pub fn from_secret(mut secret: [u8; 32]) -> Self {
         let public = PublicKey::from(&StaticSecret::from(secret)).to_bytes();
         let id = Self { secret, public };
@@ -36,10 +43,12 @@ impl Identity {
         id
     }
 
+    /// A new identity from the OS's secure random source; fails if there is none.
     pub fn generate() -> io::Result<Self> {
         Ok(Self::from_secret(random_bytes::<32>()?))
     }
 
+    /// The X25519 public key: this node as other devices know it.
     pub fn public(&self) -> [u8; 32] {
         self.public
     }
@@ -69,13 +78,14 @@ impl Identity {
         match std::fs::read(path) {
             Ok(b) => {
                 let b = zeroize::Zeroizing::new(b);
-                let a: [u8; 32] = b.as_slice().try_into().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{} holds {} bytes, expected 32", path.display(), b.len()),
-                    )
-                })?;
-                Ok(Some(Self::from_secret(a)))
+                let a: zeroize::Zeroizing<[u8; 32]> =
+                    zeroize::Zeroizing::new(b.as_slice().try_into().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{} holds {} bytes, expected 32", path.display(), b.len()),
+                        )
+                    })?);
+                Ok(Some(Self::from_secret(*a)))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -99,6 +109,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.sync_all()
 }
 
+/// `N` bytes from the OS's secure random source; fails if there is none.
 pub fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b)
@@ -109,7 +120,10 @@ pub fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
 /// Keys of an established session. The client is always the Noise initiator.
 #[derive(Clone)]
 pub struct SessionKeys {
+    /// Client → server (initiator → responder) key from Split() (SPEC.md §4.2); lane keys
+    /// derive from it (§4.3).
     pub c2s: [u8; 32],
+    /// Server → client key from Split().
     pub s2c: [u8; 32],
     /// Noise handshake hash: binds the session (the pairing PAKE, joins).
     pub hash: [u8; 64],
@@ -142,10 +156,12 @@ pub struct Handshake {
 }
 
 impl Handshake {
+    /// The initiator (client) side, with [`PROLOGUE`].
     pub fn initiator(me: &Identity) -> Result<Self, snow::Error> {
         Self::build(me, true, None, PROLOGUE)
     }
 
+    /// The responder (server) side, with [`PROLOGUE`].
     pub fn responder(me: &Identity) -> Result<Self, snow::Error> {
         Self::build(me, false, None, PROLOGUE)
     }
@@ -172,6 +188,7 @@ impl Handshake {
         Ok(Self { hs, reads: 0 })
     }
 
+    /// Writes the next handshake message, carrying `payload`.
     pub fn write(&mut self, payload: &[u8]) -> Result<Vec<u8>, snow::Error> {
         let mut out = vec![0u8; payload.len() + 128];
         let n = self.hs.write_message(payload, &mut out)?;
@@ -201,6 +218,8 @@ impl Handshake {
         Ok(out)
     }
 
+    /// The peer's static key, once a handshake message has revealed it (message 2 for the
+    /// initiator, message 3 for the responder).
     pub fn remote_static(&self) -> Option<[u8; 32]> {
         self.hs.get_remote_static()?.try_into().ok()
     }
@@ -369,6 +388,7 @@ fn aead_key(key: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte key"))
 }
 
+/// Whether two 16-byte values are equal, compared in constant time.
 pub fn ct_eq16(a: &[u8; 16], b: &[u8; 16]) -> bool {
     a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }

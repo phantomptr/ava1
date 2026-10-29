@@ -1270,7 +1270,14 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     S.sessions[idx].pair_code = pair_code;
     memcpy(S.sessions[idx].h, ns.h, 64);
     pthread_mutex_unlock(&mu);
-    if (ava1_conn_send(&k->io, AVA1_TYPE_WELCOME, 0, pl, w.len) != 0) goto out;
+    if (ava1_conn_send(&k->io, AVA1_TYPE_WELCOME, 0, pl, w.len) != 0) {
+        /* The slot is filled, so `out` will not release it: end the session here, or it is
+         * held (and counted against the session and unpaired limits) until a restart. A
+         * lane may have joined in the meantime (the session id was in message 2). */
+        if (S.cfg.data && S.cfg.data->on_session_end) S.cfg.data->on_session_end(sid);
+        sess_remove(idx, sid);
+        goto out;
+    }
     if (!known) {
         /* Only a device that was welcomed is shown, and a stranger reconnecting in a loop
          * must not flood the screen. */

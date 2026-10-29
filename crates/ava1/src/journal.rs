@@ -13,24 +13,39 @@ use crate::manifest::{Entry, Manifest};
 use crate::ranges::{from_runs, runs, runs_within_limit, Need, RangeSet};
 use crate::wire::{Message, Reader, Writer};
 
+/// The first 8 bytes of every journal file (SPEC.md §14.1).
 pub const MAGIC: &[u8; 8] = b"AVA1JNL1";
+/// Record kind of a `JnlOpen` (SPEC.md §14.1).
 pub const K_OPEN: u8 = 1;
+/// Record kind of a `JnlBatch` (SPEC.md §14.1).
 pub const K_BATCH: u8 = 2;
+/// Record kind of a `JnlReset` (SPEC.md §14.1).
 pub const K_RESET: u8 = 3;
+/// Record kind of a `JnlSnapshot` (SPEC.md §14.1).
 pub const K_SNAPSHOT: u8 = 4;
+/// Record kind of a `JnlDone` (SPEC.md §14.1).
 pub const K_DONE: u8 = 5;
 /// Durable-by-log (SPEC.md §15.7): files now durable in place.
 pub const K_SWEEP: u8 = 6;
 /// The journal is compacted once it passes this size (SPEC.md §14).
 pub const COMPACT_AT: u64 = 1 << 20;
 
+/// One journal record, decoded (SPEC.md §14.1). [`State::apply`] gives each its meaning
+/// (SPEC.md §14.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
+    /// The job's identity and parameters; the first record of every journal.
     Open(JnlOpen),
+    /// Files now done, durable ranges and roots; with the pack extension, files durable by log
+    /// (SPEC.md §15.7).
     Batch(JnlBatch),
+    /// Forget everything about this file id.
     Reset(u32),
+    /// The whole state, replacing what came before (written by compaction).
     Snapshot(JnlSnapshot),
+    /// The job's final status.
     Done(u16),
+    /// Files whose bytes are now durable in place, no longer only in the pack log (SPEC.md §15.7).
     Sweep(Vec<FileRun>),
 }
 
@@ -197,6 +212,9 @@ impl Journal {
         Ok(())
     }
 
+    /// Appends one record and `fsync`s the file (data and metadata) before returning; the record
+    /// is durable once this returns `Ok`. Does not compact: the caller checks [`len`](Self::len)
+    /// against [`COMPACT_AT`].
     pub fn append(&mut self, r: &Record) -> io::Result<()> {
         let (k, b) = r.encode()?;
         let fr = frame(k, &b);
@@ -235,10 +253,12 @@ impl Journal {
         Ok(())
     }
 
+    /// The journal file's length in bytes, magic included.
     pub fn len(&self) -> u64 {
         self.len
     }
 
+    /// True when the file holds the magic and no record.
     pub fn is_empty(&self) -> bool {
         self.len <= 8
     }
@@ -264,10 +284,15 @@ fn item_stream<M: Message>(b: &[u8]) -> Option<Vec<M>> {
 /// What a replay knows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
+    /// The job's `JnlOpen`, once replayed.
     pub open: Option<JnlOpen>,
+    /// Files that are complete and durable.
     pub done: BTreeSet<u32>,
+    /// Durable byte ranges of files not yet done, by file id.
     pub ranges: BTreeMap<u32, RangeSet>,
+    /// The file roots (SPEC.md §13) the batches recorded, by file id.
     pub roots: BTreeMap<u32, [u8; 32]>,
+    /// The job's final status, once a `Done` record is replayed.
     pub finished: Option<u16>,
     /// Done files whose bytes are only in the pack log so far (SPEC.md §15.7).
     pub unswept: BTreeSet<u32>,
@@ -277,6 +302,7 @@ pub struct State {
 }
 
 impl State {
+    /// Applies one record in replay order (SPEC.md §14.2).
     pub fn apply(&mut self, r: &Record) {
         match r {
             Record::Open(o) => self.open = Some(o.clone()),
@@ -287,7 +313,7 @@ impl State {
                     self.ranges
                         .entry(x.file_id)
                         .or_default()
-                        .insert(x.offset, x.offset + x.len);
+                        .insert(x.offset, x.offset.saturating_add(x.len));
                 }
                 for x in &b.roots {
                     self.roots.insert(x.file_id, x.root);
@@ -331,7 +357,7 @@ impl State {
                     self.ranges
                         .entry(x.file_id)
                         .or_default()
-                        .insert(x.offset, x.offset + x.len);
+                        .insert(x.offset, x.offset.saturating_add(x.len));
                 }
                 self.roots = s.roots.iter().map(|x| (x.file_id, x.root)).collect();
                 // (Record::decode already refused a snapshot whose streams do not decode.)
@@ -361,6 +387,8 @@ impl State {
         });
     }
 
+    /// This state as a `JnlSnapshot` record body (the unswept files and live pack ranges ride its
+    /// extensions only when non-empty). It does not carry `open` or `finished`.
     pub fn snapshot(&self) -> JnlSnapshot {
         JnlSnapshot {
             unswept: (!self.unswept.is_empty())
@@ -408,6 +436,9 @@ pub fn job_dir(jobs_dir: &Path, job: &[u8; 16]) -> PathBuf {
     jobs_dir.join(crate::hex::encode(job))
 }
 
+/// Stores the job's manifest as `<dir>/manifest`: the item stream of a
+/// `records(ManifestEntry)` field, written to `manifest.tmp`, `fsync`ed, renamed over, and the
+/// directory `fsync`ed (SPEC.md §14.1).
 pub fn write_manifest(dir: &Path, m: &Manifest) -> io::Result<()> {
     let mut w = Writer::new();
     let entries: Vec<ManifestEntry> = m
@@ -436,6 +467,7 @@ pub fn write_manifest(dir: &Path, m: &Manifest) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Reads back what [`write_manifest`] stored. Fails with `InvalidData` when it does not decode.
 pub fn read_manifest(dir: &Path) -> io::Result<Manifest> {
     let b = fs::read(dir.join("manifest"))?;
     let mut framed = (b.len() as u32).to_le_bytes().to_vec();

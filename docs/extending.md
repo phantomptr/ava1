@@ -25,6 +25,7 @@ Describe your methods and bodies in a TOML file with the same rules as
 name = "METHOD_DEVICE_STATUS"
 ty = "u16"
 value = 4
+doc = "RPC `device.status`: empty request, `DeviceStatus` reply."
 
 [[const]]
 name = "JOB_OP_HASH"     # a job.run operation
@@ -33,14 +34,21 @@ value = 1
 
 [[struct]]
 name = "DeviceStatus"
+doc = "The `device.status` reply."
 fields = [
-  { name = "uptime_s", ty = "u64" },
+  { name = "uptime_s", ty = "u64", doc = "Seconds since the device started." },
   { name = "label", ty = "str" },
 ]
 ext = [
   { tag = 1, name = "battery", ty = "u8" },   # optional, tagged: older readers skip it
 ]
 ```
+
+Any const, message, struct, field or `ext` field may carry a `doc` string. It becomes the
+generated item's documentation: `///` comments in Rust (so it shows on docs.rs and in editors)
+and a `/* ... */` comment in the C header. A `"""` string spans several lines; a doc may not
+contain `/*` or `*/`. Entries without one generate exactly as before. The generated Rust module
+also carries a `//!` doc naming the schema it came from.
 
 An extension may add constants and structs, not frame types (those are the protocol's), and may
 not reuse a name the core schema has. For bodies you do not want to type, the core's `MgmtText`

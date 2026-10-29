@@ -1,5 +1,6 @@
 //! Lowercase hex, for peer files and logs.
 
+/// Lowercase hex of `b`.
 pub fn encode(b: &[u8]) -> String {
     const D: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(b.len() * 2);
@@ -10,6 +11,7 @@ pub fn encode(b: &[u8]) -> String {
     s
 }
 
+/// The bytes of a hex string (either case); `None` for an odd length or a non-hex digit.
 pub fn decode(s: &str) -> Option<Vec<u8>> {
     let s = s.as_bytes();
     if !s.len().is_multiple_of(2) {
