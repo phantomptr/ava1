@@ -273,6 +273,9 @@ where
     let tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::default();
     let last_rx = Arc::new(AtomicU64::new(now_us()));
     let rtt = Arc::new(AtomicU64::new(0));
+    // The stamps of the first and the latest Ping written: a Pong's echo outside them
+    // answers no Ping of ours (it is in the future, or older than any), and is ignored.
+    let pinged = Arc::new((AtomicU64::new(u64::MAX), AtomicU64::new(0)));
     let pace = Pace {
         idle: timing.dead_after,
         min_rate: timing.min_frame_rate,
@@ -311,6 +314,7 @@ where
     let writer_task = {
         let close = close.clone();
         let writer_dead = writer_dead.clone();
+        let pinged = pinged.clone();
         tokio::spawn(async move {
             let dead = DeadOnDrop(writer_dead);
             while let Some(o) = out_rx.recv().await {
@@ -335,6 +339,13 @@ where
                             seq,
                             t_us: now_us(),
                         };
+                        let _ = pinged.0.compare_exchange(
+                            u64::MAX,
+                            ping.t_us,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                        pinged.1.store(ping.t_us, Ordering::Relaxed);
                         writer.send_msg(0, &ping).await
                     }
                     Out::Flush(ack) => {
@@ -369,6 +380,7 @@ where
 
     let reader_task = {
         let (outbox, close, rtt) = (outbox.clone(), close.clone(), rtt.clone());
+        let pinged = pinged.clone();
         tokio::spawn(async move {
             loop {
                 let f = match reader.recv().await {
@@ -392,7 +404,14 @@ where
                     }
                     Pong::TYPE => {
                         if let Ok(p) = f.decode::<Pong>() {
-                            rtt.store(now_us().saturating_sub(p.t_us).max(1), Ordering::Relaxed);
+                            let first = pinged.0.load(Ordering::Relaxed);
+                            let latest = pinged.1.load(Ordering::Relaxed);
+                            if (first..=latest).contains(&p.t_us) {
+                                rtt.store(
+                                    now_us().saturating_sub(p.t_us).max(1),
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
                     }
                     Bye::TYPE => return close("the other device closed the session".into()),
@@ -543,6 +562,56 @@ mod tests {
             rtt < Duration::from_millis(400),
             "RTT includes the write: {rtt:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pong_that_echoes_no_ping_of_ours_is_not_an_rtt() {
+        let timing = Timing {
+            ping_every: Duration::from_secs(3600),
+            dead_after: Duration::from_secs(3600),
+            handshake: Duration::from_secs(1),
+            min_frame_rate: MIN_FRAME_RATE,
+        };
+        let (link, _outbox, mut peer_r, mut peer_w) = linked(4096, timing);
+        // The interval's first tick is immediate: the one Ping this link sends.
+        let ping: Ping = peer_r.recv().await.unwrap().decode().unwrap();
+        let bogus = [
+            ("from before any Ping", 0),
+            ("from the future", ping.t_us + 3_600_000_000),
+            ("from the far future", u64::MAX),
+        ];
+        for (what, t_us) in bogus {
+            peer_w
+                .send_msg(
+                    0,
+                    &Pong {
+                        seq: ping.seq,
+                        t_us,
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(link.rtt(), None, "{what}");
+        }
+        // The true echo is still taken, and is short.
+        peer_w
+            .send_msg(
+                0,
+                &Pong {
+                    seq: ping.seq,
+                    t_us: ping.t_us,
+                },
+            )
+            .await
+            .unwrap();
+        let rtt = loop {
+            match link.rtt() {
+                Some(rtt) => break rtt,
+                None => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        };
+        assert!(rtt < Duration::from_secs(10), "{rtt:?}");
     }
 
     #[tokio::test]

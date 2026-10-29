@@ -53,12 +53,15 @@ pub fn unique_tmp(path: &Path) -> PathBuf {
 pub struct TmpGuard(Option<PathBuf>);
 
 impl TmpGuard {
+    /// Guards `p`: the file is removed when the guard drops, unless disarmed.
     pub fn new(p: PathBuf) -> Self {
         Self(Some(p))
     }
+    /// The guarded path.
     pub fn path(&self) -> &Path {
         self.0.as_deref().expect("armed")
     }
+    /// Keeps the file (call it once the file has been renamed into place).
     pub fn disarm(mut self) {
         self.0 = None;
     }

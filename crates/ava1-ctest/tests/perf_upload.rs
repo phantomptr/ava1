@@ -79,3 +79,39 @@ async fn large_file_rates_on_a_gigabit_wire() {
         run("perf-wire", 1024, Some(105), persist).await;
     }
 }
+
+/// Small files (under the 256 KiB cutoff) through the durable-by-log path, which checksums every
+/// byte into the pack log: run with AVA1_TEST_LOG_SMALL=1.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn small_file_rates() {
+    for size in [1024usize, 64 << 10, 200 << 10] {
+        let n = ((256usize << 20) / size).min(8000);
+        let d = dir(&format!("perf-small-{size}"));
+        let src = d.join("src");
+        write_tree(&src, n, |i| size - (i % 7));
+        let peers = d.join("peers");
+        let (me, mine) = paired_client(&peers);
+        let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+        let t = Instant::now();
+        let (r, _) = upload(
+            &srv.addr(),
+            me,
+            mine,
+            &src,
+            d.join("dst").to_str().unwrap(),
+            [8; 16],
+            |_| {},
+        )
+        .await;
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(r.status, 0);
+        eprintln!(
+            "PERF small {size} B x {n}: {secs:.2}s = {:.0} files/s, {:.1} MB/s",
+            n as f64 / secs,
+            (n * size) as f64 / secs / 1e6
+        );
+        drop(srv);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

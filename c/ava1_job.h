@@ -90,6 +90,10 @@ typedef struct ava1_work { /* a unit for the worker pool */
 struct ava1_job {
     uint8_t id[16], owner[32], sid[16];
     int attached, refs, stopping, finished, prepared;
+    /* Under mu. feeding: the feeder is between its `prepared` check and the engine's queue (it reads
+     * m and enqueues work against it); feed_hold: the job thread is about to replace m (a new manifest
+     * in the same session), so the feeder hands nothing more to the engine until it is done. */
+    int feeding, feed_hold;
     int discard_parts;              /* a cancelled local copy: destroy removes the .ava-part files this job itself was writing (final review #9) */
     uint64_t parked_at_ms;
     uint64_t concluded_ms;          /* an upload or download: when its end went out (our JobDone) or came in (the peer's),

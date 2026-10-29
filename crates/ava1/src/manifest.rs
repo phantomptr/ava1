@@ -5,20 +5,30 @@ use crate::gen::{ManifestEntry, ManifestPage, ENTRY_DIR, ENTRY_FILE};
 use crate::source::Source;
 use crate::wire::Message;
 
+/// The longest path a manifest may carry, in bytes of UTF-8 (SPEC.md §11.2).
 pub const MAX_PATH: usize = 1024;
 /// A page's encoded size limit: under the 64 KiB control cap with room for the MAC.
 pub const PAGE_BYTES: usize = 60 * 1024;
+/// The most entries a manifest may hold (SPEC.md §11.7; the C node's `AVA1_MAX_ENTRIES`): a
+/// receiver refuses growth past it, so a peer cannot make it buffer pages without end.
+pub const MAX_ENTRIES: usize = 4_000_000;
 
+/// Why a manifest path, or a manifest, was refused (SPEC.md §11.2).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PathError {
+    /// The path is "".
     #[error("path is empty")]
     Empty,
+    /// The path is longer than [`MAX_PATH`] bytes.
     #[error("path is longer than {MAX_PATH} bytes")]
     TooLong,
+    /// The path starts with '/'.
     #[error("path is absolute")]
     Absolute,
+    /// A '/'-separated component is empty, "." or "..".
     #[error("path has an empty, '.' or '..' component")]
     BadComponent,
+    /// The path contains a NUL byte.
     #[error("path contains NUL")]
     Nul,
     /// Not a path: a malformed manifest. Every other variant maps to `ERR_PATH` on the
@@ -28,8 +38,13 @@ pub enum PathError {
     /// The files' sizes add up to more than 64 bits can hold.
     #[error("the files' sizes overflow")]
     SizeOverflow,
+    /// More than [`MAX_ENTRIES`] entries: a malformed manifest, like `Gap`.
+    #[error("the manifest has more than {MAX_ENTRIES} entries")]
+    TooMany,
 }
 
+/// Checks `p` against the manifest path rules of SPEC.md §11.2; a receiver runs it on
+/// every path before touching the filesystem.
 pub fn check_path(p: &str) -> Result<(), PathError> {
     if p.is_empty() {
         return Err(PathError::Empty);
@@ -49,12 +64,19 @@ pub fn check_path(p: &str) -> Result<(), PathError> {
     Ok(())
 }
 
+/// One manifest entry: a file or a directory. Its `file_id` is its index in
+/// [`Manifest::entries`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// `ENTRY_FILE` or `ENTRY_DIR`.
     pub kind: u8,
+    /// Permission bits, as the source reported them.
     pub mode: u32,
+    /// Length in bytes (0 for a directory as [`walk`] builds it).
     pub size: u64,
+    /// Seconds since the Unix epoch; 0 when the source reports none (SPEC.md §11.4).
     pub mtime: u64,
+    /// Relative to the job root, '/'-separated (SPEC.md §11.2).
     pub path: String,
     /// Set only under the verify policy.
     pub root: Option<[u8; 32]>,
@@ -74,8 +96,11 @@ impl Entry {
     }
 }
 
+/// The entries a job moves (SPEC.md §11.3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Manifest {
+    /// Every entry in `file_id` order: depth first, siblings sorted by name, when built by
+    /// [`walk`].
     pub entries: Vec<Entry>,
 }
 
@@ -86,10 +111,12 @@ impl Manifest {
         self.entries.get(id as usize)
     }
 
+    /// Whether `id` names a file entry (false for a directory or an unknown id).
     pub fn is_file(&self, id: u32) -> bool {
         self.entry(id).is_some_and(|e| e.kind == ENTRY_FILE)
     }
 
+    /// How many entries are files.
     pub fn files(&self) -> u32 {
         self.entries.iter().filter(|e| e.kind == ENTRY_FILE).count() as u32
     }
@@ -123,6 +150,9 @@ impl Manifest {
         *h.finalize().as_bytes()
     }
 
+    /// Splits the manifest into `ManifestPage`s for `job_id`, each at most [`PAGE_BYTES`]
+    /// encoded, carrying each entry's `root` when set. An empty manifest gives one empty
+    /// page.
     pub fn pages(&self, job_id: [u8; 16]) -> Vec<ManifestPage> {
         let mut pages = Vec::new();
         let mut cur: Vec<ManifestEntry> = Vec::new();
@@ -151,13 +181,17 @@ impl Manifest {
         pages
     }
 
-    /// Reassembles pages, checking ids are consecutive from 0 and every path is valid.
+    /// Reassembles pages, checking ids are consecutive from 0, there are at most
+    /// [`MAX_ENTRIES`], and every path is valid.
     pub fn from_pages(pages: impl IntoIterator<Item = ManifestPage>) -> Result<Self, PathError> {
         let mut entries = Vec::new();
         for p in pages {
             for w in p.entries {
                 if w.file_id as usize != entries.len() {
                     return Err(PathError::Gap(w.file_id));
+                }
+                if entries.len() >= MAX_ENTRIES {
+                    return Err(PathError::TooMany);
                 }
                 check_path(&w.path)?;
                 entries.push(Entry {
@@ -174,6 +208,23 @@ impl Manifest {
         m.checked_bytes().ok_or(PathError::SizeOverflow)?;
         Ok(m)
     }
+}
+
+/// One more page of a manifest that holds `have` entries so far: its ids must go on from
+/// `have` with no gap, and the total stay within [`MAX_ENTRIES`]. Returns the new total. A
+/// receiver runs it on each page as it arrives, so a bad or endless manifest is refused at
+/// once instead of being buffered until its end.
+pub fn page_continues(have: usize, p: &ManifestPage) -> Result<usize, PathError> {
+    for (k, w) in p.entries.iter().enumerate() {
+        if w.file_id as usize != have + k {
+            return Err(PathError::Gap(w.file_id));
+        }
+    }
+    let n = have + p.entries.len();
+    if n > MAX_ENTRIES {
+        return Err(PathError::TooMany);
+    }
+    Ok(n)
 }
 
 /// Every directory and file under the source root, depth first, children sorted by name.
@@ -379,6 +430,26 @@ mod tests {
         let mut p = m.pages([0; 16]);
         p[0].entries[0].path = "../x".into();
         assert!(Manifest::from_pages(p).is_err());
+    }
+
+    #[test]
+    fn a_page_must_continue_the_ids_and_stay_within_max_entries() {
+        let m = Manifest {
+            entries: vec![e("a", 1), e("b", 2)],
+        };
+        let p = m.pages([0; 16]).remove(0);
+        assert_eq!(page_continues(0, &p), Ok(2));
+        // The same page again: its ids do not go on from 2.
+        assert_eq!(page_continues(2, &p), Err(PathError::Gap(0)));
+        let mut late = p.clone();
+        late.entries[0].file_id = (MAX_ENTRIES - 1) as u32;
+        late.entries[1].file_id = MAX_ENTRIES as u32;
+        assert_eq!(
+            page_continues(MAX_ENTRIES - 1, &late),
+            Err(PathError::TooMany)
+        );
+        late.entries.pop();
+        assert_eq!(page_continues(MAX_ENTRIES - 1, &late), Ok(MAX_ENTRIES));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! A Rust job host: uploads into, and downloads from, one shared folder (engine↔engine,
-//! and the tests). Policy and UI for sharing are deferred (plan scope).
+//! and the tests). Which folders to share, and with whom, is left to the application.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,7 +18,9 @@ use crate::wire::FrameMessage;
 /// refused with `ERR_PATH`. This is the engine↔engine host minus its policy and UI
 /// (deferred).
 pub struct FolderHost {
+    /// The shared folder: every job's root is resolved inside it.
     pub root: PathBuf,
+    /// Where uploads keep their job directories (journal, manifest, outboards; SPEC.md §14.3).
     pub jobs_dir: PathBuf,
 }
 
@@ -143,6 +145,12 @@ fn bind_peer(jobs: &Path, job: &[u8; 16], peer: &[u8; 32]) {
 /// no journal, another peer's job, another manifest, a root outside the share — is
 /// `JobMap{status = ERR_UNKNOWN_JOB}` (the two causes are not told apart), and the sender
 /// falls back to `JobOpen`.
+///
+/// The parked upload's journal carries `JnlOpen.kind = JOB_DOWNLOAD`: the Rust receiver records
+/// every job it receives that way (this node takes the bytes), whichever side opened it, and its
+/// replay (`recv::run`) keeps only such a journal, so any other kind would be started over.
+/// (The C node records the kind of the `JobOpen` it received, `JOB_UPLOAD`; neither side
+/// resumes the other's journals.)
 async fn answer_resume(
     link: &mut JobLink,
     r: gen::Resume,

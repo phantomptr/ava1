@@ -31,6 +31,7 @@ use crate::verify::{self, FileHasher, Outboard, GROUP};
 pub struct Restart(pub u64);
 
 impl Restart {
+    /// The beginning of the archive; a pass from here visits every entry.
     pub const START: Restart = Restart(0);
 }
 
@@ -51,8 +52,11 @@ pub enum Keep {
 /// `Skip`; `data` is called with consecutive pieces of the entry and `end` closes it.
 /// Any error stops the pass and is returned from it.
 pub trait EntrySink {
+    /// Starts the entry at `path` (the manifest's form of it).
     fn begin(&mut self, path: &str) -> io::Result<()>;
+    /// The next piece of the current entry's bytes, in order.
     fn data(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Closes the current entry once all of its bytes went through `data`.
     fn end(&mut self) -> io::Result<()>;
 }
 

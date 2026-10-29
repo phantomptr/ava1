@@ -2,15 +2,23 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Most peers a store keeps; adding past it drops the oldest (SPEC.md §5 item 7).
 pub const MAX_PEERS: usize = 32;
 
+/// One paired device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
+    /// Its static X25519 public key.
     pub key: [u8; 32],
+    /// When it was added, in Unix seconds.
     pub added_unix: u64,
+    /// Its name as stored. [`PeerStore::add`] keeps one line of at most 63 bytes, control
+    /// characters replaced by spaces.
     pub name: String,
 }
 
+/// The paired devices, in a file (or in memory). A change re-reads the file under an
+/// advisory lock first, so processes sharing it do not undo each other (SPEC.md §5 item 7).
 #[derive(Debug, Default)]
 pub struct PeerStore {
     path: Option<PathBuf>,
@@ -77,10 +85,12 @@ impl PeerStore {
         self.launch.as_ref().is_some_and(|t| t.recognises(h, proof))
     }
 
+    /// Whether `key` is a paired device, as of the last load or change.
     pub fn contains(&self, key: &[u8; 32]) -> bool {
         self.peers.iter().any(|p| &p.key == key)
     }
 
+    /// The paired devices, oldest first.
     pub fn list(&self) -> &[Peer] {
         &self.peers
     }

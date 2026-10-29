@@ -8,16 +8,22 @@ use crate::launch::{self, LaunchSecret};
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
 
+/// Pairing still to do on an established session (SPEC.md §5 step 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingState {
     /// The server does not know us yet and must accept a PairConfirm.
     pub server_must_confirm: bool,
 }
 
+/// A completed handshake (SPEC.md §5), on either side.
 pub struct Established {
+    /// The split keys and the handshake hash (SPEC.md §4.2).
     pub keys: SessionKeys,
+    /// The session id the server drew for `ServerInfo`; lanes join with it (SPEC.md §9).
     pub session_id: [u8; 16],
+    /// The other device's static X25519 public key.
     pub peer_key: [u8; 32],
+    /// The name the other device sent in its info message; empty if it sent none.
     pub peer_name: String,
     /// What the peer advertised in its info message (e.g. `CAP_DATA_PLANE`).
     pub peer_caps: u64,
@@ -50,6 +56,8 @@ pub(crate) fn refused(f: &Frame) -> Ava1Error {
     }
 }
 
+/// Sends `Error{code, message}` on channel 0 (sealed when the writer is keyed), best
+/// effort: a failed send is ignored.
 pub async fn refuse<W: AsyncWrite + Unpin>(w: &mut FrameWriter<W>, code: u16, message: &str) {
     let _ = w
         .send_msg(
@@ -62,6 +70,9 @@ pub async fn refuse<W: AsyncWrite + Unpin>(w: &mut FrameWriter<W>, code: u16, me
         .await;
 }
 
+/// Runs the client side of the handshake (SPEC.md §5 steps 1–4) and keys lane 0 both
+/// ways. `knows` says whether a server key is already paired; `caps` goes in `HelloInfo`.
+/// [`client_expecting`] with no expected key.
 pub async fn client<R, W>(
     r: &mut FrameReader<R>,
     w: &mut FrameWriter<W>,
@@ -218,6 +229,10 @@ where
     })
 }
 
+/// Runs the server side of the handshake from the client's `Hs1` frame (SPEC.md §5 steps
+/// 2–4) and keys lane 0 both ways. `admit` decides on the client once its key is known; an
+/// [`Admission::Refuse`] is sent to the client and returned as `NotPaired` for
+/// `ERR_PAIRING_CLOSED`, `Refused` otherwise. [`server_launched`] with no launch secret.
 pub async fn server<R, W>(
     r: &mut FrameReader<R>,
     w: &mut FrameWriter<W>,

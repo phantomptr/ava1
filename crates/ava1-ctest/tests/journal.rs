@@ -148,3 +148,21 @@ fn c_journal_torn_tail_is_ignored() {
     std::fs::write(&p, &b).unwrap();
     assert!(c_journal_dump(&d).ends_with("finished=none"));
 }
+
+/// The collector removes a job directory whose paths run past 1100 bytes (a staged tree's paths
+/// reach AVA1_PATH_CAP = 2112). It cut them at 1100 bytes and left such a tree behind for good.
+/// Linux only: macOS refuses paths over 1024 bytes in every call.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_collector_removes_a_job_directory_with_paths_past_1100_bytes() {
+    let d = tmp("gc-deep");
+    let jobs = d.join("jobs");
+    let mut p = jobs.join("00112233445566778899aabbccddeeff");
+    while p.as_os_str().len() < 1500 {
+        p = p.join("d".repeat(100));
+    }
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("f"), b"x").unwrap();
+    assert_eq!(jobs_gc(&jobs, 10 * 86_400, 86_400), 1);
+    assert!(std::fs::read_dir(&jobs).unwrap().next().is_none());
+}

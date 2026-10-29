@@ -25,7 +25,11 @@ use crate::session::{RpcReply, Timing};
 use crate::wire::{FrameMessage, Message};
 use crate::Ava1Error;
 
+/// Connections the server holds at once, all addresses together; past it a new one is
+/// refused with `ERR_BUSY` (SPEC.md §8).
 pub const MAX_CONNS: usize = 64;
+/// Sessions the server holds at once; past it a new one is refused with `ERR_BUSY`
+/// (SPEC.md §8).
 pub const MAX_SESSIONS: usize = 16;
 /// Jobs one session may have open at once; a `JobOpen` or `Resume` past it is answered
 /// `ERR_BUSY` (review 006 #4). The console's job table is the same size.
@@ -42,9 +46,11 @@ pub const MAX_PAIR_FAILURES_PER_IP: u32 = 5;
 pub const MAX_PAIR_FAILURES: u32 = 20;
 /// New pairing sessions one source address may start per `WELCOME_WINDOW`.
 pub const WELCOMES_PER_IP: u32 = 6;
+/// The window over which [`WELCOMES_PER_IP`] is counted.
 pub const WELCOME_WINDOW: Duration = Duration::from_secs(10);
 /// Pairing notifications over all addresses: a burst of 3, then one per second.
 pub const NOTICE_BURST: u32 = 3;
+/// After the burst, one pairing notification per this long (see [`NOTICE_BURST`]).
 pub const NOTICE_REFILL: Duration = Duration::from_secs(1);
 /// Connections one source address may hold (a session is 1 control + up to 8 lanes).
 pub const MAX_CONNS_PER_IP: usize = 12;
@@ -59,12 +65,22 @@ pub const NOTIFY_EVERY: Duration = Duration::from_secs(10);
 /// The server's admission limits (SPEC.md §8). Tests lower or raise them.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
+    /// Connections one source address may hold ([`MAX_CONNS_PER_IP`]).
     pub conns_per_ip: usize,
+    /// Welcomed sessions that have not confirmed pairing yet ([`MAX_UNPAIRED`]).
     pub unpaired: usize,
+    /// How long such a session may wait for its PairConfirm ([`PAIR_CONFIRM_DEADLINE`]).
     pub pair_confirm: Duration,
+    /// An identical pairing request is shown at most once per this long ([`NOTIFY_EVERY`]).
     pub notify_every: Duration,
+    /// Wrong code guesses one source address may make per pairing window
+    /// ([`MAX_PAIR_FAILURES_PER_IP`]).
     pub pair_fails_per_ip: u32,
+    /// Wrong code guesses from everyone together before the window closes
+    /// ([`MAX_PAIR_FAILURES`]).
     pub pair_fails_total: u32,
+    /// New pairing sessions one source address may start per [`WELCOME_WINDOW`]
+    /// ([`WELCOMES_PER_IP`]).
     pub welcomes_per_ip: u32,
     /// Pairing notifications, all addresses together: a burst of this many ...
     pub notice_burst: u32,
@@ -89,10 +105,6 @@ impl Default for Limits {
     }
 }
 
-/// What limits pairing attempts (SPEC.md §4.6): real guesses (the PAKE ran and the proof was
-/// wrong) per source address and in all, and the rate of new pairing sessions per address.
-/// A session that never completes the PAKE guessed nothing and is bounded only by the rate and
-/// by `Limits::unpaired`.
 /// Credit for pairing notifications over every address: milliseconds, a notification costs
 /// `notice_refill`. See `ServerCtx::notify_session`.
 #[derive(Debug)]
@@ -102,6 +114,10 @@ struct Notice {
     seq: u64,
 }
 
+/// What limits pairing attempts (SPEC.md §4.6): real guesses (the PAKE ran and the proof was
+/// wrong) per source address and in all, and the rate of new pairing sessions per address.
+/// A session that never completes the PAKE guessed nothing and is bounded only by the rate and
+/// by `Limits::unpaired`.
 #[derive(Debug, Default)]
 struct PairBudget {
     total: u32,
@@ -163,17 +179,29 @@ impl PairBudget {
     }
 }
 
+/// A device asking to pair, as the notify and approve hooks see it.
 #[derive(Clone)]
 pub struct PairRequest {
+    /// The source address of its connection.
     pub ip: IpAddr,
+    /// Its static public key.
     pub peer_key: [u8; 32],
+    /// The name it gave in its handshake.
     pub peer_name: String,
+    /// The six-digit code this session's console shows (random per session, never sent;
+    /// SPEC.md §5.5); 0 for a session that is not pairing.
     pub code: u32,
 }
 
+/// Answers one RPC from a paired session: `(method, request body)` to the reply (SPEC.md §7).
+/// Every method but `pairing.open`, which the server answers itself, comes here. Runs on a
+/// blocking worker; a reply body past [`RPC_REPLY_MAX`] goes out as `ERR_INTERNAL` instead.
 pub type RpcHandler = Box<dyn Fn(u16, &[u8]) -> RpcReply + Send + Sync>;
+/// The owner's veto on a pairing: false refuses it (see [`ServerCtx::with_approve`]).
 pub type PairHook = Box<dyn Fn(&PairRequest) -> bool + Send + Sync>;
+/// Shows a pairing request to the user (see [`ServerCtx::with_notify`]).
 pub type NotifyHook = Box<dyn Fn(&PairRequest) + Send + Sync>;
+/// Receives one log line for an operator (see [`ServerCtx::with_log`]).
 pub type LogHook = Box<dyn Fn(&str) + Send + Sync>;
 
 pub(crate) struct SessionEntry {
@@ -229,6 +257,9 @@ async fn taken_over(gens: &mut watch::Receiver<[u32; 9]>, lane: usize, gen_no: u
     let _ = gens.wait_for(|g| g[lane] != gen_no).await;
 }
 
+/// One node's server: its identity, paired peers, pairing window, hooks, limits and live
+/// sessions. Build it with [`ServerCtx::new`] and the `with_*` methods, then run it with
+/// [`serve`].
 pub struct ServerCtx {
     identity: Identity,
     name: String,
@@ -261,6 +292,9 @@ pub struct ServerCtx {
 }
 
 impl ServerCtx {
+    /// A server with `identity`, the node name `name`, the paired devices in `peers` and the
+    /// RPC handler `rpc`. Pairing is closed, it hosts no jobs and serves no management methods,
+    /// and the hooks do nothing until set; limits and timing are the defaults.
     pub fn new(identity: Identity, name: &str, peers: PeerStore, rpc: RpcHandler) -> Self {
         Self {
             identity,
@@ -316,6 +350,7 @@ impl ServerCtx {
         self.launcher.as_ref() == Some(key) || self.peers.lock().unwrap().contains(key)
     }
 
+    /// Replaces the admission limits; the notification credit restarts full under the new ones.
     pub fn with_limits(mut self, l: Limits) -> Self {
         self.limits = l;
         self.notice.lock().unwrap().credit_ms = self.notice_cap_ms();
@@ -329,6 +364,7 @@ impl ServerCtx {
         self
     }
 
+    /// Replaces the liveness and handshake timing of every connection.
     pub fn with_timing(mut self, t: Timing) -> Self {
         self.timing = t;
         self
@@ -359,6 +395,8 @@ impl ServerCtx {
         self
     }
 
+    /// Opens the pairing window for `d` from now and resets the count of wrong guesses. `d` is
+    /// not clamped here (the `pairing.open` RPC clamps it to [`MAX_PAIRING_WINDOW_S`]).
     pub fn open_pairing(&self, d: Duration) {
         self.pair_budget.lock().unwrap().reset();
         *self.pairing_until.lock().unwrap() = Some(Instant::now() + d);
@@ -384,10 +422,12 @@ impl ServerCtx {
         unpaired
     }
 
+    /// Closes the pairing window now.
     pub fn close_pairing(&self) {
         *self.pairing_until.lock().unwrap() = None;
     }
 
+    /// Whether the pairing window is open right now.
     pub fn pairing_open(&self) -> bool {
         self.pairing_until
             .lock()
@@ -416,10 +456,12 @@ impl ServerCtx {
         self.peers.lock().unwrap().contains(key)
     }
 
+    /// Connections open right now, all addresses together.
     pub fn connections(&self) -> usize {
         self.conns.load(Ordering::SeqCst)
     }
 
+    /// Sessions registered right now.
     pub fn sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
@@ -1271,6 +1313,12 @@ async fn lane(
     let (tx, mut rx) = mpsc::channel(DELIVER_DEPTH);
     let (link, outbox) = drive(r, w, ctx.timing, tx);
     let lane_gen = entry.router.lane_up(j.lane_id, outbox.clone());
+    // A job closes the lane through this (a credit violation, SPEC.md §12.4); a lane that came
+    // up as the session ended is nobody's and waits on nothing.
+    let closer = entry
+        .router
+        .lane_closer(j.lane_id, lane_gen)
+        .unwrap_or_default();
     // The proving frame is a frame like any other (a client sends a Ping).
     let mut first = Some(proof);
     loop {
@@ -1283,6 +1331,7 @@ async fn lane(
                 },
                 _ = taken_over(&mut gens, lane, gen_no) => break,
                 _ = over(&mut ended) => break,
+                _ = closer.notified() => break,
             },
         };
         match f.ty {

@@ -175,7 +175,7 @@ is derived from them any more.
 
 ## 5. Handshake and pairing
 1. Client → `Hs1{noise}` (unsealed): Noise message 1, payload `HelloInfo`
-   (version range, caps 0).
+   (version range, the client's own caps; a version 1 server records them and acts on none).
 2. Server: no common version → `Error(ERR_UNSUPPORTED_VERSION)` unsealed, close.
    Else → `Hs2{noise}`: message 2, payload `ServerInfo` (version, caps, random
    session_id, pair_commit (§4.6), name). `caps` bit 0 is `CAP_DATA_PLANE` (1): the node hosts the jobs
@@ -633,7 +633,7 @@ the manifest is sent. `verify` costs one read of the source plus a hash of each 
 receiver file of the right size, but is correct without an mtime; the sender never guesses
 an mtime. A client's "safe" resume mode should always use `verify`. The known weakness of
 `skip-existing`: a file whose content changed but whose size and mtime did not is skipped.
-A directory's mtime is always 0 and is ignored by both policies.
+A directory's mtime is the source's own (0 when unknown) and is ignored by both policies.
 
 11.5 A `JobOpen` for a job the receiver already knows is a resume: the receiver matches
 the new manifest against its stored one by path, keeps the progress of entries whose
@@ -991,7 +991,8 @@ budget instead of opening every file at once.
 A batch of N small files costs two fsyncs (the log, the journal) instead of N + D + 1; files are made
 durable in place later, off the transfer's critical path.
 
-Pack log. `<job dir>/pack.<n>` (n from 0, never reused within a job) = magic `AVA1PCK1` (8 bytes), then
+Pack log. `<job dir>/pack.<n>` (n from 0; a number is not reused while a journal record names it, and
+numbering restarts at 0 only after every segment has been swept and removed) = magic `AVA1PCK1` (8 bytes), then
 records `u32le(len) ‖ u8 kind ‖ body ‖ u32le(crc32c(kind ‖ body))`, `len` = 1 + body length, appended
 sequentially; kind 1 `PackFile` = a `BundleRecord` as received. A reader stops at the first record that runs
 past the extent or fails its CRC. A record never spans segments; a segment is closed when the next record would
@@ -1084,8 +1085,10 @@ numbers they are fed, so both are tested against models rather than sockets.
 - In-flight cap per lane: `max(chunk, lane rate × 2 s)` — the same bound §12.5 states.
 - Mixing check: once per job — after 3 warm-up ticks, if both classes still have work queued,
   the sender probes 5 s mixed, 5 s stream-only, 5 s bundle-only, then picks sequential if its
-  estimated finish time is < 90 % of mixed. Sequential runs bundles first. The choice and reason
-  go into `Status.sequential`. The probe never runs twice.
+  estimated finish time is < 90 % of mixed. Sequential runs bundles first. The choice is the
+  sender's, and the sender reports it to its own application (Rust: `Progress.sequential`,
+  `SendReport.sequential`); `Status` comes from the receiver, which does not know it, so version
+  1 receivers send `Status.sequential = 0`. The probe never runs twice.
 - Priority: beyond the bundle floor, the class with the longer estimated remaining time is
   preferred. The small/large cutoff is the protocol constant `LARGE_CUTOFF` (§12.2); it is not
   governed in version 1 — the design's 64 KiB–4 MiB auto-tuning is deferred.

@@ -2165,6 +2165,8 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     if (!strcmp(name, "ack_fail")) ava1_data_test_ack_fail = (int)v ? -(int)v : 0;
     else if (!strcmp(name, "feeder_fail")) ava1_data_test_feeder_fail = (int)v;
     else if (!strcmp(name, "feed_delay_ms")) ava1_data_test_feed_delay_ms = v;
+    else if (!strcmp(name, "feed_check_delay_ms")) ava1_data_test_feed_check_delay_ms = v;
+    else if (!strcmp(name, "reprep_delay_ms")) ava1_data_test_reprep_delay_ms = v;
     else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;
     else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;

@@ -2,14 +2,21 @@
 //! the receiver report, once per second. Pure: the sender feeds it samples.
 use crate::gen::{BN_CREDIT, BN_DISK, BN_NETWORK, BN_SOURCE, BN_WORKERS};
 
+/// The smallest chunk the governor picks: 1 MiB, one verification group.
 pub const MIN_CHUNK: u32 = 1 << 20;
 /// 16 MiB frames include the MAC and the Chunk header, so the largest chunk is 15 MiB.
 pub const MAX_CHUNK: u32 = 15 << 20;
+/// The chunk size a job starts with: 4 MiB (SPEC.md §16).
 pub const START_CHUNK: u32 = 4 << 20;
+/// The smallest bundle target: 256 KiB.
 pub const MIN_BUNDLE: u32 = 256 << 10;
+/// The largest bundle target: 15 MiB, for the same frame-cap reason as [`MAX_CHUNK`].
 pub const MAX_BUNDLE: u32 = 15 << 20;
+/// The bundle target a job starts with: 1 MiB.
 pub const START_BUNDLE: u32 = 1 << 20;
+/// The data lanes a job starts with.
 pub const START_LANES: u8 = 2;
+/// The most data lanes the governor opens for one job.
 pub const MAX_LANES: u8 = 8;
 /// A lane probe must raise the rate by this factor to keep its lane.
 const GAIN: f64 = 1.10;
@@ -27,24 +34,35 @@ const HOLD_TICKS: u32 = 30;
 const STABLE_TICKS: u32 = 10;
 const PROBE_TICKS: u32 = 5;
 
+/// The two kinds of data frame a sender schedules (SPEC.md §12.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
+    /// `Bundle` frames: small files packed together.
     Bundle,
+    /// `Chunk` frames: pieces of large files.
     Stream,
 }
 
+/// Which classes the sender may put on the lanes (the mixing check, SPEC.md §16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Both classes; beyond the bundle floor the sender favours [`Decision::prefer`].
     Mixed,
+    /// Only `Chunk` frames.
     StreamOnly,
+    /// Only `Bundle` frames.
     BundleOnly,
 }
 
+/// What the sender measured over one governor tick, fed to [`Governor::tick`].
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
+    /// The tick's length in seconds; a tick that is not a positive finite number changes
+    /// nothing.
     pub secs: f64,
     /// Bytes the receiver confirmed `Received` during this tick.
     pub bytes_acked: u64,
+    /// Lanes open during the tick (0 is taken as 1).
     pub lanes: u8,
     /// Lane deaths plus requeued frames this tick.
     pub stalls: u32,
@@ -56,19 +74,31 @@ pub struct Sample {
     pub receiver_bottleneck: u8,
     /// Bytes made durable this tick, per class, and what is left of each class.
     pub small_durable: u64,
+    /// Large-file bytes made durable this tick.
     pub large_durable: u64,
+    /// Small-file bytes still to send.
     pub small_left: u64,
+    /// Large-file bytes still to send.
     pub large_left: u64,
 }
 
+/// What the governor wants for the next tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Decision {
+    /// Data lanes to keep open (1..=[`MAX_LANES`]).
     pub lanes: u8,
+    /// Chunk size in bytes, a whole number of MiB ([`MIN_CHUNK`]..=[`MAX_CHUNK`]).
     pub chunk: u32,
+    /// Bundle target in bytes ([`MIN_BUNDLE`]..=[`MAX_BUNDLE`]).
     pub bundle: u32,
+    /// The sender's bottleneck as shown to the user: a `BN_*` code (SPEC.md §16).
     pub bottleneck: u8,
+    /// Which classes may be sent; in sequential mode `BundleOnly` until no small bytes are
+    /// left, then `StreamOnly`.
     pub mode: Mode,
+    /// The class with the longer estimated remaining time, preferred under `Mixed`.
     pub prefer: Class,
+    /// The mixing check chose sequential (bundles first); reported in `Status.sequential`.
     pub sequential: bool,
 }
 
@@ -122,6 +152,9 @@ impl GovernorOptions {
         )
     }
 
+    /// [`from_env`](Self::from_env) with the variables' values passed in: `lanes` and
+    /// `chunk_mib` as decimal strings, `lanes_first` off only for `"0"`. Unparsable or
+    /// out-of-range values are ignored.
     pub fn from_vars(
         lanes: Option<&str>,
         chunk_mib: Option<&str>,
@@ -142,6 +175,8 @@ impl GovernorOptions {
     }
 }
 
+/// The sender's control loop (SPEC.md §16): fed one [`Sample`] per tick, it returns the
+/// [`Decision`] for the next. Pure; it never touches a socket or the clock.
 pub struct Governor {
     opts: GovernorOptions,
     /// The highest per-tick rate seen (bytes/s).
@@ -189,10 +224,12 @@ const MAX_PLAUSIBLE_RATE: f64 = 1e12;
 const BEST_DECAY: f64 = 0.99;
 
 impl Governor {
+    /// A governor with the production behaviour ([`GovernorOptions::default`]).
     pub fn new() -> Self {
         Self::with_options(GovernorOptions::default())
     }
 
+    /// A governor with these switches; pins set the starting lanes and chunk too.
     pub fn with_options(opts: GovernorOptions) -> Self {
         Self {
             opts,
@@ -239,6 +276,10 @@ impl Governor {
         }
     }
 
+    /// Runs one tick on `s` and returns the decision for the next. A stall drops a lane and
+    /// halves the chunk; the lane probe, chunk growth, bundle target and the once-per-job
+    /// mixing check follow SPEC.md §16. Hostile values (a NaN or zero `secs`, an
+    /// implausible `bytes_acked`) cannot push the result out of its ranges.
     pub fn tick(&mut self, s: &Sample) -> Decision {
         if s.secs.is_nan() || s.secs <= 0.0 || s.secs.is_infinite() {
             return self.decision(BN_NETWORK, s);
@@ -410,13 +451,19 @@ impl Governor {
 /// (review 009 #4).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobSummary {
+    /// Ticks observed.
     pub ticks: u32,
+    /// Ticks where the sender was credit-starved.
     pub credit_starved: u32,
+    /// Ticks where the sender was source-starved.
     pub source_starved: u32,
     /// Credit-starved while the receiver reported disk or workers as its limit.
     pub receiver_bound: u32,
+    /// Sum of each tick's open lanes (divide by `ticks` for the average).
     pub lanes_sum: u64,
+    /// Sum of each tick's chosen chunk size in bytes.
     pub chunk_sum: u64,
+    /// The receiver's bottleneck (`BN_*`) as of the last tick.
     pub receiver_bottleneck: u8,
     /// Ticks the governor spent in sequential-write mode (the slow-drive switch).
     pub sequential_ticks: u32,
@@ -492,7 +539,9 @@ impl JobSummary {
         self.stride = self.stride.max(o.stride);
     }
 
-    /// `None` for a job too short to have had a tick.
+    /// The one-line `[ava1] job bottlenecks ...` summary: each starved share in percent,
+    /// the receiver's last bottleneck, average lanes and chunk. `None` for a job too short
+    /// to have had a tick.
     pub fn line(&self) -> Option<String> {
         if self.ticks == 0 {
             return None;

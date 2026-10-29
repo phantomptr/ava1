@@ -6,12 +6,15 @@ members = [
   "crates/ava1-chaos",
   "crates/ava1-ctest",
 ]
-resolver = "2"
+# Version 3 picks dependency versions that build with rust-version.
+resolver = "3"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "1.0.0"
+version = "1.0.1"
+# File::lock (1.89). CI builds the published crates with exactly this version.
+rust-version = "1.89"
 repository = "https://github.com/phantomptr/ava1"
 homepage = "https://github.com/phantomptr/ava1"
 authors = ["phantomptr"]

@@ -10,6 +10,7 @@ use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 
+/// Length of a launch token in bytes (SPEC.md §5.2).
 pub const TOKEN_LEN: usize = 16;
 /// Tokens kept; issuing past this drops the oldest.
 pub const MAX_TOKENS: usize = 32;
@@ -39,7 +40,9 @@ pub fn proof(token: &[u8; TOKEN_LEN], h: &[u8; 64]) -> [u8; 16] {
 /// static key is `key`, the trust slot's key.
 #[derive(Clone)]
 pub struct LaunchSecret {
+    /// The client key in the trust slot: the only client that gets a proof.
     pub key: [u8; 32],
+    /// The launch token from the trust slot. Wiped on drop and left out of `Debug`.
     pub token: [u8; TOKEN_LEN],
 }
 

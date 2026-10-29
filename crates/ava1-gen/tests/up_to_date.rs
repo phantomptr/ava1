@@ -156,3 +156,67 @@ fn the_embedded_core_schema_is_the_repository_one() {
     let repo = std::fs::read_to_string(root.join("schema/ava1.toml")).unwrap();
     assert_eq!(ava1_gen::CORE_SCHEMA, repo, "run `cargo run -p ava1-gen`");
 }
+
+#[test]
+fn docs_become_doc_comments_and_change_nothing_else() {
+    let plain = "[[const]]\nname = \"K\"\nty = \"u8\"\nvalue = 1\n\
+                 [[message]]\nname = \"A\"\ntype = 1\n\
+                 fields = [{ name = \"x\", ty = \"u8\" }]\next = [{ tag = 1, name = \"y\", ty = \"str\" }]\n";
+    let docs = "[[const]]\nname = \"K\"\nty = \"u8\"\nvalue = 1\ndoc = \"One K.\"\n\
+                [[message]]\nname = \"A\"\ntype = 1\ndoc = \"\"\"\nFirst line.\n\nThird line.\"\"\"\n\
+                fields = [{ name = \"x\", ty = \"u8\", doc = \"The x.\" }]\n\
+                ext = [{ tag = 1, name = \"y\", ty = \"str\", doc = \"The y.\" }]\n";
+    let (p, d) = (
+        ava1_gen::parse(plain).unwrap(),
+        ava1_gen::parse(docs).unwrap(),
+    );
+    let t = &ava1_gen::CORE;
+    let rs = ava1_gen::emit_rust(&d, t);
+    assert!(rs.starts_with("//! The AVA1 core"), "{rs}");
+    assert!(rs.contains("/// One K.\npub const K: u8 = 1;"), "{rs}");
+    assert!(
+        rs.contains("/// First line.\n///\n/// Third line.\n#[derive("),
+        "{rs}"
+    );
+    assert!(rs.contains("    /// The x.\n    pub x: u8,"), "{rs}");
+    assert!(
+        rs.contains("    /// The y.\n    pub y: Option<String>,"),
+        "{rs}"
+    );
+    let h = ava1_gen::emit_c_header(&d, t);
+    assert!(h.contains("/* One K. */\n#define AVA1_K 1ULL"), "{h}");
+    assert!(
+        h.contains("/* First line.\n *\n * Third line. */\ntypedef struct {"),
+        "{h}"
+    );
+    assert!(h.contains("    /* The x. */\n    uint8_t x;"), "{h}");
+    assert!(h.contains("    /* The y. */\n    int has_y;"), "{h}");
+    // Without the doc lines, the output is the undocumented schema's.
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(&rs), strip(&ava1_gen::emit_rust(&p, t)));
+    let c_strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                !(l.starts_with("/* ")
+                    && !l.starts_with("/* Generated")
+                    && !l.starts_with("/* Decode"))
+                    && !(l.starts_with('*') && !l.starts_with("* run"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(c_strip(&h), c_strip(&ava1_gen::emit_c_header(&p, t)));
+    assert_eq!(
+        ava1_gen::emit_c_source(&d, t),
+        ava1_gen::emit_c_source(&p, t)
+    );
+    // A doc lands in C comments: it may not close or open one.
+    let bad = "[[const]]\nname = \"K\"\nty = \"u8\"\nvalue = 1\ndoc = \"a */ b\"\n";
+    assert!(ava1_gen::parse(bad).is_err());
+}

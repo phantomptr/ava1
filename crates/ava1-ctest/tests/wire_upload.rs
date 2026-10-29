@@ -668,3 +668,58 @@ fn n3_retire_never_frees_a_job_that_left_the_table() {
     // table's and the caller's: retire must refuse it, not free it under the other holder.
     assert_eq!(ava1_ctest::c_retire_unlisted(), 0);
 }
+
+/// A second manifest in the same session renumbers the job's files. A lane frame the feeder
+/// had already checked against the first manifest must reach the engine before the new one
+/// replaces it: pre-fix it was validated (and indexed) against the new, smaller manifest —
+/// a use-after-free of the old entries, or a write past the new file table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_frame_checked_before_a_new_manifest_is_queued_before_it_replaces_the_old() {
+    let d = dir("wire-remanifest");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x5eu8; 16];
+    let big = big_data(2 << 20);
+    let a = Manifest {
+        entries: vec![file("a", big.len() as u64), file("b", big.len() as u64)],
+    };
+    let root = d.join("dest");
+    let mut link = s.job(job);
+    let ack = open(&mut link, job, &root).await;
+    assert_eq!(ack.status, 0);
+    send_manifest(&link, job, &a).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    // The job thread takes its time before re-preparing; the feeder, in that time, checks a
+    // chunk for file 1 against manifest A and is slow to queue it.
+    srv.knob("reprep_delay_ms", 300);
+    srv.knob("feed_check_delay_ms", 700);
+    let b = Manifest {
+        entries: vec![file("a", big.len() as u64)],
+    };
+    send_manifest(&link, job, &b).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send_raw(Chunk::TYPE, 0, 1, chunk(job, 1, 0, &big[..1 << 20]))
+        .await
+        .unwrap();
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    srv.knob("reprep_delay_ms", 0);
+    srv.knob("feed_check_delay_ms", 0);
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    // No failure follows: the chunk was applied under manifest A.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(1500) {
+        if let Ok(Some(Inbound::Control(f))) =
+            tokio::time::timeout(Duration::from_millis(100), link.rx.recv()).await
+        {
+            if f.ty == JobDone::TYPE {
+                let done: JobDone = f.decode().unwrap();
+                panic!("the job ended: {} {:?}", done.status, done.message);
+            }
+        }
+    }
+}

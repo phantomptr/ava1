@@ -13,6 +13,7 @@
 #include "ava1_b3.h"
 #include "ava1_data.h"
 #include "ava1_internal.h"
+#include "ava1_platform.h"
 #include "blake3.h"
 
 #define MAP_ITEMS 2000u /* items per JobMap page: 2,000 ranges of 24 bytes fit a control frame */
@@ -659,7 +660,8 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         } else {
             j->staged = !(s->flags & AVA1_JF_SINGLE_FILE) && stat(s->root, &st) != 0;
         }
-        (void)ava1_mkdirs(j->dir, 0);
+        /* synced into jobs_dir: the journal and pack logs in it are what acknowledged bytes rest on */
+        (void)ava1_mkdirs(j->dir, 1);
     }
     snprintf(j->base, sizeof j->base, "%s%s", j->root, j->staged ? ".ava-part" : "");
     if (s->entries && ava1_mstore_reserve(&j->m_in, s->entries) != 0) {
@@ -1357,7 +1359,13 @@ static void recv_events(ava1_job_t *j) {
         int stopped;
         /* frames of an earlier session name the old ids; and files not yet durable in place must settle first,
          * or the sweep queue would name other files once the ids move (SPEC.md §15.7) */
+        /* The feeder keeps handing lane frames to the engine while this thread re-prepares; one
+         * checked against the old manifest and queued after the quiesce would be applied with the
+         * new one's ids and sizes (or read the old one after remap frees it). Hold it first. */
+        if (ava1_data_test_reprep_delay_ms) ava1_platform_sleep_ms(ava1_data_test_reprep_delay_ms);
+        ava1_data_feed_hold(j, 1);
         if (ava1_apply_quiesce(j) != 0) {
+            ava1_data_feed_hold(j, 0);
             pthread_mutex_lock(&j->mu);
             stopped = j->stopping;
             pthread_mutex_unlock(&j->mu);
@@ -1369,6 +1377,7 @@ static void recv_events(ava1_job_t *j) {
             return;
         }
         st = adopt(j, &in, hash, msg, sizeof msg);
+        ava1_data_feed_hold(j, 0); /* `prepared` stays 0 until the new map is out */
         ava1_mstore_free(&in);
         pthread_mutex_lock(&j->mu);
         stopped = j->stopping;

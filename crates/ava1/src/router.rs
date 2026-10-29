@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::conn::{Frame, FrameBody};
 use crate::frame::FLAG_IGNORABLE;
@@ -14,23 +14,42 @@ use crate::link::{Outbox, DELIVER_DEPTH};
 use crate::wire::FrameMessage;
 use crate::Ava1Error;
 
+/// A job's 16-byte identifier (SPEC.md §11.1).
 pub type JobId = [u8; 16];
+/// A boxed `Send` future, so [`LaneOpener`] stays object-safe.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Whether frame type `ty` is a data-plane message (0x20–0x3F), whose body starts with its
+/// job id (SPEC.md §11.1).
 pub fn is_data_type(ty: u8) -> bool {
     (0x20..=0x3F).contains(&ty)
 }
 
+/// The job id in the first 16 bytes of the frame's body; `None` when the body is shorter.
+/// Meaningful only for a data-plane frame ([`is_data_type`]); the type is not checked here.
 pub fn job_of(f: &Frame) -> Option<JobId> {
     f.body.get(..16).and_then(|b| b.try_into().ok())
 }
 
+/// What a job's [`Inbox`] yields: frames routed to the job, and the session's lane and
+/// lifecycle events.
 #[derive(Debug)]
 pub enum Inbound {
+    /// A data-plane frame for this job that arrived on the control connection.
     Control(Frame),
-    Lane { lane: u16, frame: Frame },
+    /// A data-plane frame for this job that arrived on a data lane.
+    Lane {
+        /// The lane it arrived on.
+        lane: u16,
+        /// The frame.
+        frame: Frame,
+    },
+    /// The lane with this id is up (it came up, or was already up when the job registered).
     LaneUp(u16),
+    /// The lane with this id went down.
     LaneDown(u16),
+    /// The job is cut off: the session ended, or another registration took its id
+    /// (`"superseded"`). The string says why. No lane event follows it.
     Closed(String),
 }
 
@@ -52,6 +71,8 @@ impl ConnTx {
         Self { outbox }
     }
 
+    /// Queues one frame of type `ty` with `flags`, `channel` and an encoded body. Waits for
+    /// room in the writer queue; fails with [`Ava1Error::Lost`] once the connection has ended.
     pub async fn send_raw(
         &self,
         ty: u8,
@@ -84,6 +105,14 @@ impl ConnTx {
         self.outbox.writer_dead()
     }
 
+    /// Waits (at most `limit`) until everything queued before this call is on the wire;
+    /// false when the limit passed first or the connection has ended.
+    pub async fn flush(&self, limit: std::time::Duration) -> bool {
+        self.outbox.flush(limit).await
+    }
+
+    /// Encodes `m` and queues it as a frame of its own type, flags 0, channel 0. Fails if `m`
+    /// does not encode, or as [`send_raw`](Self::send_raw) does.
     pub async fn send<M: FrameMessage>(&self, m: &M) -> Result<(), Ava1Error> {
         self.send_raw(M::TYPE, 0, 0, m.to_bytes()?).await
     }
@@ -95,16 +124,36 @@ impl ConnTx {
     }
 }
 
+/// One data lane that is up on the session: its id and a sender on its connection.
 #[derive(Clone)]
 pub struct LaneTx {
+    /// The lane id.
     pub id: u16,
     gen: u64,
+    /// Sends on the lane's connection.
     pub tx: ConnTx,
+    /// Asks the lane's owner to close it (see [`LaneTx::close`]).
+    closer: Arc<Notify>,
+}
+
+impl LaneTx {
+    /// Asks whoever runs this lane's connection to close it, as a receiver does after a credit
+    /// violation (SPEC.md §12.4): the lane goes down, the session and its other lanes go on.
+    /// A server's lane loop ends on it; on the dialling side the job's [`LaneOpener`] closes
+    /// the lane instead. Queue anything that must reach the peer first
+    /// and flush it: the close drops what is still queued.
+    pub fn close(&self) {
+        self.closer.notify_one();
+    }
 }
 
 /// Opens and closes lanes for jobs. Only the dialling side has one.
 pub trait LaneOpener: Send + Sync {
+    /// Opens a new data lane on the session and returns its lane id. The lane reports itself up
+    /// to every job through the router ([`Inbound::LaneUp`]).
     fn open(&self) -> BoxFut<'_, Result<u16, Ava1Error>>;
+    /// Lets go of the lane this opener opened with `id`; the lane then goes down
+    /// ([`Inbound::LaneDown`]).
     fn close(&self, id: u16);
 }
 
@@ -165,6 +214,8 @@ impl Inbox {
     }
 }
 
+/// Routes one session's data-plane frames to its jobs by job id, and tells every job when a
+/// lane comes up or goes down and when the session closes.
 #[derive(Default)]
 pub struct Router {
     jobs: Mutex<HashMap<JobId, JobInbox>>,
@@ -229,6 +280,7 @@ impl Router {
         self.jobs.lock().unwrap().len()
     }
 
+    /// Whether a job is registered under `job` right now.
     pub fn has_job(&self, job: &JobId) -> bool {
         self.jobs.lock().unwrap().contains_key(job)
     }
@@ -278,11 +330,23 @@ impl Router {
                 id,
                 gen,
                 tx: ConnTx::new(outbox),
+                closer: Arc::default(),
             },
         );
         self.broadcast(|| Inbound::LaneUp(id));
         drop(lanes);
         gen
+    }
+
+    /// What [`LaneTx::close`] signals for the lane `id` of generation `gen`, for the task that
+    /// runs its connection to wait on; `None` when that lane is not (or no longer) up.
+    pub(crate) fn lane_closer(&self, id: u16, gen: u64) -> Option<Arc<Notify>> {
+        self.lanes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|t| t.gen == gen)
+            .map(|t| t.closer.clone())
     }
 
     /// Only the generation that came up is taken down (a lane id can be re-joined).
@@ -294,12 +358,23 @@ impl Router {
         }
     }
 
+    /// The lanes that are up right now.
     pub fn lanes(&self) -> Vec<LaneTx> {
         self.lanes.lock().unwrap().values().cloned().collect()
     }
 
+    /// The lane `id`, if it is up.
     pub fn lane(&self, id: u16) -> Option<LaneTx> {
         self.lanes.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Whether `l` is still the lane up on its id (not gone, and not a later lane on the id).
+    pub(crate) fn is_current(&self, l: &LaneTx) -> bool {
+        self.lanes
+            .lock()
+            .unwrap()
+            .get(&l.id)
+            .is_some_and(|t| t.gen == l.gen)
     }
 
     pub(crate) fn close(&self, why: &str) {
@@ -329,8 +404,11 @@ impl Router {
 /// means this job is over (the session closed, or another registration took the id) and
 /// nothing queued remains.
 pub struct JobLink {
+    /// The job this link serves.
     pub job_id: JobId,
+    /// The job's frames and lifecycle events.
     pub rx: Inbox,
+    /// Sends on the session's control connection.
     pub control: ConnTx,
     router: Arc<Router>,
     opener: Option<Arc<dyn LaneOpener>>,
@@ -353,14 +431,23 @@ impl JobLink {
         }
     }
 
+    /// The session's lanes that are up right now.
     pub fn lanes(&self) -> Vec<LaneTx> {
         self.router.lanes()
     }
 
+    /// The session's lane `id`, if it is up.
     pub fn lane(&self, id: u16) -> Option<LaneTx> {
         self.router.lane(id)
     }
 
+    /// The session's router, for work that outlives a borrow of this link.
+    pub(crate) fn router(&self) -> Arc<Router> {
+        self.router.clone()
+    }
+
+    /// The session's lane opener; `None` on the side that did not dial (only the dialling side
+    /// opens lanes).
     pub fn opener(&self) -> Option<&Arc<dyn LaneOpener>> {
         self.opener.as_ref()
     }
@@ -405,6 +492,24 @@ mod tests {
             tx,
         );
         outbox
+    }
+
+    #[tokio::test]
+    async fn closing_a_lane_wakes_the_task_that_runs_it_and_only_that_generation() {
+        let router = Arc::new(Router::default());
+        let gen = router.lane_up(3, outbox());
+        let closer = router.lane_closer(3, gen).expect("the lane is up");
+        assert!(
+            router.lane_closer(3, gen + 1).is_none(),
+            "another generation"
+        );
+        router.lane(3).expect("the lane is up").close();
+        // The permit is stored: a task that starts waiting after the close still sees it.
+        timeout(Duration::from_secs(1), closer.notified())
+            .await
+            .expect("the lane's task was not told to close");
+        router.lane_down(3, gen);
+        assert!(router.lane_closer(3, gen).is_none(), "a lane that is down");
     }
 
     #[tokio::test]

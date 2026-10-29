@@ -159,7 +159,10 @@ static int mkdirs_to(const char *path, int self, int sync) {
     return 0;
 }
 
-int ava1_mkparents(const char *path) { return mkdirs_to(path, 0, 0); }
+/* A file whose parents are not manifest entries (SPEC.md 15.1): each directory made here is synced
+ * into its parent, as the batch syncs only the file's own directory. Nothing is synced when the
+ * parents exist (prepare made the manifest's directories). */
+int ava1_mkparents(const char *path) { return mkdirs_to(path, 0, 1); }
 int ava1_mkdirs(const char *path, int sync) { return mkdirs_to(path, 1, sync); }
 
 /* ---- the large-file index (see ava1_job.h: lfl) ----------------------------------- */
@@ -2815,6 +2818,7 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     uint8_t b[16];
     ava1_w_t w;
     ava1_lfile_t *lf = j->lf[id];
+    int ob;
     r.file_id = id;
     ava1_w_init(&w, b, sizeof b);
     if (ava1_jnl_reset_encode(&r, &w) == 0) (void)ava1_apply_jnl_append(j, AVA1_JNL_RESET, b, w.len);
@@ -2824,12 +2828,16 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     ava1_rset_clear(&lf->durable);
     lf->has_root = lf->root_journaled = 0;
     lf->committing = 0; /* a commit that found its bytes wrong starts the file over */
+    /* Our own descriptor, taken under the lock: from here lf is evictable, and a worker in lf_slots
+     * may close its descriptors and reuse the number for another file's part file. */
+    ob = lf->ob_fd >= 0 ? dup(lf->ob_fd) : -1;
     pthread_mutex_unlock(&j->mu);
-    if (lf->ob_fd >= 0) {
+    if (ob >= 0) {
         uint64_t n = groups_of(j->m.e[id].size) * 32u;
         /* Best effort: the outboard is rewritten with the file's next bytes either way. */
-        if (ftruncate(lf->ob_fd, 0) != 0 || ftruncate(lf->ob_fd, (off_t)n) != 0) {
+        if (ftruncate(ob, 0) != 0 || ftruncate(ob, (off_t)n) != 0) {
         }
+        close(ob);
     }
     if (reason) emit_retry(j, id, reason);
 }
@@ -3022,7 +3030,9 @@ void ava1_apply_commit_ready(ava1_job_t *j) {
         ava1_work_t *w;
         pthread_mutex_lock(&j->mu);
         lf = j->lf[i]; /* the same lf the snapshot saw: only a commit or a reset frees one, never this scan */
-        ready = lf && !lf->committed && !lf->committing && !ava1_bits_get(&j->done, i) && lf->has_root &&
+        /* Not while a worker opens it (a late duplicate chunk): that worker may be waiting in lf_slots,
+         * which runs queued commits itself, and this commit's own open would wait on that `opening`. */
+        ready = lf && !lf->committed && !lf->committing && !lf->opening && !ava1_bits_get(&j->done, i) && lf->has_root &&
                 lf->root_journaled && !lf->written.n &&
                 (j->m.e[i].size == 0 || ava1_rset_covers(&lf->durable, 0, j->m.e[i].size));
         if (ready) {

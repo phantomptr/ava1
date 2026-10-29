@@ -20,6 +20,7 @@ const fn table() -> [u32; 256] {
 
 static TABLE: [u32; 256] = table();
 
+/// CRC-32C of `data` (initial value and final XOR 0xFFFFFFFF).
 pub fn crc32c(data: &[u8]) -> u32 {
     let mut c = !0u32;
     for &b in data {

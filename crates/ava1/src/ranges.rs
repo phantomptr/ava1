@@ -10,10 +10,13 @@ pub struct RangeSet {
 }
 
 impl RangeSet {
+    /// An empty set.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds `start..end`, merging it with every range it overlaps or touches. An empty range
+    /// (`start >= end`) is ignored.
     pub fn insert(&mut self, start: u64, end: u64) {
         if start >= end {
             return;
@@ -30,23 +33,28 @@ impl RangeSet {
         self.v.splice(i..j, [(s, e)]);
     }
 
+    /// The ranges as `(start, end)` pairs, ascending.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.v.iter().copied()
     }
 
+    /// The number of bytes the set covers.
     pub fn covered(&self) -> u64 {
         self.v.iter().map(|r| r.1 - r.0).sum()
     }
 
+    /// Whether one range of the set holds all of `start..end`.
     pub fn covers(&self, start: u64, end: u64) -> bool {
         let i = self.v.partition_point(|r| r.1 <= start);
         self.v.get(i).is_some_and(|r| r.0 <= start && end <= r.1)
     }
 
+    /// Whether the set covers `0..total`; always true for `total == 0`.
     pub fn is_full(&self, total: u64) -> bool {
         total == 0 || self.covers(0, total)
     }
 
+    /// The gaps in `0..total`, ascending, as `(start, end)` pairs.
     pub fn missing(&self, total: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         let mut at = 0;
@@ -67,6 +75,7 @@ impl RangeSet {
     }
 }
 
+/// The ids as runs of consecutive ids, ascending.
 pub fn runs(set: &BTreeSet<u32>) -> Vec<FileRun> {
     let mut out: Vec<FileRun> = Vec::new();
     for &i in set {
@@ -86,6 +95,8 @@ pub fn runs_within_limit(runs: &[FileRun]) -> bool {
     runs.iter().map(|r| r.count as u64).sum::<u64>() <= MAX_RUN_IDS
 }
 
+/// The ids the runs name. Saturates at `u32::MAX` and keeps at most [`MAX_RUN_IDS`] ids, so
+/// a hostile or corrupt list can neither wrap nor exhaust memory.
 pub fn from_runs(runs: &[FileRun]) -> BTreeSet<u32> {
     runs.iter()
         .flat_map(|r| r.first..r.first.saturating_add(r.count))
@@ -96,7 +107,9 @@ pub fn from_runs(runs: &[FileRun]) -> BTreeSet<u32> {
 /// A receiver's answer to "what do you have": done files and durable ranges of the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Need {
+    /// Files that are complete and durable.
     pub done: BTreeSet<u32>,
+    /// Durable byte ranges of files not yet done, by file id.
     pub partial: BTreeMap<u32, RangeSet>,
     /// Bytes the receiver's drive already holds for the job's unfinished large files (the
     /// allocated blocks of their part files; the JobMap `held` extension on its last page).
@@ -150,6 +163,7 @@ impl Need {
         }
     }
 
+    /// Merges one JobMap page into this answer. `held` keeps the largest value any page reported.
     pub fn add_page(&mut self, m: &gen::JobMap) {
         if let Some(h) = m.held {
             self.held = self.held.max(h);
