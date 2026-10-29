@@ -6,6 +6,12 @@
 //! (`use ava1::wire::...`); in C it is `ava1_<name>_gen.{h,c}`, which includes `ava1_gen.h`.
 //! Constants and types keep the `AVA1_` / `ava1_` prefix either way, so an application's names
 //! read like the protocol's.
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/phantomptr/ava1/main/branding/png/icon-256.png"
+)]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/phantomptr/ava1/main/branding/png/favicon-32.png"
+)]
 #![warn(missing_docs)]
 use serde::Deserialize;
 use std::collections::HashSet;

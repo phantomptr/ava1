@@ -3,6 +3,13 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## Unreleased
+
+- A logo: the AVA1 mark and name in `branding/` (SVG masters, PNGs, `scripts/brand-assets.py`),
+  shown in the READMEs and as the docs.rs logo and favicon.
+- Issue and pull request templates, CODEOWNERS, and the Ko-fi and Discord links (README,
+  `.github/FUNDING.yml`).
+
 ## 1.0.2
 
 The known limits of 1.0.1, fixed. Nothing changes on the wire or on disk, and the public API only

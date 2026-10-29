@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest an idea for AVA1
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case or pain point. "I can't do X because..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to see?
+      description: Describe the feature or change you'd like. If it touches the wire format, say how an older peer would cope with it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you tried any workarounds? Could an application method (see docs/extending.md) do it without a protocol change?

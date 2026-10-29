@@ -1,7 +1,9 @@
 # ava1
 
+<p align="center"><img src="https://raw.githubusercontent.com/phantomptr/ava1/main/branding/png/lockup-horizontal-black.png" alt="AVA1" width="360" /></p>
+
 [![ci](https://github.com/phantomptr/ava1/actions/workflows/ci.yml/badge.svg)](https://github.com/phantomptr/ava1/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/ava1.svg)](https://crates.io/crates/ava1)
+[![crates.io](https://img.shields.io/crates/v/ava1)](https://crates.io/crates/ava1)
 [![docs.rs](https://img.shields.io/docsrs/ava1)](https://docs.rs/ava1)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -55,6 +57,12 @@ cargo run -p ava1 --example send_folder -- path/to/folder
 See the [API documentation](https://docs.rs/ava1), the
 [specification](https://github.com/phantomptr/ava1/blob/main/spec/SPEC.md), and the
 [repository README](https://github.com/phantomptr/ava1#readme).
+
+## Support
+
+AVA1 is made by [PhantomPtr](https://x.com/phantomptr). Questions are welcome on
+[Discord](https://discord.gg/fzK3xddtrM), and if AVA1 is useful to you, you can
+[buy me a coffee on Ko-fi](https://ko-fi.com/B0B81S0WUA).
 
 ## License
 
