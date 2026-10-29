@@ -1,4 +1,4 @@
-//! perf-apply (review 003 §2.1, §3.3, §6): the receive/apply path's latency fixes, each proved
+//! perf-apply: the receive/apply path's latency fixes, each proved
 //! through the C engine's test hooks rather than by timing.
 #![cfg(unix)]
 
@@ -400,7 +400,7 @@ fn a_fast_drive_keeps_the_batch_fsync() {
     assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), a);
 }
 
-// ---- fix round (review perf-apply) ----
+// ---- regressions ----
 
 fn six_large(tag: &str) -> (TempDir, Vec<Vec<u8>>, Manifest) {
     let t = tmp(tag);

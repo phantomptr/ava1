@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Task 14 fix round 1 (the fix brief): a job can never stay attached to a dead session,
+//! A job can never stay attached to a dead session,
 //! control frames are checked against the attached session, the global control-queue cap,
 //! Received headroom at volume, re-attach drops the old session's batch, retiring ids.
 //! Every network test runs under one outer timeout, so a hang fails in seconds.

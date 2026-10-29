@@ -685,7 +685,7 @@ mod tests {
     }
 
     /// A one-segment pack of five records of different sizes: the file bytes, each record's
-    /// `(id, start, end)` and the journal state that names the whole range (review 009 #2b).
+    /// `(id, start, end)` and the journal state that names the whole range.
     fn sweep_fixture(tag: &str) -> (Vec<u8>, Vec<(u32, u64, u64)>, State) {
         let d = tmp(tag);
         let mut p = PackLog::new(&d, PackOpts::default());

@@ -525,7 +525,7 @@ static int part_shared(const char *jobs_dir, const char *self, const char *part)
 }
 
 /* Collects job directories idle for more than max_age_s by `now_unix`, a WALL clock (file mtimes are wall
- * time). The wall clock is the user's to set, so (final review: console):
+ * time). The wall clock is the user's to set, so:
  *   - before 2024 it is a reset clock: nothing is collected;
  *   - a job stamped in the future (clock moved back) is skipped, and only it;
  *   - a directory with a pack log (the only copy of files not yet durable in place) is never collected on

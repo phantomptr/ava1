@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Durable-by-log on the engine's receiver (review 003 §3.2, SPEC.md §15.7): a download of many small
+//! Durable-by-log on the engine's receiver (SPEC.md §15.7): a download of many small
 //! files from the C sender through `LocalSink` with the pack log on — the journal records pack batches and
 //! sweeps, the job ends settled with no pack file left, and the per-file path (log off) still works.
 mod common;

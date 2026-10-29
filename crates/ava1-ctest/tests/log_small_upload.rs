@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Durable-by-log on the wire (review 003 §3.2, SPEC.md §15.7): the engine uploads small files to the C
+//! Durable-by-log on the wire (SPEC.md §15.7): the engine uploads small files to the C
 //! receiver with the pack log on. A merge settles behind JobDone; the sender sees `settling` and the
 //! receiver's `unswept` through its Status and reports when it reaches 0.
 mod common;

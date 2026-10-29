@@ -87,7 +87,7 @@ impl JobHost for FolderHost {
                     let _ = receive_job(&mut link, open, sink, o).await;
                 }
                 gen::JOB_DOWNLOAD => {
-                    // The peer-chosen root was checked above (ruling 14): walk/single emit
+                    // The peer-chosen root was checked above: walk/single emit
                     // only checked paths, so nothing peer-chosen reaches LocalSource
                     // unvalidated.
                     let (m, src) = if path.is_dir() {

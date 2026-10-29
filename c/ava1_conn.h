@@ -28,7 +28,7 @@ typedef struct ava1_qitem {
 
 /* The first counter value no frame may be sealed or opened with. A direction's counter is the
  * AEAD nonce (SPEC.md 4.4); a wrap would reuse nonces under one key. 2^64 frames are
- * unreachable, so reaching this breaks the connection cleanly (review 006 #1). */
+ * unreachable, so reaching this breaks the connection cleanly. */
 #define AVA1_NONCE_CEILING (UINT64_MAX - 1)
 
 typedef struct {
@@ -96,7 +96,7 @@ int ava1_conn_try_send(ava1_conn_t *c, uint8_t type, uint32_t channel, const uin
 int ava1_conn_send_frame(ava1_conn_t *c, uint8_t type, uint32_t channel, uint8_t *frame, size_t body_len);
 /* The header of one frame; *body_len is its body length (the MAC is not counted).
  * Reader thread only. AVA1_E_* on failure. */
-/* Lane socket buffers (review 003 section 1): ask for AVA1_LANE_SOCKBUF on SO_RCVBUF and
+/* Lane socket buffers: ask for AVA1_LANE_SOCKBUF on SO_RCVBUF and
  * SO_SNDBUF so a lane thread that is busy opening a frame for 10-20 ms does not close the
  * sender's TCP window. Call before the first read. The kernel may cap the request (it takes
  * what it gives); the effective sizes are returned (0 when unreadable). Returns 0, or -1 when

@@ -1,4 +1,4 @@
-//! Durable-by-log, the failure and settle paths (review dbl): a sweep that fails after JobDone, a stop in
+//! Durable-by-log, the failure and settle paths: a sweep that fails after JobDone, a stop in
 //! the final drain, a manifest change while files are unswept, a reaped or crashed job nobody holds, the
 //! cross-job cap, and the crash points inside a sweep.
 #![cfg(unix)]
@@ -395,7 +395,7 @@ fn gc_never_removes_a_job_directory_that_holds_a_log_until_a_long_ceiling() {
     );
     // a log that recovery could not settle in a week beyond the normal age is given up on, and says so, but
     // not on one boot's wall clock (a clock moved forward would age every log at once): it takes three
-    // boots that each saw it past the ceiling (final review: console)
+    // boots that each saw it past the ceiling
     for strike in 1..=2u64 {
         gc_boot(100 + strike);
         assert_eq!(
@@ -441,7 +441,7 @@ fn a_directory_recovery_cannot_open_is_kept_for_a_while_and_then_given_up() {
     gc_boot(0);
 }
 
-/// Final review (console), re-review: strikes count boots, not starts. Any number of re-sends within one boot,
+/// Strikes count boots, not starts. Any number of re-sends within one boot,
 /// or boots less than a day apart (a clock set wrong), add one strike at most.
 #[test]
 fn gc_strikes_do_not_accumulate_within_a_boot_or_within_a_day() {
@@ -495,7 +495,7 @@ fn a_future_stamped_directory_does_not_stop_the_gc_of_the_others() {
     assert!(!old.exists() && fut.exists());
 }
 
-/// Final review (console): `time(NULL)` is the wall clock, and the console's clock is set by the user and
+/// `time(NULL)` is the wall clock, and the console's clock is set by the user and
 /// by the app. A clock that is wrong must not delete resumable job directories.
 #[test]
 fn gc_does_nothing_when_the_clock_is_implausible_or_behind_a_jobs_own_stamp() {
@@ -812,7 +812,7 @@ fn after_crash_point_10_the_sweep_was_durable_and_its_files_are_whole() {
     drop(r);
 }
 
-// ---- review dbl round 2 ----------------------------------------------------------------------
+// ---- round 2 ----------------------------------------------------------------------
 
 fn bad_dir(t: &Path, byte: u8) {
     // a crashed job whose manifest is gone: its journal opens (so recovery tries it) but it cannot load
@@ -1030,7 +1030,7 @@ fn stopping_the_data_layer_during_a_slow_recovery_pass_returns_promptly() {
     drop(r);
 }
 
-/// Final review (console): the start-time pass runs on the recovery thread, so ava1_data_start returns
+/// The start-time pass runs on the recovery thread, so ava1_data_start returns
 /// at once; until the pass ends a JobOpen for a job that holds a log is answered BUSY, never served from
 /// state recovery has not yet restored.
 #[test]

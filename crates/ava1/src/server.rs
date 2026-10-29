@@ -32,7 +32,7 @@ pub const MAX_CONNS: usize = 64;
 /// (SPEC.md §8).
 pub const MAX_SESSIONS: usize = 16;
 /// Jobs one session may have open at once; a `JobOpen` or `Resume` past it is answered
-/// `ERR_BUSY` (review 006 #4). The console's job table is the same size.
+/// `ERR_BUSY`. The console's job table is the same size.
 pub const MAX_JOBS_PER_SESSION: usize = 32;
 /// Calls in flight per session; more are answered `ERR_BUSY`.
 pub const RPC_WORKERS: usize = 8;
@@ -1350,7 +1350,7 @@ async fn lane(
             }
             Pong::TYPE => {}
             gen::Bye::TYPE | gen::Error::TYPE => break,
-            t if is_data_type(t) => entry.router.route_lane(j.lane_id, f).await,
+            t if is_data_type(t) => entry.router.route_lane_gen(j.lane_id, lane_gen, f).await,
             _ if f.ignorable() => {}
             _ => {
                 refuse_on(&outbox, gen::ERR_PROTOCOL, "unexpected frame on a lane").await;

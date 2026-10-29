@@ -1,4 +1,4 @@
-//! The lane frame-buffer pool (review 003 section 3): size classes, reuse without
+//! The lane frame-buffer pool: size classes, reuse without
 //! zeroing, the idle cap, and no leak / double free.
 #![cfg(unix)]
 use ava1_ctest as _; // links the payload C

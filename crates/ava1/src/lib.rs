@@ -73,6 +73,9 @@
 //! | Wire format | [`gen`] (generated messages), [`wire`], [`frame`], [`conn`], [`crc32c`] |
 //! | Support | [`diag`] (where diagnostic lines go), [`fslock`], [`hex`], [`Ava1Error`] |
 //!
+//! The generated messages live in [`gen`], whose name is a reserved word in Rust 2024: a crate
+//! on edition 2024 writes `ava1::r#gen` (`use ava1::r#gen::{self, NodeInfo};`).
+//!
 //! The library writes a few diagnostic lines (a transfer's bottleneck summary, kernel buffer
 //! sizes) to standard error; [`diag::set_sink`] sends them elsewhere.
 //!

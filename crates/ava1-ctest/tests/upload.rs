@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Task 16: end-to-end uploads, Rust sender (Task 15) → C receiver (Task 13/14), under
+//! End-to-end uploads, Rust sender → C receiver, under
 //! faults — lane death, payload restart/resume, slow disk under a flood of tiny files,
 //! and a source that changes while the payload is down.
 mod common;

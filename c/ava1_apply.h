@@ -14,11 +14,11 @@
 #define AVA1_W_BUNDLE 2
 #define AVA1_W_CALL 3
 #define AVA1_W_SWEEP 5  /* durable-by-log: make logged small files durable in place (SPEC.md §15.7) */
-#define AVA1_W_COMMIT 4 /* commit_large of one file (review 003 §3.3), run by a worker */
+#define AVA1_W_COMMIT 4 /* commit_large of one file, run by a worker */
 #define AVA1_PEND_MAX 512u          /* small-file fds held open until their batch */
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
 #define AVA1_CRASH_AFTER_JOURNAL 2  /* tests: die after the journal, before Durable */
-#define AVA1_CRASH_AFTER_TAKE 3     /* tests: die after taking <root>, before the journal (Task 13) */
+#define AVA1_CRASH_AFTER_TAKE 3     /* tests: die after taking <root>, before the journal */
 #define AVA1_CRASH_COMMIT_RENAMED 4 /* tests: die after a commit's rename + dir sync, before its journal */
 #define AVA1_CRASH_BEFORE_COMMIT 5  /* tests: die as a fully durable file's commit starts */
 #define AVA1_CRASH_STAGED_RENAMED 6 /* tests: die after the staging rename + sync, before Done */
@@ -39,7 +39,7 @@ int ava1_apply_chunk(ava1_job_t *j, uint8_t *owned, size_t owned_len, uint32_t f
                      const uint8_t *data, size_t len);
 int ava1_apply_bundle(ava1_job_t *j, uint8_t *owned, size_t owned_len, const ava1_bundle_t *b);
 /* The same, for an `owned` buffer from ava1_frame_alloc: `owned_cap` is the capacity it
- * returned and the buffer goes back to the pool, not the allocator (review 003 section 3). */
+ * returned and the buffer goes back to the pool, not the allocator. */
 int ava1_apply_chunk_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap, uint32_t file_id,
                             uint64_t off, const uint8_t *data, size_t len);
 int ava1_apply_bundle_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, size_t owned_cap,

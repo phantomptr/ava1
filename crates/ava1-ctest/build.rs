@@ -1,7 +1,7 @@
 //! Compiles the AVA1 library's C (`c/`) on the host so `cargo test` can check it against Rust.
 use std::path::PathBuf;
 
-/// `AVA1_CTEST_SANITIZE=1` (review 009 #2a): every C unit this crate builds gets ASan + UBSan, so
+/// `AVA1_CTEST_SANITIZE=1`: every C unit this crate builds gets ASan + UBSan, so
 /// the whole host-runnable library C runs instrumented under `cargo test`.
 fn sanitize() -> bool {
     std::env::var("AVA1_CTEST_SANITIZE").as_deref() == Ok("1")
@@ -53,7 +53,7 @@ fn main() {
         .define("BLAKE3_NO_AVX512", None)
         .define("BLAKE3_USE_NEON", "0")
         .include(&b3)
-        // -O2 like the console build (review P5): cargo's debug profile would otherwise
+        // -O2 like the console build: cargo's debug profile would otherwise
         // compile it at -O0, and the differential tests hash a lot.
         .opt_level(2)
         .warnings(false)

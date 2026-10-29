@@ -1,4 +1,4 @@
-//! Lane socket buffers on the console side (review 003 section 1).
+//! Lane socket buffers on the console side.
 #![cfg(unix)]
 use ava1_ctest as _; // links the payload C
 use std::os::raw::c_int;

@@ -1,4 +1,4 @@
-//! perf-apply (review 003 §4, §8): the receiver's periodic stats line is opt-in like the sender's
+//! perf-apply: the receiver's periodic stats line is opt-in like the sender's
 //! stage timers (`AVA1_TIMING`, or the flag file on the console); the end-of-job
 //! summary is not.
 #![cfg(unix)]

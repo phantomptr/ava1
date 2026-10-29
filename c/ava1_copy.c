@@ -1,5 +1,5 @@
 /* Console-local copy and move (SPEC.md §13.5). A copy is a receiver job that talks to
- * Task 18's reader instead of a socket: ava1_recv_open prepares it exactly like an upload,
+ * the in-process reader instead of a socket: ava1_recv_open prepares it exactly like an upload,
  * the reader feeds it Chunk/Bundle through ava1_apply_*, and the map it gets back is the
  * resume state. A move deletes the source after a verified Done. */
 #include "ava1_copy.h"
@@ -16,7 +16,7 @@
 #include "ava1_data.h"
 #include "ava1_platform.h"
 #include "ava1_recv.h"
-#include "ava1_send.h"   /* Task 18: ava1_reader_t, ava1_read_files */
+#include "ava1_send.h"   /* ava1_reader_t, ava1_read_files */
 #include "ava1_thread.h"
 
 typedef struct {
@@ -184,8 +184,8 @@ void ava1_copy_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *b
         ava1_job_done_t d;
         if (ava1_job_done_decode(body, len, &d) == 0) {
             /* The reaper reads parked_at_ms under the table lock, which the job thread does
-             * not hold when JobDone is emitted: a release store makes the stamp visible
-             * (ruling 6). Every finished copy gets the full park age from here; the delete
+             * not hold when JobDone is emitted: a release store makes the stamp visible.
+             * Every finished copy gets the full park age from here; the delete
              * below may run on this call, so the stamp goes first. */
             int left = 0;
             __atomic_store_n(&j->parked_at_ms, ava1_mono_ms(), __ATOMIC_RELEASE);
@@ -359,8 +359,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
         snprintf(msg, cap, "single-file flag on a folder");
         return NULL;
     }
-    /* CORRECTED (ruling 3): the destination must be writable, and a move must be able to
-     * delete the source. */
+    /* The destination must be writable, and a move must be able to delete the source. */
     if (!cfg->may_write || !cfg->may_write(dest) || ((in->flags & AVA1_JF_MOVE) && !cfg->may_write(src))) {
         snprintf(msg, cap, "cannot write %s", dest);
         return NULL;

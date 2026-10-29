@@ -3,6 +3,30 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.2
+
+The known limits of 1.0.1, fixed. Nothing changes on the wire or on disk, and the public API only
+grows.
+
+Fixes, Rust:
+
+- A job directory is also locked across processes (an advisory lock on `<job dir>/run.lock`),
+  so two programs sharing one jobs directory never run the same job at once; 1.0.1 locked it
+  within one process only.
+- A frame that overran its credit is answered on the lane it came on: a lane joined since on
+  the same id is no longer told `ERR_CREDIT` or closed for it.
+- `Progress::phase`, `skip_done_bytes` and `skip_total_bytes` now report a sequential source's
+  resume skip (a 7z folder or solid RAR decoded and discarded up to what the receiver lacks):
+  `phase` is the new `PHASE_SKIP` from the start of the pass until every discarded byte is
+  counted, then `PHASE_SEND`. The total is the held groups of partly durable files plus what
+  the new defaulted `SeqSource::bytes_to_skip` returns; a source that keeps the default
+  (`None`) leaves its own discards out of both counters.
+
+Documentation:
+
+- Comments and docs no longer cite private planning documents; the crate's front page notes
+  that a crate on Rust 2024 writes `ava1::r#gen`.
+
 ## 1.0.1
 
 Fixes, speed-ups, documentation and release work. Nothing changes on the wire or in the journal

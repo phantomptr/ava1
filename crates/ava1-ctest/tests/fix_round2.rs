@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Task 14 fix round 2: a cap refusal landing while a JobOpen's slow work runs refuses the
+//! A cap refusal landing while a JobOpen's slow work runs refuses the
 //! open all the same (the flag is re-checked after the work), and a full retiring table
 //! refuses creates instead of silently losing the reopen guard. Every network test runs
 //! under one outer timeout, so a hang fails in seconds.

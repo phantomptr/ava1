@@ -132,7 +132,7 @@ async fn a_calibrate_on_a_missing_dir_carries_its_cause_to_the_session() {
     }
 }
 
-/// Final review (console): a peer whose first group covers thousands of large files used to
+/// A peer whose first group covers thousands of large files used to
 /// leave two descriptors open per file until its commit, so about 600 of them used the
 /// helper's whole table and every accept() and open() failed. Large-file descriptors are
 /// capped against the budget now (a quarter of it, half of that per job): idle files are

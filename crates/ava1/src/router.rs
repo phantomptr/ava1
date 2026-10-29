@@ -173,7 +173,8 @@ pub trait JobHost: Send + Sync {
 /// holds whole 16 MiB frames; lifecycle events ride their own channel, which can never
 /// be full behind data because a lane change or a session end produces at most one.
 struct JobInbox {
-    data: mpsc::Sender<Inbound>,
+    /// Data and control frames, each with the generation of the lane it came on (0 for control).
+    data: mpsc::Sender<(Inbound, u64)>,
     events: mpsc::UnboundedSender<Inbound>,
     /// This registration's identity, shared with its `Inbox` so a link can prove, when it
     /// lets go, that it is still the current one. Deliberately not a sender clone: an
@@ -184,7 +185,9 @@ struct JobInbox {
 
 /// What a job task reads: `Recv`'s items, events first.
 pub struct Inbox {
-    data: mpsc::Receiver<Inbound>,
+    data: mpsc::Receiver<(Inbound, u64)>,
+    /// The generation of the lane the last `Inbound::Lane` came on (see `lane_gen`).
+    lane_gen: u64,
     events: mpsc::UnboundedReceiver<Inbound>,
     id: Arc<()>,
     events_done: bool,
@@ -200,7 +203,7 @@ impl Inbox {
         }
         loop {
             if self.events_done {
-                return self.data.recv().await;
+                return self.data.recv().await.map(|d| self.took(d));
             }
             tokio::select! {
                 biased;
@@ -208,9 +211,21 @@ impl Inbox {
                     Some(i) => return Some(i),
                     None => self.events_done = true,
                 },
-                d = self.data.recv() => return d,
+                d = self.data.recv() => return d.map(|d| self.took(d)),
             }
         }
+    }
+
+    fn took(&mut self, (ev, gen): (Inbound, u64)) -> Inbound {
+        self.lane_gen = gen;
+        ev
+    }
+
+    /// The generation of the lane the frame of the last `Inbound::Lane` that `recv` returned
+    /// came on: a lane id can be re-joined, and [`Router::lane_of`] tells whether that lane is
+    /// still the one up on its id.
+    pub(crate) fn lane_gen(&self) -> u64 {
+        self.lane_gen
     }
 }
 
@@ -260,6 +275,7 @@ impl Router {
         }
         Inbox {
             data: rx,
+            lane_gen: 0,
             events: erx,
             id,
             events_done: false,
@@ -293,10 +309,10 @@ impl Router {
         let Some(tx) = self.jobs.lock().unwrap().get(&job).map(|i| i.data.clone()) else {
             return Some(f);
         };
-        match tx.send(Inbound::Control(f)).await {
+        match tx.send((Inbound::Control(f), 0)).await {
             Ok(()) => None,
             // The job let go between the lookup and the send: the caller decides again.
-            Err(e) => match e.0 {
+            Err(e) => match e.0 .0 {
                 Inbound::Control(f) => Some(f),
                 _ => None,
             },
@@ -305,11 +321,18 @@ impl Router {
 
     /// Lane frames for unknown jobs are dropped: credit only exists inside a job. Like
     /// `route_control`, this waits for the job to make room.
+    /// The frame is taken to come from the lane up on `lane` now.
     pub async fn route_lane(&self, lane: u16, f: Frame) {
+        let gen = self.lanes.lock().unwrap().get(&lane).map_or(0, |t| t.gen);
+        self.route_lane_gen(lane, gen, f).await;
+    }
+
+    /// `route_lane` for the task that runs the lane of generation `gen` (from `lane_up`).
+    pub(crate) async fn route_lane_gen(&self, lane: u16, gen: u64, f: Frame) {
         if let Some(job) = job_of(&f) {
             let tx = self.jobs.lock().unwrap().get(&job).map(|i| i.data.clone());
             if let Some(tx) = tx {
-                let _ = tx.send(Inbound::Lane { lane, frame: f }).await;
+                let _ = tx.send((Inbound::Lane { lane, frame: f }, gen)).await;
             }
         }
     }
@@ -366,6 +389,16 @@ impl Router {
     /// The lane `id`, if it is up.
     pub fn lane(&self, id: u16) -> Option<LaneTx> {
         self.lanes.lock().unwrap().get(&id).cloned()
+    }
+
+    /// The lane `id` if it is still the one of generation `gen`.
+    pub(crate) fn lane_of(&self, id: u16, gen: u64) -> Option<LaneTx> {
+        self.lanes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|t| t.gen == gen)
+            .cloned()
     }
 
     /// Whether `l` is still the lane up on its id (not gone, and not a later lane on the id).
@@ -510,6 +543,35 @@ mod tests {
             .expect("the lane's task was not told to close");
         router.lane_down(3, gen);
         assert!(router.lane_closer(3, gen).is_none(), "a lane that is down");
+    }
+
+    #[tokio::test]
+    async fn a_frame_queued_from_a_lane_that_was_rejoined_names_the_old_lane() {
+        // A frame read on lane 3 waits in the inbox while lane 3 dies and is joined again:
+        // whatever the job does about that frame (ERR_CREDIT, the close) is for the old lane.
+        let router = Router::default();
+        let mut inbox = router.register([7; 16]);
+        let old = router.lane_up(3, outbox());
+        router.route_lane_gen(3, old, frame_for([7; 16])).await;
+        router.lane_down(3, old);
+        let new = router.lane_up(3, outbox());
+        loop {
+            match inbox.recv().await {
+                Some(Inbound::Lane { lane: 3, .. }) => break,
+                Some(_) => continue,
+                None => panic!("the frame never arrived"),
+            }
+        }
+        assert_eq!(inbox.lane_gen(), old);
+        assert!(
+            router.lane_of(3, inbox.lane_gen()).is_none(),
+            "not the new lane"
+        );
+        assert!(router.lane_of(3, new).is_some());
+        // A caller that does not know the generation gets the lane up now.
+        router.route_lane(3, frame_for([7; 16])).await;
+        assert!(matches!(inbox.recv().await, Some(Inbound::Lane { .. })));
+        assert_eq!(inbox.lane_gen(), new);
     }
 
     #[tokio::test]

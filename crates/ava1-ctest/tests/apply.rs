@@ -188,7 +188,7 @@ fn c_commit_refuses_cross_device_rename() {
 
 #[test]
 fn c_commit_refuses_an_unknown_device_and_never_renames() {
-    // review 007 #4 (HW-1): "could not tell" must fail closed like "another drive".
+    // "could not tell" must fail closed like "another drive".
     let t = tmp("xdev-unknown");
     let root = t.join("dest");
     std::fs::create_dir_all(&root).unwrap();
@@ -207,7 +207,7 @@ fn c_commit_refuses_an_unknown_device_and_never_renames() {
 
 #[test]
 fn c_commit_with_no_device_hook_refuses_and_never_renames() {
-    // final review fs #1: a missing same_device hook is not "no guard needed".
+    // a missing same_device hook is not "no guard needed".
     let t = tmp("xdev-nohook");
     let root = t.join("dest");
     std::fs::create_dir_all(&root).unwrap();
@@ -277,7 +277,7 @@ fn a_single_file_lands_through_its_part_file() {
     assert!(!t.join("one.pkg.ava-part").exists());
 }
 
-// ---- fix round 1 ------------------------------------------------------------------
+// ---- regressions ------------------------------------------------------------------
 
 /// AVA1_E_PROTO, what the apply entry points answer for a frame that breaks the rules.
 const E_PROTO: i32 = -11;
@@ -727,7 +727,7 @@ extern "C" {
     fn ava1_pend_in_use() -> u32;
 }
 
-/// Final review (console): a sync batch that ran out of memory before its lists existed went
+/// A sync batch that ran out of memory before its lists existed went
 /// `goto out` with the descriptor count still 0, so ava1_pend_release(0) left every reservation of the
 /// pending small files taken for good, and the pending-fd budget shrank with each failed batch.
 #[test]

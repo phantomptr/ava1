@@ -752,7 +752,7 @@ impl CServer {
         }
     }
 
-    /// The C server with the real data layer (Task 14): uploads land under any absolute
+    /// The C server with the real data layer: uploads land under any absolute
     /// path. `fsync_delay_us` slows every data fsync (a slow disk).
     pub fn start_data(
         secret: [u8; 32],
@@ -1267,7 +1267,7 @@ thread_local! {
     static LOG_FLAG: std::cell::RefCell<Option<CString>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Points the console's runtime durable-by-log off-switch (review 007 #5) at `path` for jobs this
+/// Points the console's runtime durable-by-log off-switch at `path` for jobs this
 /// thread begins or opens; the file's existence is what turns the logging off. None: the real path.
 pub fn c_set_log_small_flag(path: Option<&Path>) {
     LOG_FLAG.with(|f| *f.borrow_mut() = path.map(|p| CString::new(p.to_str().unwrap()).unwrap()));
@@ -1997,7 +1997,7 @@ pub fn c_recv_open_status(jobs: &Path, root: &Path, a: OpenArgs) -> i32 {
     rc
 }
 
-/// The AVA1 event log (c/ava1_events.c, P3 Task 9).
+/// The AVA1 event log (c/ava1_events.c).
 pub mod events {
     use super::ffi;
     use std::ffi::CString;

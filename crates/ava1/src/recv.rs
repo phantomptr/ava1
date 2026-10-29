@@ -3,7 +3,7 @@
 //! The Rust mirror of the payload's C receiver (ava1_recv.c, ava1_apply.c), simplified
 //! by a normal OS underneath: blocking writes on `spawn_blocking`, one sync batch every
 //! 250 ms run on a task of its own — the run loop keeps draining its inbox and answering
-//! the peer while the batch's fsyncs run (ruling 11) — the same journal (SPEC.md §14)
+//! the peer while the batch's fsyncs run — the same journal (SPEC.md §14)
 //! and outboards, the same on-disk layout. (The formats are shared, the journals are not:
 //! each side resumes only the jobs it journaled itself; see `run_loop`.)
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -27,7 +27,7 @@ use crate::verify::{self, Outboard, GROUP};
 use crate::wire::FrameMessage;
 
 /// Where a received job's bytes land. One implementation today (`LocalSink`); a relay
-/// (Task 24) and the zip sink implement their own.
+/// and the zip sink implement their own.
 pub trait Sink: Send + Sync {
     /// Called once with the manifest, before any data (create directories, decide staging).
     fn prepare(&self, m: &Manifest) -> io::Result<()>;
@@ -86,7 +86,7 @@ pub trait Sink: Send + Sync {
     /// A complete file: part → final, same directory.
     fn commit(&self, id: u32) -> io::Result<()>;
     /// Every file of `ids` has been committed (renamed into place): makes the new names durable
-    /// (their directories fsynced) before the journal record that calls them done (review 009 #5).
+    /// (their directories fsynced) before the journal record that calls them done.
     /// A sink with no directories ignores it.
     fn sync_committed(&self, _ids: &[u32]) -> io::Result<()> {
         Ok(())
@@ -95,7 +95,7 @@ pub trait Sink: Send + Sync {
     fn finish(&self) -> io::Result<()>;
     /// What the journal's Open records (SPEC.md §14): (destination root, staged). `None`
     /// for a sink with nothing resumable on disk. LocalSink returns the C receiver's rule
-    /// (`staged = !single_file && !root.exists()`); see ruling Q1.
+    /// (`staged = !single_file && !root.exists()`).
     fn resume_key(&self) -> Option<(String, bool)> {
         None
     }
@@ -154,7 +154,7 @@ pub struct LocalSink {
     /// The staging decision, taken once at construction — the C receiver's rule
     /// (`staged = !single_file && !root.exists()`, ava1_recv.c:380-430). It is stable
     /// across a crash because the only transition is the atomic part→final rename, so
-    /// `root absent ⟺ part present` on every run (ruling 10). A resume settles it on the
+    /// `root absent ⟺ part present` on every run. A resume settles it on the
     /// journal's (`resume_staged`).
     staged: AtomicBool,
     st: Mutex<LocalState>,
@@ -316,8 +316,8 @@ impl LocalSink {
 
     /// The path for `id`, part or final. Every `.ava-part` path is derived from the final
     /// path's own parent, so the part→final renames are same-directory by construction and
-    /// can never cross a device (Global Constraint 60; ruling Q3: the placement is the
-    /// guard — the payload's C keeps the `st_dev` check, a host OS returns EXDEV).
+    /// can never cross a device (the placement is the guard: the C node also checks
+    /// `st_dev`, and a host OS returns EXDEV).
     fn path(&self, st: &LocalState, id: u32, part: bool) -> PathBuf {
         if self.single {
             return if part {
@@ -475,7 +475,7 @@ fn flush_drive_cache(_f: &std::fs::File) -> io::Result<()> {
 
 /// fsyncs each directory (so the new names are durable). They are independent descriptors, so
 /// a game-sized tree's tens of directories go four at a time instead of one after another
-/// (review 003 §3.3 item 1, the engine's side of the console's striped directory syncs).
+/// (the engine's side of the console's striped directory syncs).
 #[cfg(unix)] // a directory cannot be opened for sync on Windows
 fn sync_dirs(dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
     const WAYS: usize = 4;
@@ -740,7 +740,7 @@ impl Sink for LocalSink {
             sys_fsync(&f)?;
         }
         if part != fin {
-            std::fs::rename(&part, &fin)?; // same directory by construction (ruling Q3)
+            std::fs::rename(&part, &fin)?; // same directory by construction
         }
         Ok(())
     }
@@ -804,7 +804,7 @@ pub struct RecvOptions {
     /// as `JobOpen` ext `credit` for a download, or as a `Credit` frame for a `Resume`.
     pub credit: u64,
     /// The job's flags; recorded in the journal's Open so a job reopened with different
-    /// flags is refused/replaced exactly as the C receiver does (ruling Q4).
+    /// flags is refused/replaced exactly as the C receiver does.
     pub flags: u32,
     /// The jobs directory (SPEC.md §14.3); the job's own directory is
     /// [`journal::job_dir`] inside it.
@@ -818,7 +818,7 @@ pub struct RecvOptions {
     pub cancel: Arc<AtomicBool>,
     /// How long a job may go without any progress (a data frame, a root, a finished disk
     /// batch or write) while the sender still owes bytes before the receiver ends it with
-    /// `ERR_STALLED` (review 006 #2). `None` = `PROGRESS_DEADLINE` (3 x the default
+    /// `ERR_STALLED`. `None` = `PROGRESS_DEADLINE` (3 x the default
     /// `dead_after`), or `RESUME_PROGRESS_DEADLINE` for a resumed job. When set, it is also how
     /// long a `receive_job` waits between manifest pages (else `RECEIVER_SILENT_FATAL`).
     pub progress_deadline: Option<Duration>,
@@ -839,7 +839,7 @@ fn proto(e: impl std::fmt::Display) -> SendError {
     SendError::Protocol(e.to_string())
 }
 
-/// `PathError` → wire mapping (ruling 13, documented in `manifest.rs`): a gap is a
+/// `PathError` → wire mapping (documented in `manifest.rs`): a gap is a
 /// malformed manifest (`ERR_PROTOCOL`); every other variant is an invalid path
 /// (`ERR_PATH`). Used for manifest validation on the receiver path.
 fn wire_path(e: manifest::PathError) -> SendError {
@@ -867,7 +867,7 @@ async fn next(link: &mut JobLink) -> Result<Inbound, SendError> {
 
 /// Collects manifest pages until ManifestEnd; checks the end. The receiver learns the
 /// manifest from the peer every time — the on-disk `manifest` file is written for the C
-/// side's resume, never read back by Rust (ruling 20). The responder acks before its
+/// side's resume, never read back by Rust. The responder acks before its
 /// pages, the opener's ack confirms the open, so a JobOpenAck may come first either way.
 ///
 /// Each page is checked as it arrives (ids consecutive, at most `MAX_ENTRIES` in all,
@@ -875,9 +875,9 @@ async fn next(link: &mut JobLink) -> Result<Inbound, SendError> {
 /// the job as it does in the data phase, and a peer that sends no page (or ack) for `silent`
 /// is stalled: it is told `JobCancel(ERR_STALLED)` and the job ends, so it cannot hold the
 /// job (and its destination) for the whole life of a session it keeps alive with pings.
-/// Reads a job's manifest, giving up after `silent` without a page. With `after_ack`, the clock
-/// starts only at the `JobOpenAck`: a download's sender walks its source before it acks, for as
-/// long as that takes, and the link's own liveness covers a peer that is gone meanwhile.
+/// With `after_ack`, that clock starts only at the `JobOpenAck`: a download's sender walks its
+/// source before it acks, for as long as that takes, and the link's own liveness covers a peer
+/// that is gone meanwhile.
 async fn read_manifest(
     link: &mut JobLink,
     silent: Duration,
@@ -1007,7 +1007,7 @@ pub async fn download_job(
             t0.elapsed().as_secs_f64() * 1000.0
         ));
     }
-    o.flags = flags; // ruling 12: `run` reads only `o.flags`
+    o.flags = flags; // `run` reads only `o.flags`
     download_run(link, m, None, sink, o).await
 }
 
@@ -1020,7 +1020,7 @@ pub async fn receive_job(
     sink: Arc<dyn Sink>,
     mut o: RecvOptions,
 ) -> Result<RecvReport, SendError> {
-    o.flags = open.flags; // ruling 12 / Q4: the journal's Open records the job's flags
+    o.flags = open.flags; // The journal's Open records the job's flags
     link.control
         .send(&JobOpenAck {
             job_id: link.job_id,
@@ -1168,7 +1168,7 @@ fn held_cost(len: u64) -> u64 {
     len.saturating_add(64)
 }
 
-/// Validates the key of a data frame before it is buffered (final review: engine #4): the file
+/// Validates the key of a data frame before it is buffered: the file
 /// must be a file of the manifest, the range inside it, the key at or past the cursor and not
 /// already held, and the buffer within `REORDER_WINDOWS` of credit.
 #[allow(clippy::too_many_arguments)]
@@ -1211,7 +1211,7 @@ fn admit_ordered(
 
 /// A chunk (SPEC.md §12.2, the C receiver's ava1_apply_chunk): inside the file, group
 /// aligned, whole groups unless it ends the file. A wire-supplied id the manifest does
-/// not carry is a protocol error — never a panic (ruling 3).
+/// not carry is a protocol error — never a panic.
 async fn apply_chunk(
     sink: &Arc<dyn Sink>,
     m: &Arc<Manifest>,
@@ -1288,7 +1288,7 @@ fn relay_root(
 /// The loop runs in `run_loop`; this wrapper joins the sync batch on every exit path.
 /// A dropped handle detaches the task, and a detached batch keeps appending to the
 /// job's journal after the job is gone — two writers against the journal's
-/// single-writer directory if the peer reopens the same job id (ruling 19). Joining
+/// single-writer directory if the peer reopens the same job id. Joining
 /// cannot deadlock: the batch awaits only its own `spawn_blocking` I/O and the
 /// control outbox, whose sends fail as soon as the session's writer task ends
 /// (bounded by `dead_after`), never anything the run loop holds.
@@ -1299,16 +1299,22 @@ async fn run(
     sink: Arc<dyn Sink>,
     o: RecvOptions,
 ) -> Result<RecvReport, SendError> {
-    // One receiver per job directory at a time (ruling 19). A retry that arrives while the run
+    // One receiver per job directory at a time. A retry that arrives while the run
     // it replaces is still in its end sequence (a session that dropped as the job finished;
     // a host's job task outlives its session) waits for it here, then replays the journal it
     // leaves — never two writers on one journal, and never one staging rename racing another
     // run's view of the destination.
-    let dir_lock = Arc::new(
-        job_dir_lock(&journal::job_dir(&o.jobs_dir, &link.job_id))
-            .lock_owned()
-            .await,
-    );
+    let dir = journal::job_dir(&o.jobs_dir, &link.job_id);
+    let in_process = job_dir_lock(&dir).lock_owned().await;
+    // Then the advisory lock for other processes on the same jobs directory (a blocking wait,
+    // so on the blocking pool), taken only by whoever holds the in-process one.
+    let across = tokio::task::spawn_blocking(move || crate::fslock::lock(&dir.join("run")))
+        .await
+        .map_err(proto)??;
+    let dir_lock = Arc::new(DirHold {
+        _across: across,
+        _in_process: in_process,
+    });
     let mut batch_handle: Option<tokio::task::JoinHandle<Result<BatchDone, SendError>>> = None;
     let outcome = run_loop(link, m, need_hint, sink, o, &mut batch_handle, &dir_lock).await;
     if let Some(h) = batch_handle.take() {
@@ -1318,9 +1324,16 @@ async fn run(
 }
 
 /// Held by a run for its whole life, and by the work it hands off (the sync batch, the
-/// finish), so that even a run whose future is dropped keeps its job directory until its
-/// detached work has ended.
-type DirLock = Arc<tokio::sync::OwnedMutexGuard<()>>;
+/// finish, the bundle writes), so that even a run whose future is dropped keeps its job
+/// directory until its detached work has ended.
+type DirLock = Arc<DirHold>;
+
+/// The job directory's two locks: one for this process's runs, and an advisory file lock
+/// (`<job dir>/run.lock`) for runs in other processes that share the jobs directory.
+struct DirHold {
+    _across: crate::fslock::FileLock,
+    _in_process: tokio::sync::OwnedMutexGuard<()>,
+}
 
 /// The in-process lock of the job directory `dir`.
 fn job_dir_lock(dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
@@ -1444,7 +1457,7 @@ async fn run_loop(
         .map_err(proto)??;
     // The destination root and the staging decision go into the journal's Open, decided by
     // the C receiver's rule (ava1_recv.c:380-430 decides, :1026-1040 writes); the sink
-    // supplies both (ruling Q1). The Open's kind is always JOB_DOWNLOAD here (this node takes
+    // supplies both. The Open's kind is always JOB_DOWNLOAD here (this node takes
     // the bytes, whichever side opened the job), while the C node records the kind of the
     // JobOpen it received (JOB_UPLOAD), so neither side resumes a journal the other wrote.
     let (dest_root, staged) = sink.resume_key().unwrap_or((String::new(), false));
@@ -1489,7 +1502,7 @@ async fn run_loop(
                     (j, jo)
                 }
                 None => {
-                    drop(j); // one writer per directory (ruling 19): a different job
+                    drop(j); // one writer per directory: a different job
                     st = State::default(); // start over
                     if early_map {
                         send_need(link, job_id, &Need::default()).await?;
@@ -1549,8 +1562,8 @@ async fn run_loop(
     for (id, r) in st.ranges.clone() {
         let Some(e) = m.entry(id) else {
             // A journal id the manifest does not carry (corrupt state, or a hash
-            // collision): an error ends the job, never a panic on the job task (ruling
-            // 3 covers wire ids; this is the journal's).
+            // collision): an error ends the job, never a panic on the job task, as for an
+            // unknown id on the wire.
             return Err(SendError::Protocol(format!(
                 "the journal names file {id}, which this manifest has none of"
             )));
@@ -1628,8 +1641,8 @@ async fn run_loop(
                 .map_err(proto)??;
         }
     }
-    // What the job still needs: the relay's hint when given (Task 24), else the replayed
-    // state after the resume check (ruling 4: build it here; never change journal.rs).
+    // What the job still needs: the relay's hint when given, else the replayed
+    // state after the resume check (built here, not in journal.rs).
     let need = match need_hint.clone() {
         Some(n) => n,
         None => Need {
@@ -1657,8 +1670,8 @@ async fn run_loop(
     }
     tm.setup_done();
     // Progress: the totals, and the durable counters seeded from the replay so a resumed
-    // run reports what the journal already knows (preflight row 21; Task 18's resume test
-    // asserts bytes_durable on the resumed run).
+    // run reports what the journal already knows (the resume tests check bytes_durable on
+    // the resumed run).
     let pg = o.progress.clone();
     pg.bytes_total.store(m.bytes(), Ordering::Relaxed);
     pg.files_total.store(m.files() as u64, Ordering::Relaxed);
@@ -1718,7 +1731,7 @@ async fn run_loop(
     // the grant, minus every frame received, plus every Credit frame sent back — the
     // sender's in-flight mirror. A job receiving more than `granted` in total is fine
     // (every returned Credit re-opens the window); only more than `granted` at once is
-    // not (SPEC.md §12.4, ledger row 19).
+    // not (SPEC.md §12.4).
     let mut outstanding = granted;
     let mut last_batch = Instant::now();
     // The last moment the job moved: a data frame, a root, a finished write or batch.
@@ -1762,7 +1775,7 @@ async fn run_loop(
                 .await;
             return Err(SendError::Cancelled);
         }
-        // A job task never stops reading (ruling 11): the inbox is drained continuously and
+        // A job task never stops reading: the inbox is drained continuously and
         // disk work runs on spawn_blocking — including the sync batch, which runs on a task
         // of its own (`batch_handle`) while this loop keeps routing frames and answering the
         // peer; awaiting room on the control outbox is the backpressure, so a peer that
@@ -1817,17 +1830,19 @@ async fn run_loop(
             Some(Inbound::Lane { lane, frame }) => {
                 let len = frame.body.len() as u64;
                 tm.frame();
-                // SPEC.md §12.4 (ledger row 19): a frame that exceeds the credit this job
+                // SPEC.md §12.4: a frame that exceeds the credit this job
                 // still has outstanding is refused with ERR_CREDIT on that lane; nothing of
                 // it is buffered or acknowledged. `outstanding` = granted − received +
                 // returned, the sender's in-flight mirror (the C receiver's w_avail).
                 if len > outstanding {
-                    if let Some(l) = link.lane(lane) {
+                    // Only on the lane the frame came on: a frame of a lane that has since
+                    // gone (and perhaps been re-joined on its id) needs no answer.
+                    if let Some(l) = link.router().lane_of(lane, link.rx.lane_gen()) {
                         // The sealed Error on the offending lane, then the lane is closed
                         // (SPEC.md §12.4), as the C receiver does: a peer that ignored the
                         // Error could otherwise go on making this side take (and open) 16 MiB
                         // frames on it. The flush and the close run off the loop, which must
-                        // not stop reading (ruling 11) behind a peer that does not read.
+                        // not stop reading behind a peer that does not read.
                         let (opener, router) = (link.opener().cloned(), link.router());
                         tokio::spawn(async move {
                             let _ =
@@ -2253,7 +2268,7 @@ async fn run_loop(
 /// A job that makes no progress for this long while the sender owes bytes is stalled: the
 /// receiver ends it rather than wait on the byte-level watchdog forever, since a Ping is a
 /// byte and a sender that heartbeats with a wedged data pump (a source read stuck on a
-/// network share) keeps the link alive indefinitely (review 006 #2). 3 x the SPEC default
+/// network share) keeps the link alive indefinitely. 3 x the SPEC default
 /// `dead_after` (12 s): generous, so a slow-but-moving link or drive is never cut.
 pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(36);
 
@@ -2406,7 +2421,7 @@ impl StageTimes {
 
 /// The work of one sync batch, owned: the snapshot is taken in the run loop (fast, no
 /// I/O) so the batch's blocking I/O can run on its own task while the loop keeps draining
-/// the inbox and answering control traffic (ruling 11). `jnl` and `st` move with the job
+/// the inbox and answering control traffic. `jnl` and `st` move with the job
 /// and come back in `BatchDone`, so the loop's journal and applied state are never shared.
 struct BatchJob {
     job_id: [u8; 16],
@@ -2457,7 +2472,7 @@ struct BatchDone {
 
 /// Takes the snapshot of the pending work: the pending small files, the large files'
 /// written ranges and roots, their outboards, the journal and the applied state. No I/O
-/// (ruling 11: the loop must not block), so the loop keeps routing frames while
+/// (the loop must not block), so the loop keeps routing frames while
 /// `batch_task` runs.
 #[allow(clippy::too_many_arguments)]
 fn snapshot_batch(
@@ -2533,7 +2548,7 @@ fn snapshot_batch(
 /// fsyncs run (a receiver that goes silent for seconds loses the session: the peer's
 /// heartbeats go unanswered, and a sender's credit stalls too). Every appended record is
 /// applied to `st` and, once the journal passes COMPACT_AT, it is compacted from exactly
-/// the Open record that created it and the applied state (ruling 5).
+/// the Open record that created it and the applied state.
 async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
     let BatchJob {
         job_id,
@@ -2777,7 +2792,7 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         let force = sink.log_pressure();
         (jnl, st) = sweep_logged(&sink, jnl, st, force).await?;
     }
-    // The journal is compacted once it passes COMPACT_AT (ruling 5): the engine-side
+    // The journal is compacted once it passes COMPACT_AT: the engine-side
     // journal must not grow without bound, and the C side does the same.
     if jnl.len() > journal::COMPACT_AT {
         let (j, st2, r) = tokio::task::spawn_blocking(move || {
@@ -3549,8 +3564,8 @@ mod tests {
     }
 
     /// The receiver compacts its journal once it passes COMPACT_AT: the batch is the
-    /// caller (ruling 5, preflight row 12), and the rewritten file (Open ‖ Snapshot)
-    /// replays to exactly the applied state — the same property Task 9 pins for the
+    /// caller, and the rewritten file (Open ‖ Snapshot)
+    /// replays to exactly the applied state — the same property the journal tests pin for the
     /// journal itself.
     #[tokio::test]
     async fn batch_compacts_the_journal_once_it_passes_compact_at() {
@@ -3726,7 +3741,7 @@ mod tests {
         assert_eq!(*sink.0.lock().unwrap(), vec![1, 3]); // the bad one was never written
     }
 
-    // ---- commit off the sink lock, bounded parallel (review 009 #5) ----
+    // ---- commit off the sink lock, bounded parallel ----
 
     fn large_manifest(n: u32, size: u64) -> Manifest {
         Manifest {

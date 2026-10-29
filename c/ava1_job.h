@@ -1,6 +1,4 @@
-/* AVA1 jobs: the in-memory table every data-plane task drives (SPEC.md §13).
- * Task 11 wrote the struct; later tasks add their own fields (T13: replay_done,
- * replay_status, dest_held, ava1_lfile_t.dir_synced; T14 adds more). */
+/* AVA1 jobs: the in-memory table every data-plane task drives (SPEC.md §13). */
 #ifndef AVA1_JOB_H
 #define AVA1_JOB_H
 
@@ -28,7 +26,7 @@ typedef struct ava1_job ava1_job_t;
  * what they send (Received, a refusal, Error) they post (ava1_server_post). */
 typedef void (*ava1_emit_fn)(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
-/* A frame waiting for a job (Task 14): a lane frame held until the job's map is out, or a
+/* A frame waiting for a job: a lane frame held until the job's map is out, or a
  * control frame for the job's feeder thread. `body` is owned: malloc'd, or a pool buffer when `cap` != 0. */
 typedef struct ava1_inframe {
     struct ava1_inframe *next;
@@ -37,7 +35,7 @@ typedef struct ava1_inframe {
     uint32_t seq;
     size_t len;
     uint8_t *body;
-    size_t cap; /* 0: malloc'd; else the pool capacity ava1_frame_free takes (review 003 section 3) */
+    size_t cap; /* 0: malloc'd; else the pool capacity ava1_frame_free takes */
 } ava1_inframe_t;
 
 typedef struct {        /* one large file being assembled */
@@ -47,10 +45,10 @@ typedef struct {        /* one large file being assembled */
     int has_root, root_journaled;
     uint8_t root[32];
     int committed;
-    int dir_synced;        /* its part file's directory entry is durable (Task 13) */
+    int dir_synced;        /* its part file's directory entry is durable */
     int in_list;           /* its id is in the job's lfl list (the batch scans' index) */
     int opening;           /* a worker is opening/preallocating it with j->mu released */
-    int committing;        /* its commit is queued or running on a worker (review 003 §3.3) */
+    int committing;        /* its commit is queued or running on a worker */
     int writers;           /* write_chunk calls that took their own dups and have not yet recorded the range */
     uint8_t held;          /* descriptors counted against the large-file budget (0, 1 or 2) */
 } ava1_lfile_t;
@@ -94,7 +92,7 @@ struct ava1_job {
      * m and enqueues work against it); feed_hold: the job thread is about to replace m (a new manifest
      * in the same session), so the feeder hands nothing more to the engine until it is done. */
     int feeding, feed_hold;
-    int discard_parts;              /* a cancelled local copy: destroy removes the .ava-part files this job itself was writing (final review #9) */
+    int discard_parts;              /* a cancelled local copy: destroy removes the .ava-part files this job itself was writing */
     uint64_t parked_at_ms;
     uint64_t concluded_ms;          /* an upload or download: when its end went out (our JobDone) or came in (the peer's),
                                      * nothing of it in flight after; 0 before. The table lets it go from then (#475) */
@@ -105,7 +103,7 @@ struct ava1_job {
     uint8_t kind, policy;
     uint32_t flags;
     int staged;
-    int dest_held;                  /* staged and <root> is our empty lock folder (Task 13) */
+    int dest_held;                  /* staged and <root> is our empty lock folder */
     char root[AVA1_MAX_PATH + 1];   /* the job root as requested */
     char base[AVA1_MAX_PATH + 16];  /* where entries land: root, or root.ava-part */
     char dir[512];                  /* job directory (journal, manifest, outboards) */
@@ -114,15 +112,15 @@ struct ava1_job {
     uint32_t copy_flags;              /* original job.copy flags; same-id opens must agree */
     int copy_delete_done;             /* status stays running until source deletion finishes */
     ava1_mstore_t m;                /* the manifest; file ids index everything below */
-    ava1_mstore_t m_in;             /* pages of a JobOpen still arriving (Task 13) */
+    ava1_mstore_t m_in;             /* pages of a JobOpen still arriving */
     int have_manifest;
-    int replay_done;                /* the journal ended with JnlDone (Task 13) */
+    int replay_done;                /* the journal ended with JnlDone */
     uint16_t replay_status;         /* ... and this status */
     uint8_t manifest_hash[32];
     ava1_jnl_t jnl;
     ava1_bits_t done;               /* committed (small: synced; large: renamed) */
     ava1_lfile_t **lf;              /* per file_id; NULL for small files and directories */
-    /* Large files with open descriptors (final review: console), under j->mu. At most
+    /* Large files with open descriptors, under j->mu. At most
      * ava1_lf_job_share() descriptors; an idle one is closed (and reopened on demand) to make room. */
     uint32_t *lfo, lfo_n, lfo_cap;
     uint32_t lf_fds;                /* descriptors held by this job's large files */
@@ -158,14 +156,14 @@ struct ava1_job {
         st_compact_us, st_compacts, st_log_ms;
     /* Preallocation, all workers (atomics): microseconds, bytes and files; one "slow" line per job. */
     uint64_t pre_us, pre_bytes;
-    /* Commits run on the workers (review 003 §3.3): `commits_inflight` (under mu) counts the
+    /* Commits run on the workers: `commits_inflight` (under mu) counts the
      * queued and running ones; a journal compaction waits until there are none. `jnl_mu`
      * serialises every journal append (the file offset and fsync order are one critical
      * section) and compaction; lock order: jnl_mu then mu. A commit's failure is recorded like
      * any worker's, `fail_journal` saying whether its Done must be journaled. */
     pthread_mutex_t jnl_mu;
     uint32_t commits_inflight;
-    /* A drive whose batch fsync outlasts the credit window (review 003 §6): once set (atomic,
+    /* A drive whose batch fsync outlasts the credit window: once set (atomic,
      * never cleared) workers fsync each chunk right after writing it. The rate is measured
      * between batches: bytes_received at the end of the last one and when it ended. */
     int perchunk;
@@ -177,7 +175,7 @@ struct ava1_job {
      * thread's scan/data/dirs/journal microseconds; commit is the sum over workers (atomic). */
     uint64_t start_us, tot_scan_us, tot_data_us, tot_dirs_us, tot_jnl_us, tot_commit_us, tot_batches, tot_files;
     int timing;                     /* the periodic stats line is on (opt-in, read once per job) */
-    ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check, Task 13) */
+    ava1_file_range_t *last_ranges; /* the last journal batch's ranges (resume check) */
     uint32_t last_ranges_n;
     uint64_t credit, outstanding;   /* granted; lane-frame bytes held */
     uint64_t credit_back;           /* freed, not yet returned to the sender */
@@ -192,26 +190,26 @@ struct ava1_job {
     uint8_t (*pend_root)[32];       /* their BLAKE3 roots (re-read after a retried fsync) */
     uint32_t pend_n, pend_cap;
     uint32_t pend_n_fd;             /* of those, the ones holding an open descriptor (and a budget slot) */
-    uint32_t batch_max;             /* small files per sync batch (tuned, Task 12) */
+    uint32_t batch_max;             /* small files per sync batch (tuned) */
     uint64_t last_batch_ms, unsynced_bytes;
     uint32_t roots_new;             /* FileRoots not yet journaled */
-    uint8_t lanes;                  /* live lanes of the attached session (Task 14) */
-    /* The progress watchdog (review 006 #2), all on the job thread but `frames_in` (under cmu): a
+    uint8_t lanes;                  /* live lanes of the attached session */
+    /* The progress watchdog, all on the job thread but `frames_in` (under cmu): a
      * signature of everything that counts as the job moving, and when it last changed. */
     uint64_t frames_in;             /* lane frames admitted and control frames queued (cmu) */
     uint64_t prog_sig, prog_at_ms;
     uint32_t prog_limit_ms;
     int prog_armed;
-    int log_small;                  /* durable-by-log or per-file, decided once when the job is created (review 007 #5) */
+    int log_small;                  /* durable-by-log or per-file, decided once when the job is created */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */
     uint32_t calls_left;            /* outstanding AVA1_W_CALL items (ava1_apply_parallel) */
-    int ev_end, ev_resume;          /* control events for the job thread (Task 13) */
+    int ev_end, ev_resume;          /* control events for the job thread */
     uint32_t end_files;
     uint64_t end_bytes;
     uint8_t end_hash[32];
-    void (*on_events)(ava1_job_t *j);  /* set by the receiver (Task 13) */
+    void (*on_events)(ava1_job_t *j);  /* set by the receiver */
     void (*on_tick)(ava1_job_t *j);    /* set by the sender roles (Tasks 18-19) */
     void *role;                     /* the sender state of JOB_DOWNLOAD / JOB_COPY */
     void (*role_free)(ava1_job_t *j);
@@ -228,7 +226,7 @@ struct ava1_job {
     uint16_t final_status;
     int durable_ok;                  /* the final rename, parent sync and Done append succeeded */
     char message[128];
-    /* ---- the wire (Task 14, ava1_data.c) ----
+    /* ---- the wire (ava1_data.c) ----
      * `cmu` is a leaf lock: held for a few field updates only, never across I/O and never
      * while taking another lock. The two orders are T.mu -> cmu (attach, park, reap reads)
      * and j->mu -> cmu (a job thread checking the wire state); never the reverse. Reader
@@ -253,7 +251,7 @@ struct ava1_job {
     int feed_stop;
     pthread_t feeder;                 /* applies held frames and control frames (receiver jobs) */
     int feeder_started;
-    /* Sender roles (Task 18): control frames from the receiving peer, and lane changes.
+    /* Sender roles: control frames from the receiving peer, and lane changes.
      * Both run on a reader thread (or under the table lock): they must not block. */
     int (*on_frame)(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len);
     void (*on_lane_change)(ava1_job_t *j, uint16_t lane, int up);
@@ -299,7 +297,7 @@ int ava1_job_retire_parked(ava1_job_t *j);
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 /* Control-frame bytes queued across all jobs (their inboxes and the frames behind a
- * JobOpen still opening), one global counter (Task 14 fix round 1): a flood past it is
+ * JobOpen still opening), one global counter: a flood past it is
  * refused with ERR_BUSY instead of exhausting memory. ava1_ctl_take charges `len` and
  * returns 0, or returns -1 when it would pass ava1_data_cfg_t.ctl_cap (0 = AVA1_CTL_CAP)
  * and charges nothing. ava1_ctl_give returns the bytes when a frame leaves a queue. */

@@ -513,7 +513,7 @@ impl Lane {
     }
 }
 
-/// What a lane asks the kernel for on each socket buffer (review 003 §1): a thread that
+/// What a lane asks the kernel for on each socket buffer: a thread that
 /// is not in `recv` for 10-20 ms (the console opens a frame) must not close the sender's
 /// TCP window, and on Wi-Fi the per-lane window is today's ceiling.
 pub(crate) const LANE_SOCKBUF: u32 = 4 << 20;
@@ -631,7 +631,7 @@ impl Joiner {
         tokio::spawn(async move {
             while let Some(f) = rx.recv().await {
                 if is_data_type(f.ty) {
-                    router.route_lane(id, f).await;
+                    router.route_lane_gen(id, gen_no, f).await;
                 }
             }
             router.lane_down(id, gen_no);

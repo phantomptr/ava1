@@ -1,7 +1,6 @@
 //! The Rust receiver end to end: a Rust sender against a Rust folder host, ordered
 //! downloads, credit, resume from the engine's journal, and the host's path guard.
-//! `OrderCheckSink` lives here, not in tests/common (the controller's file split for
-//! this round: Task 16 owns the ava1-ctest tests/common).
+//! `OrderCheckSink` lives here, not in tests/common.
 mod common;
 
 use std::sync::Arc;
@@ -330,7 +329,7 @@ async fn a_host_refuses_paths_outside_its_share() {
 }
 
 /// The §11.2 guard on the download direction: a peer-chosen root is refused before it
-/// can reach `LocalSource` (ruling 14).
+/// can reach `LocalSource`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_of_a_path_outside_the_share_is_refused_too() {
     let d = common::temp_dir("rr-descape");
@@ -455,7 +454,7 @@ async fn an_over_credit_chunk_closes_only_its_lane() {
     .expect("Received on the healthy lane within 20 s");
 }
 
-/// SPEC.md §12.4, the grant direction (ledger row 19): the sender's window is the grant
+/// SPEC.md §12.4, the grant direction: the sender's window is the grant
 /// plus every Credit frame sent back, so the receiver must admit frames up to that
 /// running total — never only up to the grant minus the credit already returned. With
 /// the wrong (subtractive) check the first frame after the receiver has returned credit
@@ -729,7 +728,7 @@ async fn a_reopened_job_resumes_from_the_engine_journal_and_credits_are_deltas()
     }
 
     // The journal on disk is the C receiver's layout: the Open records the sink's resume
-    // key — the destination root and the construction-time staged decision (ruling Q1).
+    // key — the destination root and the construction-time staged decision.
     let dir = journal::job_dir(&d.join("hjobs"), &job);
     let (_, recs) = journal::Journal::open(&dir).unwrap();
     let open_rec: gen::JnlOpen = match &recs[0] {
@@ -1011,7 +1010,7 @@ async fn a_sequential_source_uploads_into_a_folder_host() {
     }
 }
 
-// ---- review 006 #2: the receiver's progress watchdog ---------------------------------
+// ---- the receiver's progress watchdog ---------------------------------
 
 /// A sink that makes every sync batch slow (a slow drive), over a real folder sink.
 struct SlowSyncSink {
@@ -1476,7 +1475,7 @@ async fn a_done_only_resume_outlives_the_fresh_deadline() {
     assert_eq!(files, 3);
 }
 
-/// Final review engine #3: zero-byte files in an ordered download verify as the empty file
+/// Zero-byte files in an ordered download verify as the empty file
 /// without a read-back, so no sink loops on `FileRetry`.
 async fn ordered_with_empty_files(tag: &str, job: u8, preexisting_root: bool) {
     let d = common::temp_dir(tag);
