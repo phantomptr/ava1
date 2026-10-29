@@ -141,7 +141,7 @@ static void *op_main(void *arg) {
     ava1_job_t *j = arg;
     op_t *o = op_of(j);
     /* (int): the error code is an unsigned constant and fn returns int; gcc 13 -Werror=sign-compare
-     * rejects the mixed-sign ?: (review 007: the ctest build on a gcc 13 host). */
+     * rejects the mixed-sign ?: (the ctest build on a gcc 13 host). */
     int rc = ava1_op_cancelled(&o->ctx) ? (int)AVA1_ERR_CANCELLED : o->fn(o->fn_arg, &o->ctx, o->args, o->args_len);
     pthread_mutex_lock(&j->mu);
     j->final_status = (uint16_t)rc;

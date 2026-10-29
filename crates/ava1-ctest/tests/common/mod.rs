@@ -55,7 +55,7 @@ pub fn paired_client(peers_file: &Path) -> (Arc<Identity>, Arc<Mutex<PeerStore>>
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Uploads `src` (a directory, or one file) to `root` on the receiver at `addr`,
-/// reconnecting after every lost session — the loop Task 22's engine adapter runs.
+/// reconnecting after every lost session — the loop the engine adapter runs.
 /// `setup` adjusts the options of each attempt; `job` is the job id for every attempt
 /// (a resume must use the same id or it starts a different job).
 pub async fn upload(

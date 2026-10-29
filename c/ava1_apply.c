@@ -746,8 +746,8 @@ int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t
 
 /* ---- applying ---------------------------------------------------------------------- */
 
-/* Opens a large file's part file and outboard, preallocating a new part file (review 003
- * §2.1: this used to run under j->mu, so a minutes-long preallocation on a slow drive stalled
+/* Opens a large file's part file and outboard, preallocating a new part file (this
+ * used to run under j->mu, so a minutes-long preallocation on a slow drive stalled
  * every other worker and the feeder). It touches no job lock; the caller publishes the
  * descriptors under j->mu. create == 0 (the commit's reopen): a missing part file or outboard
  * is ENOENT, never a new empty file — an empty part would hash to nothing and be renamed over
@@ -776,7 +776,7 @@ static int lfile_open_fds(ava1_job_t *j, uint32_t id, int create, int *fdp, int 
         __atomic_add_fetch(&j->pre_us, dt, __ATOMIC_RELAXED);
         __atomic_add_fetch(&j->pre_bytes, e->size, __ATOMIC_RELAXED);
         __atomic_add_fetch(&j->pre_files, 1, __ATOMIC_RELAXED);
-        /* more than a second per GiB: say so once per job, so CUTOVER can record it per drive */
+        /* more than a second per GiB: say so once per job, so it can be recorded per drive */
         if (dt * (1ull << 30) > 1000000ull * e->size && !__atomic_exchange_n(&j->pre_slow_logged, 1, __ATOMIC_RELAXED))
             fprintf(stderr, "[ava1] job %02x%02x%02x%02x: preallocation on this drive is slow (%llu ms for %llu MiB)\n",
                     j->id[0], j->id[1], j->id[2], j->id[3], (unsigned long long)(dt / 1000u),
@@ -1643,7 +1643,7 @@ static int dirent_cmp(const void *a, const void *b) {
 }
 
 /* A set of distinct directories to fsync, striped over the workers like the data fsyncs
- * (review 003 §3.3 item 1: they used to run one after another on the job thread, ~3 ms each,
+ * (they used to run one after another on the job thread, ~3 ms each,
  * tens of seconds in prepare and a good share of every batch on a game-sized tree). The
  * directories are independent descriptors; each sync is the same call as before, so nothing
  * about what is durable when changes. */
@@ -1806,7 +1806,7 @@ static int sweep_one(ava1_job_t *j, const ava1_usw_t *u) {
         if (!bad) {
             /* Right size is not right content (zero-filled blocks after a power cut, a damaged page): check the
              * bytes against the record's BLAKE3 root before the file is fsynced and its record released
-             * (review 007 #8). A record that cannot be read here skips the check; it never fails a sound file. */
+             *. A record that cannot be read here skips the check; it never fails a sound file. */
             ava1_bundle_record_t cr;
             uint8_t *cbuf = NULL;
             if (pack_read(j, u->seg, u->off, u->len, &cbuf, &cr) == 0) {
@@ -2452,7 +2452,7 @@ static void sync_batch(ava1_job_t *j) {
     if (n_small) {
         /* Sorted ids, with each logged file's record location kept beside its id: sorting `ids` alone left
          * `ploc` in arrival order, so the sweep queue and the per-segment journal ranges paired ids with other
-         * files' records (review 007 #8 found it: the sweep's re-make read the wrong record and failed). */
+         * files' records (the sweep's re-make used to read the wrong record and fail). */
         idloc_t *pr = ploc && logmode ? malloc((size_t)n_small * sizeof *pr) : NULL;
         if (pr) {
             for (i = 0; i < n_small; i++) {
@@ -2947,7 +2947,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         /* Same directory by construction; checked anyway (SPEC.md §12.6, the kernel panic). */
         {
             /* Fail closed: only a definite 1 may reach rename(). -1 (a stat failed) is not "same";
-             * a false refusal costs a retry, a false allow costs a kernel panic (review 007 #4). */
+             * a false refusal costs a retry, a false allow costs a kernel panic. */
             int sd = cfg->same_device ? cfg->same_device(part, parent) : -1; /* no hook = unknown */
             if (sd == 0) {
                 commit_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
@@ -3083,7 +3083,7 @@ static void finish(ava1_job_t *j) {
             return;
         }
         {
-            int sd = cfg->same_device ? cfg->same_device(j->base, parent) : -1; /* no hook = unknown */ /* only a definite 1 may rename (review 007 #4) */
+            int sd = cfg->same_device ? cfg->same_device(j->base, parent) : -1; /* no hook = unknown */ /* only a definite 1 may rename */
             if (sd == 0) {
                 ava1_apply_fail(j, AVA1_ERR_CROSS_DEVICE, "the destination is on another drive", 0, 1);
                 return;

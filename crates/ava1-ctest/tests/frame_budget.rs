@@ -1,4 +1,4 @@
-//! The pool must not let live frame memory pass the admit budget (review perf-lanes): with
+//! The pool must not let live frame memory pass the admit budget: with
 //! 2 MiB frames (not a size class) the peak bytes handed out during a real upload stay at or
 //! below the budget, and every buffer is released at the end.
 #![cfg(unix)]

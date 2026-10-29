@@ -1,5 +1,5 @@
 /* The payload's side of a download (SPEC.md §12): the console is the sender, the engine
- * (ava1::recv, Task 17) the receiver. ava1_send_open walks the source, sends the
+ * (ava1::recv) the receiver. ava1_send_open walks the source, sends the
  * manifest, waits for the engine's JobMap, then one reader thread reads and one writer
  * thread per live lane sends, so a slow lane never stalls the others. The engine
  * concludes the job (JOB_DONE / JOB_CANCEL). */
@@ -11,7 +11,7 @@
 
 #include "ava1_job.h"
 
-/* The reader shared by downloads and the local copy (Task 19): it walks files in
+/* The reader shared by downloads and the local copy: it walks files in
  * manifest order and produces *encoded* Chunk/Bundle messages through `put`, and the
  * large files' roots through `root`. `put` and `root` are called only from the reader
  * thread. `put` takes ownership of `msg` (frees it) on every return. */

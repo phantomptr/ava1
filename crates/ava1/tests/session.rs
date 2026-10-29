@@ -263,7 +263,7 @@ async fn an_unpaired_server_opens_its_own_window() {
 
 #[tokio::test]
 async fn a_slow_call_does_not_stop_liveness_or_other_calls() {
-    // Design-review flaw 4: a 1.5 s call on a 500 ms dead_after session.
+    // A 1.5 s call on a 500 ms dead_after session.
     let (s_id, c_id) = (
         Identity::generate().unwrap(),
         Arc::new(Identity::generate().unwrap()),

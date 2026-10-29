@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! The sender's wait for a console to settle (review dbl): it can be cancelled, it fails when the console reports
+//! The sender's wait for a console to settle: it can be cancelled, it fails when the console reports
 //! it cannot make files durable, and on timeout it does not report a clean success.
 mod common;
 use ava1_ctest::TempDir;

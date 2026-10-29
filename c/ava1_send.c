@@ -750,7 +750,7 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
     }
 }
 
-/* The stage-timer line is opt-in (review L2), like the Rust side's AVA1_TIMING: the
+/* The stage-timer line is opt-in, like the Rust side's AVA1_TIMING: the
  * console has no environment to set, so a flag file in the debug directory turns it on (the host
  * build, which runs this code in ava1-ctest, also honours the environment variable). Read once per
  * job. */

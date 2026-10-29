@@ -24,7 +24,7 @@ typedef struct {
      * refuses it. May be NULL. */
     int (*refuse_link)(const char *abs);
     uint32_t fsync_delay_us;              /* tests: a slow disk */
-    int crash_at;                         /* tests: AVA1_CRASH_* (Task 13) */
+    int crash_at;                         /* tests: AVA1_CRASH_* */
     uint32_t park_ms;                     /* a parked job is freed after this; 0 = AVA1_PARK_MS */
     /* Control-frame bytes queued for jobs (their inboxes and the frames behind a JobOpen
      * still opening), all jobs together; 0 = 64 MiB. Past it, the job ends with ERR_BUSY. */
@@ -56,7 +56,7 @@ typedef struct {
 #define AVA1_UNSWEPT_TOTAL (512ull << 20)
 #define AVA1_SWEEP_AGE_MS 3000u
 /* 1 when small files go through the pack log (the data layer's effective setting). */
-/* Runtime off-switch (review 007 #5): when this file exists the console takes the per-file fsync path
+/* Runtime off-switch: when this file exists the console takes the per-file fsync path
  * for every job OPENED from then on (a job decides once, at open, and never switches mid-job).
  * Recovery of already-logged jobs ignores it. Same directory as the timing flag. */
 /* A file whose presence turns the small-file log off (a diagnostic switch an application can
@@ -142,7 +142,7 @@ int ava1_data_spawn(void *(*fn)(void *), void *arg);
 const ava1_data_hooks_t *ava1_data_hooks(void);
 /* The data plane's RPC methods (SPEC.md §13.5): job.copy, job.status, job.cancel and
  * disk.calibrate. Returns AVA1_STATUS_OK or an AVA1_ERR_*; -1 when the method is not the
- * data layer's, so an embedder's own handler runs (ava1_glue.c, Task 21). */
+ * data layer's, so an embedder's own handler runs (ava1_glue.c). */
 int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                   size_t *out_len);
 /* JOB_CANCEL without the owner check, for the console page (which runs under its own identity
@@ -158,7 +158,7 @@ int ava1_calibrate(const uint8_t *body, uint32_t len, uint8_t *out, size_t cap, 
 int ava1_job_attach(ava1_job_t *j, const uint8_t sid[16], uint64_t credit);
 
 /* Records a failure found off the job thread (a sender job's on_frame hook, a worker):
- * the job thread ends the job within one 25 ms tick (ruling C4). Never blocks on I/O. */
+ * the job thread ends the job within one 25 ms tick. Never blocks on I/O. */
 void ava1_data_fail_soon(ava1_job_t *j, uint16_t status, const char *what);
 /* hold 1: the feeder hands no more lane frames to the engine, and any it is handing over is queued
  * when this returns (the job thread is about to replace the manifest); hold 0 lets it go again. */

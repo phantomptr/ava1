@@ -20,7 +20,7 @@ pub const START_LANES: u8 = 2;
 pub const MAX_LANES: u8 = 8;
 /// A lane probe must raise the rate by this factor to keep its lane.
 const GAIN: f64 = 1.10;
-/// The easier bar while the link is not yet at its best observed rate (review 003 §5): a
+/// The easier bar while the link is not yet at its best observed rate: a
 /// third lane that adds a few percent is worth keeping then, and reverting it holds the
 /// governor back for `HOLD_TICKS`.
 const GAIN_BELOW_BEST: f64 = 1.05;
@@ -446,9 +446,8 @@ impl Governor {
     }
 }
 
-/// Where a job's time went, one tick (a second) at a time: the line CUTOVER §4 rows quote
-/// (review 003 §2.2 item 3), and the counts the engine's per-job telemetry record keeps
-/// (review 009 #4).
+/// Where a job's time went, one tick (a second) at a time, and the counts the engine's per-job
+/// telemetry record keeps.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobSummary {
     /// Ticks observed.
@@ -832,7 +831,7 @@ mod tests {
         assert!(matches!(g.probe, Probe::Done), "the probe never runs twice");
     }
 
-    // ---- review 003 §5: lanes first, and the benchmark pins ----------------------------
+    // ---- lanes first, and the benchmark pins ----------------------------
 
     fn steady(rate: f64, lanes: u8) -> Sample {
         Sample {

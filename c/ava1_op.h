@@ -1,4 +1,4 @@
-/* AVA1 long-running management operations as jobs (P3 Task 5; SPEC.md section 7.3, job.run).
+/* AVA1 long-running management operations as jobs (SPEC.md section 7.3, job.run).
  *
  * `job.run{job_id, op, args}` starts an operation on its own worker thread (512 KiB stack,
  * the management stack) and answers at once with a Status. The operation reports progress

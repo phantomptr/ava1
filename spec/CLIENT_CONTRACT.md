@@ -82,7 +82,7 @@ application sends it).
 
 Deferred (recorded here, not done):
 
-- **Directory-fsync deferral** (the second option of the perf-apply review) was not taken: striping
+- **Directory-fsync deferral** (the second option considered for the apply path) was not taken: striping
   keeps the invariant "no journal record names a file whose directory is unsynced" (SPEC 15.4) and
   needs no `lstat` of every done file on resume. Durable-by-log (§4.3) supersedes both.
 - **Rust receiver**: `LocalSink` (downloads) still does one `fsync` per file serially and opens each

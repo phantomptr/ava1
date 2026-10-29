@@ -1,4 +1,4 @@
-/* Threads and clocks (SPEC.md §15's 256 KiB rule, Global Constraint 65). */
+/* Threads and clocks (SPEC.md §15's 256 KiB rule). */
 #ifndef AVA1_THREAD_H
 #define AVA1_THREAD_H
 

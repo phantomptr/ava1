@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! The C receiver on the wire (Task 14): JobOpen → ack → pages → map → chunks/bundles →
+//! The C receiver on the wire: JobOpen → ack → pages → map → chunks/bundles →
 //! Received/Credit/Durable → JobDone, credit admission, held frames, parking.
 mod common;
 

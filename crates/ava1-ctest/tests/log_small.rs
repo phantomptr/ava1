@@ -1,4 +1,4 @@
-//! Durable-by-log for small files (review 003 §3.2, SPEC.md §15.7), console receiver: the pack log, the
+//! Durable-by-log for small files (SPEC.md §15.7), console receiver: the pack log, the
 //! two-fsync batch, the sweep, recovery after every crash point, the unswept cap and the settling report.
 #![cfg(unix)]
 use std::path::PathBuf;
@@ -405,7 +405,7 @@ fn a_compacted_journal_still_names_the_unswept_files_so_a_restart_recovers_them(
     all_there(&t, n);
 }
 
-// ---- review 007 #5: the runtime off-switch (the AVA1_LOG_SMALL_OFF_FLAG file) ----
+// ---- the runtime off-switch (the AVA1_LOG_SMALL_OFF_FLAG file) ----
 
 /// A job begun with the flag file present (and the engine ON) takes the per-file path: every file is
 /// fsynced, nothing waits for a sweep and no pack segment exists.

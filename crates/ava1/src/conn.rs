@@ -16,13 +16,12 @@ use crate::Ava1Error;
 /// The first counter value no frame may be sealed or opened with. A direction's counter is
 /// the AEAD nonce (SPEC.md §4.4), so a wrap would reuse nonces under one key. 2^64 frames
 /// are unreachable; the ceiling turns a violated invariant into a clean connection break
-/// instead of a silent break of the cipher (review 006 #1).
+/// instead of a silent break of the cipher.
 pub(crate) const NONCE_CEILING: u64 = u64::MAX - 1;
 
 /// A frame body on its way out: owned, or shared with the sender's bookkeeping. The data
 /// plane keeps every in-flight frame (a lane death requeues it), so the writer borrows the
-/// same bytes instead of taking a copy: the one copy per frame is the sealed output buffer
-/// (review 003 §5 of 01).
+/// same bytes instead of taking a copy: the one copy per frame is the sealed output buffer.
 #[derive(Debug, Clone)]
 pub enum FrameBody {
     /// A body the frame owns.
@@ -635,7 +634,7 @@ mod tests {
         assert_eq!(r2.ctr(), NONCE_CEILING);
     }
 
-    // ---- negative frame vectors (review 006 #4, checklist A): truncated, oversized, misordered ----
+    // ---- negative frame vectors : truncated, oversized, misordered ----
 
     /// Three sealed frames on one lane, as wire bytes, with each frame's length.
     async fn three_frames(key: [u8; 32]) -> (Vec<u8>, Vec<usize>) {

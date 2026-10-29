@@ -276,7 +276,7 @@ void ava1_pend_release(uint32_t n) {
 /* Descriptors held by large files (each open one holds a part file and, from two groups up, an
  * outboard) until the file commits. They used to be uncapped: a first group that spanned thousands
  * of files kept two descriptors per file and used the whole table (about 600 on the console), so
- * every accept() and open() failed (final review: console). A quarter of the budget, all jobs
+ * every accept() and open() failed. A quarter of the budget, all jobs
  * together; the pending small files take half, and the rest covers the writers' transient dups,
  * the journals, the pack logs and the sockets. */
 static uint32_t g_lf_open, g_lf_peak;
@@ -939,7 +939,7 @@ static void root_each(ava1_job_t *j, void *ctx) {
     }
 }
 
-/* Another job that has not ended writes to `root` (Task 13 review M6): two jobs must not
+/* Another job that has not ended writes to `root`: two jobs must not
  * stage, lock or rename the same destination. Parked jobs count: they can resume. */
 static int root_in_use(const uint8_t id[16], const char *root) {
     root_q_t q;
@@ -1507,7 +1507,7 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
     case AVA1_METHOD_C2C_SEND:
         return c2c_send(body, len, peer, out, cap, out_len);
     default:
-        return -1; /* not ours: the embedder's handler runs (ava1_glue.c, Task 21) */
+        return -1; /* not ours: the embedder's handler runs (ava1_glue.c) */
     }
 }
 
@@ -1588,7 +1588,7 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         return 0;
     }
     if (type == AVA1_TYPE_RESUME) ava1_log_job_event("resume", j, AVA1_STATUS_OK);
-    if (j->on_frame) { /* a sender job (Task 18): the receiving peer's acks and map */
+    if (j->on_frame) { /* a sender job: the receiving peer's acks and map */
         /* A Resume re-attaches it: the new session's lanes that came up before the attach
          * never told the job, so its writers start here (as after a JobOpen's attach). */
         if (type == AVA1_TYPE_RESUME && ava1_job_attach(j, sid, 0) == 0) ava1_send_start(j);
@@ -1864,7 +1864,7 @@ typedef struct {
     int up;
 } lane_ev_t;
 
-/* Under the table lock: counters and the sender's hook only (it marks state, Task 18). */
+/* Under the table lock: counters and the sender's hook only (it marks state). */
 static void lane_each(ava1_job_t *j, void *ctx) {
     lane_ev_t *e = ctx;
     if (!j->attached || memcmp(j->sid, e->sid, 16) != 0) return;

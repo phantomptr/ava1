@@ -1,4 +1,4 @@
-//! Exhaustive torn-write sweeps through the console C (review 009 #2b): the journal and the
+//! Exhaustive torn-write sweeps through the console C: the journal and the
 //! pack log are cut at EVERY byte length (and the last record flipped at every offset), and the
 //! C replay and the C `ava1_pack_recover` must do what the Rust receivers do.
 #![cfg(unix)]

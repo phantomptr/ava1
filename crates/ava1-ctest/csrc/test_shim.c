@@ -677,7 +677,7 @@ static int jdump_visit(void *ctx, uint8_t kind, const uint8_t *body, size_t len)
         d->status = x.status;
     } else if (kind == AVA1_JNL_SNAPSHOT) {
         /* Test-only visitor: Rust's replay applies a snapshot, but the cross-tests never
-         * write one. Accept it so replay does not stop; the real C replay (Task 13) must
+         * write one. Accept it so replay does not stop; the real C replay must
          * apply it. */
     } else if (kind != AVA1_JNL_OPEN) {
         return 1; /* unknown kind: torn from here on, same as Rust's Record::decode */
@@ -821,7 +821,7 @@ int ava1_test_mstore_walk(const char *root, uint8_t hash[32], uint32_t *count) {
     return rc;
 }
 
-/* The walk with flags (AVA1_WALK_FOLLOW): the sender's mode (ruling C1). */
+/* The walk with flags (AVA1_WALK_FOLLOW): the sender's mode. */
 int ava1_test_mstore_walk_ex(const char *root, unsigned flags, uint8_t hash[32], uint32_t *count) {
     ava1_mstore_t m;
     int rc;
@@ -878,7 +878,7 @@ int ava1_test_thread_smoke(size_t *stack_bytes) {
 }
 
 /* ---------------------------------------------------------------------------
- * Task 11 fix round: manifest store limits, blob/page cross checks, data config.
+ * Manifest store limits, blob/page cross checks, data config.
  */
 
 size_t ava1_test_ment_size(void) { return sizeof(ava1_ment_t); }
@@ -1027,7 +1027,7 @@ void ava1_test_data_clamp(uint8_t start, uint8_t min, uint8_t max, int out[5]) {
     ava1_data_stop();
 }
 
-/* ---- the apply engine on a hand-built job (Task 12) ------------------------------ */
+/* ---- the apply engine on a hand-built job ------------------------------------------ */
 /* One apply job at a time: the Rust side (CApplyJob) holds the shared C server lock. */
 
 static pthread_mutex_t g_ev_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1118,7 +1118,7 @@ static void apply_opts(ava1_data_cfg_t *cfg) {
     cfg->recover_every_ms = g_opt_every;
     cfg->recover_max = g_opt_rmax;
 }
-/* review 007 #5: point the console's durable-by-log off-switch at a test file (NULL: the real path). */
+/* point the console's durable-by-log off-switch at a test file (NULL: the real path). */
 static char g_log_flag_buf[1024];
 void ava1_test_set_log_small_flag(const char *path) {
     if (!path) {
@@ -1651,7 +1651,7 @@ void ava1_test_apply_end(void) {
     ava1_test_set_same_device(1);
 }
 
-/* ---- the receiver driven directly (Task 13) --------------------------------------- */
+/* ---- the receiver driven directly --------------------------------------------------- */
 /* Shares g_job, the recorder and the apply calls above; one job at a time (the Rust side
  * holds the C server lock). */
 
@@ -1861,9 +1861,9 @@ static void install_ops(void) {
 /* Runs the reaper as if an hour had passed: finished jobs go, running ones stay. */
 void ava1_test_reap_far(void) { ava1_job_reap(ava1_mono_ms() + 3600u * 1000u); }
 
-/* ---- the data layer on the wire (Task 14) ----------------------------------------- */
+/* ---- the data layer on the wire ----------------------------------------------------- */
 
-/* The data server's hook: the data plane's own methods first (Task 19), then node.info. */
+/* The data server's hook: the data plane's own methods first, then node.info. */
 static int data_rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
                     size_t *out_len) {
     int rc = ava1_data_rpc(method, body, body_len, out, cap, out_len);

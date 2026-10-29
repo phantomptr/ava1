@@ -18,7 +18,7 @@ typedef struct {
     const char *root;
     ava1_emit_fn emit;
     void *emit_ctx;
-    const uint8_t *sid; /* a new job is attached to this session as it is created (Task 14); NULL = none */
+    const uint8_t *sid; /* a new job is attached to this session as it is created; NULL = none */
 } ava1_recv_spec_t;
 
 /* JobOpen. Returns the referenced job (new, resumed from disk, or re-attached from memory)

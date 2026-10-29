@@ -23,7 +23,7 @@ void ava1_header_encode(const ava1_header_t *h, uint8_t out[AVA1_HEADER_LEN]);
 /* 0, AVA1_E_MAGIC, AVA1_E_CRC or AVA1_E_TOOLONG. */
 int ava1_header_decode(const uint8_t in[AVA1_HEADER_LEN], ava1_header_t *h);
 
-/* Lane frame-buffer pool (review 003 section 3). A lane body is read into a buffer from
+/* Lane frame-buffer pool. A lane body is read into a buffer from
  * ava1_frame_alloc. A body whose length is a size class (1, 4, 8, 15 or 16 MiB) plus at most a
  * chunk's few header bytes comes from that class's free list and is kept for the next frame
  * instead of being returned to the allocator, which hands a fresh 15 MiB block back to the

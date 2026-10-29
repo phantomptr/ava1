@@ -282,7 +282,7 @@ static int frec_push(frec_t **v, uint32_t *n, uint32_t *cap, const char *p, cons
     return 0;
 }
 
-/* One implementation for both modes (ruling C1). The walk follows the path order Rust's
+/* One implementation for both modes. The walk follows the path order Rust's
  * walk produces; the entries are sorted by `path_cmp` afterwards either way. */
 int ava1_mstore_walk_deny(ava1_mstore_t *m, const char *root, unsigned flags, int (*deny)(const char *abs)) {
     strv_t dirs = { 0 };
@@ -313,7 +313,7 @@ int ava1_mstore_walk_deny(ava1_mstore_t *m, const char *root, unsigned flags, in
             snprintf(abs, 2 * (AVA1_MAX_PATH + 2) + 512, "%s/%s", root, child);
             /* A stat failure on a discovered entry is fatal in both modes: Rust's walk
              * fails on a dangling link, and a silent skip would produce a manifest that
-             * does not match the source tree (ruling C1). */
+             * does not match the source tree. */
             if (lstat(abs, &lst) != 0) {
                 rc = AVA1_E_IO;
                 break;

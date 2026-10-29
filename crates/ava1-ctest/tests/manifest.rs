@@ -138,7 +138,7 @@ fn a_symlink_cycle_fails_the_c_follow_walk_and_rust() {
 fn c_threads_start_with_their_own_stack() {
     // Not a smoke test: the C side reports the stack it actually ran on and fails unless
     // it is within [200 KiB, 256 KiB + 4 KiB] (64 KiB of ceiling on macOS, whose pthreads
-    // pad the reported allocation) — the default pthread stack (512 KiB on macOS, 8 MiB on Linux) must not pass. See ruling 4.
+    // pad the reported allocation) — the default pthread stack (512 KiB on macOS, 8 MiB on Linux) must not pass.
     assert_eq!(c_thread_smoke().0, 0);
 }
 

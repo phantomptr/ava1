@@ -50,7 +50,7 @@ int ava1_mstore_page(const ava1_mstore_t *m, const uint8_t job[16], uint32_t *ne
 #define AVA1_WALK_FOLLOW 1u
 int ava1_mstore_walk(ava1_mstore_t *m, const char *root); /* = ava1_mstore_walk_ex(m, root, 0) */
 int ava1_mstore_walk_ex(ava1_mstore_t *m, const char *root, unsigned flags); /* depth first, sorted */
-/* The walk with a deny hook (review S2): a SYMLINK entry for which `deny(abs)` is 1 (it leads into the trust
+/* The walk with a deny hook: a SYMLINK entry for which `deny(abs)` is 1 (it leads into the trust
  * store or to an ancestor of it) is skipped, never followed or listed. NULL = ava1_mstore_walk_ex. */
 int ava1_mstore_walk_deny(ava1_mstore_t *m, const char *root, unsigned flags, int (*deny)(const char *abs));
 /* Opens a file for reading without following a final symlink. A symlink (a file link inside a followed

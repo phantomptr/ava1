@@ -1,8 +1,7 @@
 #![cfg(unix)]
-//! Task 18: downloads, C sender (ava1_send.c) → Rust receiver (ava1::recv). The four
-//! plan tests — a folder, a single ordered file, a resume from the engine's journal, a
-//! refusal — plus the empty-folder test (ruling R3), and the Task 18 fix round: the C
-//! sender's window rules (SPEC.md §12.3–§12.4) driven step by step, a transient send
+//! Downloads, C sender (ava1_send.c) → Rust receiver (ava1::recv). The four core
+//! tests — a folder, a single ordered file, a resume from the engine's journal, a
+//! refusal — plus the empty-folder test, and the hardening tests: the C sender's window rules (SPEC.md §12.3–§12.4) driven step by step, a transient send
 //! failure, failed writer starts, and the wire Resume's re-attach.
 mod common;
 
@@ -276,7 +275,7 @@ async fn an_empty_folder_downloads() {
     assert!(d.join("got").exists());
 }
 
-// ---- the Task 18 fix round: the C sender's window, step by step ------------------------
+// ---- the C sender's window, step by step ---------------------------------------------
 
 /// Finding 1 (SPEC.md §12.3): a frame the writer handed to the socket may have reached
 /// the receiver, so its lane's death must not return its charge — the sender would spend
@@ -479,9 +478,9 @@ fn the_reader_stops_queueing_once_the_job_is_ending() {
     assert_eq!((st.ready, st.queued), (0, 0));
 }
 
-// ---- the Task 18 fix round: end to end ------------------------------------------------
+// ---- the C sender's window: end to end -----------------------------------------------
 
-/// The deadline for the fix round's end-to-end downloads: each finishes in seconds; a
+/// The deadline for these end-to-end downloads: each finishes in seconds; a
 /// lane the sender abandoned hangs until this fires.
 const FIX_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -730,9 +729,9 @@ async fn two_thousand_tiny_files_download_fast() {
 /// and ~2,500-3,000 release (serial per-file writes, a 250 ms wait before the final sync);
 /// the parallel bundle writes and the immediate final sync took it to today's numbers. The
 /// floors sit at ~70% of healthy, above everything the earlier pipeline reached. Raised from 700 to 1,000
-/// (debug) with the pack log work (review 003 §3.2): 2,000 files measured 2,270-2,930 files/s on loopback, with
+/// (debug) with the pack log work: 2,000 files measured 2,270-2,930 files/s on loopback, with
 /// the log on or off, while this test ran alone; the whole binary's other tests run beside it.
-/// Under the sanitizers (AVA1_CTEST_SANITIZE, review 009 #2a) the C runs 5-7x slower (measured 195
+/// Under the sanitizers (AVA1_CTEST_SANITIZE) the C runs 5-7x slower (measured 195
 /// files/s): the floor there only catches a stall, not a regression of the pipeline.
 const FLOOR_FILES_PER_S: f64 = if cfg!(ava1_ctest_sanitize) {
     50.0
@@ -742,7 +741,7 @@ const FLOOR_FILES_PER_S: f64 = if cfg!(ava1_ctest_sanitize) {
     3500.0
 };
 
-/// Large-file commit bench (review 009 #5): many multi-group files downloaded from the C sender, so
+/// Large-file commit bench: many multi-group files downloaded from the C sender, so
 /// every file takes the large path and pays its own `set_len`/fsync/rename commit. Prints the time
 /// and rate; the assertion is correctness only (a wall-clock floor would be machine-dependent).
 #[tokio::test(flavor = "multi_thread")]

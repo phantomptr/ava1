@@ -1,4 +1,4 @@
-//! An RPC the peer never answers is bounded (final review: engine #6).
+//! An RPC the peer never answers is bounded.
 mod common;
 
 use std::time::{Duration, Instant};

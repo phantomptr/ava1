@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use crate::gen;
 use crate::manifest::Manifest;
 use crate::ranges::{Need, RangeSet};
-use crate::send::{pieces, Piece, Read};
+use crate::send::{pieces, Piece, Progress, Read, PHASE_SEND, PHASE_SKIP};
 use crate::verify::{self, FileHasher, Outboard, GROUP};
 
 /// A decode restart point the source understands (7z: a folder, RAR: an entry). Opaque
@@ -92,6 +92,23 @@ pub trait SeqSource: Send + Sync {
     fn bytes_skipped(&self) -> u64 {
         0
     }
+    /// How much `bytes_skipped` will grow over `pass(restart, want, ..)`: the bytes of the
+    /// entries that pass would decode only to discard (a solid block's done prefix on
+    /// resume, a done entry between two wanted ones), worked out from the headers without
+    /// decoding. `want` answers as it will in the pass; call it for the entries the pass
+    /// visits, in decode order. The sender calls this once before each pass and reports the
+    /// answer, with what it discards of partly held files itself, as
+    /// `Progress::skip_total_bytes` (`skip_done_bytes` is the growth of `bytes_skipped`).
+    /// `None`, the default, means the source cannot tell: its discards are then left out
+    /// of both counters. A source that overrides `bytes_skipped` should override this too.
+    fn bytes_to_skip(
+        &self,
+        restart: Restart,
+        want: &mut dyn FnMut(&str, u64) -> Keep,
+    ) -> Option<u64> {
+        let _ = (restart, want);
+        None
+    }
 }
 
 /// A job gets at most this many passes (the first plus retries); a further `FileRetry`
@@ -160,6 +177,77 @@ pub(crate) struct DecodeCtx {
     /// stretches of a partly held large file (SPEC.md §17.2). Read with
     /// `SeqSource::bytes_skipped` for `SkipProgress`.
     pub skipped: Arc<AtomicU64>,
+    /// The job's counters: the decode thread writes `phase`, `skip_done_bytes` and
+    /// `skip_total_bytes` for each pass (see `SkipMeter`).
+    pub progress: Arc<Progress>,
+}
+
+/// One pass's skip, as `Progress` reports it.
+struct SkipPass {
+    /// `SeqSource::bytes_skipped` when the pass began.
+    src_base: u64,
+    /// `DecodeCtx::skipped` when the pass began.
+    own_base: u64,
+    /// Whether the source said how much it discards (its growth then counts as done).
+    count_src: bool,
+    total: u64,
+}
+
+/// Writes `Progress::{phase, skip_done_bytes, skip_total_bytes}`: set when a pass begins,
+/// refreshed by the watcher thread (the source discards inside `pass`, out of the decode
+/// thread's sight) and as each delivered entry begins, and once more when the pass ends.
+struct SkipMeter {
+    seq: Arc<dyn SeqSource>,
+    own: Arc<AtomicU64>,
+    pg: Arc<Progress>,
+    cur: Mutex<Option<SkipPass>>,
+}
+
+impl SkipMeter {
+    fn begin(&self, count_src: bool, total: u64) {
+        let mut g = self.cur.lock().unwrap();
+        *g = Some(SkipPass {
+            src_base: self.seq.bytes_skipped(),
+            own_base: self.own.load(Ordering::Relaxed),
+            count_src,
+            total,
+        });
+        self.pg.skip_done_bytes.store(0, Ordering::Relaxed);
+        self.pg.skip_total_bytes.store(total, Ordering::Relaxed);
+        let phase = if total > 0 { PHASE_SKIP } else { PHASE_SEND };
+        self.pg.phase.store(phase, Ordering::Relaxed);
+    }
+
+    /// Brings `skip_done_bytes` and `phase` up to date; nothing between passes.
+    fn update(&self) {
+        let g = self.cur.lock().unwrap();
+        if let Some(p) = g.as_ref() {
+            self.store(p);
+        }
+    }
+
+    fn store(&self, p: &SkipPass) {
+        let mut done = self.own.load(Ordering::Relaxed).saturating_sub(p.own_base);
+        if p.count_src {
+            done = done.saturating_add(self.seq.bytes_skipped().saturating_sub(p.src_base));
+        }
+        self.pg.skip_done_bytes.store(done, Ordering::Relaxed);
+        let phase = if done < p.total {
+            PHASE_SKIP
+        } else {
+            PHASE_SEND
+        };
+        self.pg.phase.store(phase, Ordering::Relaxed);
+    }
+
+    /// The pass returned (done, failed or stopped): the last count, and no skip any more.
+    fn end(&self) {
+        let mut g = self.cur.lock().unwrap();
+        if let Some(p) = g.take() {
+            self.store(&p);
+        }
+        self.pg.phase.store(PHASE_SEND, Ordering::Relaxed);
+    }
 }
 
 /// Per-file plan for a pass.
@@ -178,24 +266,36 @@ pub(crate) fn run(c: DecodeCtx) {
     // The flag handed to the source: set by `stop` OR `cancel`.
     let abort = Arc::new(AtomicBool::new(false));
     let fin = Arc::new(AtomicBool::new(false));
+    let meter = Arc::new(SkipMeter {
+        seq: c.seq.clone(),
+        own: c.skipped.clone(),
+        pg: c.progress.clone(),
+        cur: Mutex::new(None),
+    });
     let watcher = {
-        let (abort, fin, stop, cancel) =
-            (abort.clone(), fin.clone(), c.stop.clone(), c.cancel.clone());
+        let (abort, fin, stop, cancel, meter) = (
+            abort.clone(),
+            fin.clone(),
+            c.stop.clone(),
+            c.cancel.clone(),
+            meter.clone(),
+        );
         std::thread::spawn(move || {
             while !fin.load(Ordering::Relaxed) {
                 if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                     abort.store(true, Ordering::Relaxed);
                 }
+                meter.update();
                 std::thread::sleep(Duration::from_millis(10));
             }
         })
     };
-    run_passes(&c, &abort);
+    run_passes(&c, &abort, &meter);
     fin.store(true, Ordering::Relaxed);
     let _ = watcher.join();
 }
 
-fn run_passes(c: &DecodeCtx, abort: &AtomicBool) {
+fn run_passes(c: &DecodeCtx, abort: &AtomicBool, meter: &SkipMeter) {
     let mut by_path: HashMap<String, u32> = HashMap::new();
     for (i, e) in c.manifest.entries.iter().enumerate() {
         if e.kind == gen::ENTRY_FILE {
@@ -232,7 +332,7 @@ fn run_passes(c: &DecodeCtx, abort: &AtomicBool) {
     let mut passes = 0u32;
     loop {
         if !wants.is_empty() {
-            match one_pass(c, abort, &by_path, &mut wants) {
+            match one_pass(c, abort, &by_path, &mut wants, meter) {
                 // A pass that had nothing to decode does not count against the cap.
                 Ok(ran) => passes += ran as u32,
                 Err(e) => {
@@ -280,6 +380,7 @@ fn one_pass(
     abort: &AtomicBool,
     by_path: &Arc<HashMap<String, u32>>,
     wants: &mut BTreeMap<u32, Want>,
+    meter: &SkipMeter,
 ) -> io::Result<bool> {
     // A large file whose every missing group is absent and whose CVs are all known
     // needs no decoding: its root comes from the persisted outboard alone.
@@ -325,6 +426,7 @@ fn one_pass(
         finished: &finished,
         cur: None,
         done: HashSet::new(),
+        meter,
     };
     let wants_ref: &BTreeMap<u32, Want> = &*wants;
     let by = by_path.clone();
@@ -337,7 +439,27 @@ fn one_pass(
             _ => Keep::Skip,
         }
     };
-    c.seq.pass(restart, &mut want, &mut sink, abort)?;
+    // What the pass will discard: the held groups of partly durable files (they pass
+    // through `Feeder::data` unsent, exactly the groups the durable map covers whole)
+    // plus what the source decodes only to drop.
+    let own: u64 = todo
+        .iter()
+        .filter(|id| matches!(wants[*id].keep, Keep::Ranges(_)))
+        .map(|id| {
+            let size = c.manifest.entries[*id as usize].size;
+            let d = &wants[id].durable;
+            (0..verify::groups(size))
+                .map(|g| (g * GROUP, (size - g * GROUP).min(GROUP)))
+                .filter(|(off, len)| d.covers(*off, off + len))
+                .map(|(_, len)| len)
+                .sum::<u64>()
+        })
+        .sum();
+    let src = c.seq.bytes_to_skip(restart, &mut want);
+    meter.begin(src.is_some(), own.saturating_add(src.unwrap_or(0)));
+    let passed = c.seq.pass(restart, &mut want, &mut sink, abort);
+    meter.end();
+    passed?;
     if gone(c) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
     }
@@ -393,6 +515,7 @@ struct Feeder<'a> {
     finished: &'a HashSet<u32>,
     cur: Option<Cur>,
     done: HashSet<u32>,
+    meter: &'a SkipMeter,
 }
 
 fn stopped() -> io::Error {
@@ -478,6 +601,9 @@ impl EntrySink for Feeder<'_> {
                 "{path} appears twice in the archive"
             )));
         }
+        // What the source dropped before this entry is counted now, not at the watcher's
+        // next look: a skip that ends here shows as ended before the entry's data goes out.
+        self.meter.update();
         let size = self.c.manifest.entries[id as usize].size;
         if size < self.c.cutoff {
             let permit = self.acquire(size / 1024 + 1)?;
@@ -616,6 +742,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     const CUT: u64 = 4096;
+    /// `Progress::phase` before the decode thread wrote it.
+    const UNSET: u8 = 0xff;
 
     /// An in-memory archive: entries in decode order, folders of `folder` entries.
     struct MemSeq {
@@ -628,6 +756,12 @@ mod tests {
         delivered: AtomicUsize,
         bytes_out: AtomicUsize,
         slice: usize,
+        /// Bytes of `Skip` entries decoded and dropped (a solid archive's way).
+        discarded: AtomicU64,
+        /// Time each `Skip` entry takes to decode.
+        skip_delay: Duration,
+        /// Whether `bytes_to_skip` answers.
+        tells_skip: bool,
     }
 
     impl SeqSource for MemSeq {
@@ -646,6 +780,9 @@ mod tests {
                 let k = want(path, data.len() as u64);
                 self.wants.lock().unwrap().push((path.clone(), k.clone()));
                 if k == Keep::Skip {
+                    std::thread::sleep(self.skip_delay);
+                    self.discarded
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
                     continue;
                 }
                 sink.begin(path)?;
@@ -661,6 +798,23 @@ mod tests {
         fn restart_for(&self, id: u32) -> Restart {
             let i = self.index[&id];
             Restart((i - i % self.folder) as u64)
+        }
+        fn bytes_skipped(&self) -> u64 {
+            self.discarded.load(Ordering::Relaxed)
+        }
+        fn bytes_to_skip(
+            &self,
+            restart: Restart,
+            want: &mut dyn FnMut(&str, u64) -> Keep,
+        ) -> Option<u64> {
+            self.tells_skip.then(|| {
+                self.entries
+                    .iter()
+                    .skip(restart.0 as usize)
+                    .filter(|(p, d)| want(p, d.len() as u64) == Keep::Skip)
+                    .map(|(_, d)| d.len() as u64)
+                    .sum()
+            })
         }
     }
 
@@ -707,12 +861,16 @@ mod tests {
             delivered: AtomicUsize::new(0),
             bytes_out: AtomicUsize::new(0),
             slice: 1000,
+            discarded: AtomicU64::new(0),
+            skip_delay: Duration::ZERO,
+            tells_skip: true,
         };
         (Arc::new(m), Arc::new(s))
     }
 
     struct Run {
         skipped: Arc<AtomicU64>,
+        pg: Arc<Progress>,
         budget: Arc<Semaphore>,
         bw: Arc<BudgetWait>,
         rx: mpsc::UnboundedReceiver<Read>,
@@ -739,8 +897,12 @@ mod tests {
         let bw = Arc::new(BudgetWait::default());
         let budget = Arc::new(Semaphore::new(budget_kib));
         let skipped = Arc::new(AtomicU64::new(0));
+        let pg = Arc::new(Progress::default());
+        // Not a phase: tells "the pass has not begun yet" from what the pass wrote.
+        pg.phase.store(UNSET, Ordering::Relaxed);
         let ctx = DecodeCtx {
             skipped: skipped.clone(),
+            progress: pg.clone(),
             seq: s.clone(),
             manifest: m.clone(),
             need,
@@ -758,6 +920,7 @@ mod tests {
         let h = std::thread::spawn(move || run(ctx));
         Run {
             skipped,
+            pg,
             budget,
             bw,
             rx,
@@ -769,6 +932,58 @@ mod tests {
     }
 
     impl Run {
+        /// Waits for the skip of the current pass to be over (`PHASE_SEND`, every byte counted).
+        fn wait_skip_over(&self) {
+            let t = Instant::now();
+            loop {
+                let pg = &self.pg;
+                if pg.phase.load(Ordering::Relaxed) == PHASE_SEND
+                    && pg.skip_done_bytes.load(Ordering::Relaxed)
+                        == pg.skip_total_bytes.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "the skip never ended"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Reads messages until `n` records arrived, sampling `phase` and `skip_done_bytes`
+        /// meanwhile: the distinct phases seen, in order, and the done counts seen.
+        async fn records_watching_skip(&mut self, n: usize) -> (Vec<u8>, Vec<u64>, Vec<u32>) {
+            let (mut phases, mut dones, mut ids) = (Vec::new(), Vec::new(), Vec::new());
+            let mut sample = |pg: &Progress| {
+                let ph = pg.phase.load(Ordering::Relaxed);
+                let d = pg.skip_done_bytes.load(Ordering::Relaxed);
+                if ph != UNSET {
+                    if phases.last() != Some(&ph) {
+                        phases.push(ph);
+                    }
+                    if dones.last() != Some(&d) {
+                        dones.push(d);
+                    }
+                }
+            };
+            let t = Instant::now();
+            loop {
+                sample(&self.pg);
+                if ids.len() == n {
+                    break;
+                }
+                assert!(t.elapsed() < Duration::from_secs(10), "no records");
+                match tokio::time::timeout(Duration::from_millis(2), self.rx.recv()).await {
+                    Ok(Some(Read::Record { file_id, .. })) => ids.push(file_id),
+                    Ok(Some(x)) => panic!("{}", tag(&x)),
+                    Ok(None) => panic!("channel closed"),
+                    Err(_) => {}
+                }
+            }
+            (phases, dones, ids)
+        }
+
         async fn next(&mut self) -> Read {
             tokio::time::timeout(Duration::from_secs(10), self.rx.recv())
                 .await
@@ -921,6 +1136,82 @@ mod tests {
         assert_eq!(s.delivered.load(Ordering::SeqCst), 2);
     }
 
+    /// A solid block resumed past three done entries: they are decoded and dropped, and
+    /// `Progress` shows that skip from its start (`PHASE_SKIP`, its total known up front)
+    /// to its end (`PHASE_SEND`, every byte counted) before the wanted entry is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seq_resume_reports_the_skip_in_progress() {
+        let names = ["p", "q", "r", "s"];
+        let (m, s) = fixture(
+            names
+                .iter()
+                .map(|n| (*n, bytes(1000, n.as_bytes()[0])))
+                .collect(),
+            4,
+        );
+        let s = Arc::new(MemSeq {
+            skip_delay: Duration::from_millis(150),
+            ..Arc::try_unwrap(s).ok().unwrap()
+        });
+        let mut need = Need::default();
+        for n in ["p", "q", "r"] {
+            need.done
+                .insert(m.entries.iter().position(|e| e.path == n).unwrap() as u32);
+        }
+        let mut r = start(&m, &s, need, None, 96 * 1024, GROUP);
+        let (phases, dones, ids) = r.records_watching_skip(1).await;
+        assert_eq!(m.entries[ids[0] as usize].path, "s");
+        assert_eq!(r.pg.skip_total_bytes.load(Ordering::Relaxed), 3000);
+        r.wait_skip_over();
+        assert_eq!(r.pg.skip_done_bytes.load(Ordering::Relaxed), 3000);
+        assert_eq!(phases, [PHASE_SKIP, PHASE_SEND], "{dones:?}");
+        assert!(dones.windows(2).all(|w| w[0] <= w[1]), "{dones:?}");
+        assert!(
+            dones.iter().any(|d| (1..3000).contains(d)),
+            "the count moved during the skip: {dones:?}"
+        );
+        r.end();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seq_fresh_job_reports_no_skip() {
+        let (m, s) = fixture(
+            vec![("b", bytes(10, 1)), ("a", bytes(20, 2)), ("c", bytes(5, 3))],
+            3,
+        );
+        let mut r = start(&m, &s, Need::default(), None, 96 * 1024, GROUP);
+        let (phases, dones, ids) = r.records_watching_skip(3).await;
+        assert_eq!(ids.len(), 3);
+        assert_eq!(phases, [PHASE_SEND]);
+        assert_eq!(dones, [0]);
+        r.wait_skip_over();
+        assert_eq!(r.pg.skip_total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(r.pg.skip_done_bytes.load(Ordering::Relaxed), 0);
+        r.end();
+    }
+
+    /// A source that cannot say what it discards (`bytes_to_skip` = `None`) leaves its
+    /// discards out of both counters, so they never disagree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seq_a_source_that_cannot_tell_reports_no_skip() {
+        let (m, s) = fixture(vec![("p", bytes(500, 1)), ("q", bytes(500, 2))], 2);
+        let s = Arc::new(MemSeq {
+            tells_skip: false,
+            ..Arc::try_unwrap(s).ok().unwrap()
+        });
+        let mut need = Need::default();
+        need.done.insert(0); // p
+        let mut r = start(&m, &s, need, None, 96 * 1024, GROUP);
+        let (phases, _, ids) = r.records_watching_skip(1).await;
+        assert_eq!(ids, [1]);
+        assert_eq!(phases, [PHASE_SEND]);
+        r.wait_skip_over();
+        assert_eq!(s.bytes_skipped(), 500, "p was decoded and dropped");
+        assert_eq!(r.pg.skip_total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(r.pg.skip_done_bytes.load(Ordering::Relaxed), 0);
+        r.end();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn seq_partial_large_file_sends_only_missing_groups() {
         let big = big(); // 3 groups: 0 and 1 full, 2 short
@@ -953,6 +1244,10 @@ mod tests {
         assert_eq!(sent, [(2 * GROUP, 5000)]);
         // Both held groups passed through unsent: that is what SkipProgress reports.
         assert_eq!(r.skipped.load(Ordering::Relaxed), 2 * GROUP);
+        // Progress reports the same skip, known up front from the durable map.
+        assert_eq!(r.pg.skip_total_bytes.load(Ordering::Relaxed), 2 * GROUP);
+        r.wait_skip_over();
+        assert_eq!(r.pg.skip_done_bytes.load(Ordering::Relaxed), 2 * GROUP);
         assert_eq!(root, root_of(&big));
         let wants = s.wants.lock().unwrap();
         assert!(
@@ -1157,6 +1452,7 @@ mod tests {
             retries: Arc::default(),
             rt: tokio::runtime::Handle::current(),
             skipped: Arc::default(),
+            progress: Arc::default(),
         };
         let h = std::thread::spawn(move || run(ctx));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1212,6 +1508,9 @@ mod tests {
             delivered: AtomicUsize::new(0),
             bytes_out: AtomicUsize::new(0),
             slice: 1000,
+            discarded: AtomicU64::new(0),
+            skip_delay: Duration::ZERO,
+            tells_skip: true,
         });
         let mut r = start(&m, &s2, Need::default(), None, 96 * 1024, GROUP);
         assert!(matches!(r.next().await, Read::Record { .. }));

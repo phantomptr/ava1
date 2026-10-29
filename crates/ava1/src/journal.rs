@@ -826,8 +826,7 @@ mod tests {
         assert!(!new.exists());
     }
 
-    /// A journal of every record kind, as the whole file bytes plus each record's `(start, end)`
-    /// (review 009 #2b).
+    /// A journal of every record kind, as the whole file bytes plus each record's `(start, end)`.
     fn sweep_fixture(tag: &str) -> (Vec<u8>, Vec<Record>, Vec<(usize, usize)>) {
         let d = tmp(tag);
         let mut j = Journal::create(&d, &open_rec()).unwrap();

@@ -43,7 +43,7 @@ static void retiring_clear(const uint8_t id[16]) {
         }
 }
 
-/* Control-frame bytes queued for jobs, all jobs together (Task 14 fix round 1). */
+/* Control-frame bytes queued for jobs, all jobs together. */
 static uint64_t g_ctl;
 
 int ava1_ctl_take(size_t len) {
@@ -248,7 +248,7 @@ static void job_destroy(ava1_job_t *j) {
     if (j->thread_started) pthread_join(j->thread, NULL);
     for (i = 0; i < j->nworkers; i++) pthread_join(j->workers[i], NULL);
     /* The role's reader is the only thread left that can enqueue work (a copy's reader
-     * applies what it reads, Task 19): join it before the queue below is drained, or an
+     * applies what it reads): join it before the queue below is drained, or an
      * enqueue concurrent with the drain would append to a freed item. */
     if (j->role_free) j->role_free(j);
     while ((w = j->q_head) != NULL) {
@@ -523,7 +523,7 @@ void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *bo
     if (fn) fn(j, type, flags, body, len);
 }
 
-/* ---- test driver (fix round 2, R4) ------------------------------------------------- */
+/* ---- test driver ----------------------------------------------------------------- */
 
 /* The retiring table full (AVA1_MAX_JOBS ids unlisted, every destroy still pending behind
  * a held reference): a create must refuse — pre-fix it succeeded and its own unlist would

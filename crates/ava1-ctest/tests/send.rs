@@ -1,6 +1,6 @@
 #![cfg(unix)]
-//! The Rust sender on the wire (Task 15): a real `send_job` run against the C receiver
-//! (Task 14's data layer), plain and through a shaped link.
+//! The Rust sender on the wire: a real `send_job` run against the C receiver
+//! (the C data layer), plain and through a shaped link.
 mod common;
 
 use std::sync::{Arc, Mutex};

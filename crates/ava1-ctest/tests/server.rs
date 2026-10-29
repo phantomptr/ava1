@@ -301,7 +301,7 @@ async fn the_c_server_refuses_strangers_when_pairing_is_closed() {
 async fn the_c_server_window_stays_shut_once_paired_until_a_peer_opens_it() {
     let d = dir("window");
     let (me, peers) = paired_client(&d.join("peers"));
-    // pairing_s = 60, but the peers file is not empty: no automatic window (design review, flaw 2).
+    // pairing_s = 60, but the peers file is not empty: no automatic window.
     let srv = CServer::start(SECRET, &d.join("peers"), 60, 100, 500, 500);
     let stranger = Arc::new(Identity::generate().unwrap());
     let none = Arc::new(Mutex::new(PeerStore::in_memory()));

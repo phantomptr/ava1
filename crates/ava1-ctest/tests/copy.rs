@@ -773,7 +773,7 @@ async fn a_copy_resumes_after_a_payload_restart() {
     assert!(same_tree(&d.join("usb/g"), &d.join("data/g")));
 }
 
-/* ---- fix round 2 ------------------------------------------------------------------- */
+/* ---- regressions ------------------------------------------------------------------- */
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_move_reissued_after_a_crash_following_done_deletes_its_source() {
@@ -1074,7 +1074,7 @@ async fn a_single_file_with_overwrite_replaces_the_file() {
     assert!(d.join("usb/one.bin").exists(), "an overwrite is not a move");
 }
 
-/* ---- final review #9: a cancelled overwrite copy removes its own part files ------------ */
+/* ---- a cancelled overwrite copy removes its own part files ------------ */
 
 fn part_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();

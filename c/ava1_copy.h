@@ -1,5 +1,5 @@
 /* AVA1 console-local copy and move (SPEC.md §13.5): a receiver job whose sender is the
- * in-process reader (Task 18). Only ava1_data_rpc opens one (it holds the open lock). */
+ * in-process reader. Only ava1_data_rpc opens one (it holds the open lock). */
 #ifndef AVA1_COPY_H
 #define AVA1_COPY_H
 

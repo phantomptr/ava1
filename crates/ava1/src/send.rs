@@ -157,6 +157,12 @@ impl SendOptions {
     }
 }
 
+/// [`Progress::phase`]: sending (or nothing to report).
+pub const PHASE_SEND: u8 = 0;
+/// [`Progress::phase`]: a sequential source is decoding and discarding data the receiver
+/// already holds before it reaches what it lacks.
+pub const PHASE_SKIP: u8 = 1;
+
 /// Live counters of one job, written by the sender and read by whoever shows progress.
 /// Bytes are file payload bytes.
 #[derive(Debug, Default)]
@@ -187,12 +193,22 @@ pub struct Progress {
     pub skipped_bytes: AtomicU64,
     /// Set by the first attempt once it recorded `skipped_files` and `skipped_bytes`.
     pub skip_recorded: AtomicBool,
-    /// Sequential sources (7z/RAR resume): 1 while the decoder discards data the receiver
-    /// already holds (`skip_done_bytes` of `skip_total_bytes`), else 0.
+    /// Sequential sources (7z/RAR resume, SPEC.md §17.2): [`PHASE_SKIP`] while the current
+    /// decoding pass is still discarding data the receiver already holds
+    /// (`skip_done_bytes` < `skip_total_bytes`), else [`PHASE_SEND`]. Set when each pass
+    /// begins, refreshed about every 10 ms and as each wanted entry starts, and back to
+    /// `PHASE_SEND` when the pass returns (finished, failed or stopped). Always
+    /// `PHASE_SEND` for a random-access source and for a pass that discards nothing (a
+    /// fresh job).
     pub phase: AtomicU8,
-    /// See `phase`. Nothing in this crate writes it (nor `phase`, nor `skip_total_bytes`).
+    /// Bytes the current pass has decoded only to discard so far: the held groups of partly
+    /// durable large files, plus the growth of `SeqSource::bytes_skipped` when the source
+    /// answers `SeqSource::bytes_to_skip`. Reset to 0 when a pass begins; it reaches
+    /// `skip_total_bytes` once the skip is over.
     pub skip_done_bytes: AtomicU64,
-    /// See `phase`. Nothing in this crate writes it.
+    /// What the current pass will discard, stored when it begins: the held groups of
+    /// partly durable files (from the receiver's map) plus `SeqSource::bytes_to_skip`
+    /// (nothing from a source that answers `None`). 0 when nothing is discarded.
     pub skip_total_bytes: AtomicU64,
     /// Files are still settling on the receiver after the job's last byte (it reports
     /// unswept files); false until the receiver says so.
@@ -205,7 +221,7 @@ pub struct Progress {
     pub unswept_peak: AtomicU32,
     /// Milliseconds spent waiting for the receiver to settle, over all attempts.
     pub settle_ms: AtomicU64,
-    /// What the per-job telemetry record keeps beyond the counters above (review 009 #4).
+    /// What the per-job telemetry record keeps beyond the counters above.
     pub telemetry: Mutex<Telemetry>,
 }
 
@@ -303,7 +319,7 @@ pub struct Piece {
 ///
 /// Pieces with `send = false` never reach a lane: their bytes are read only to finish the
 /// file's root, so a consumer must never wait for them — a relay feeds only `send` pieces
-/// into the pipe (Task 24).
+/// into the pipe.
 pub fn pieces(
     size: u64,
     durable: &RangeSet,
@@ -1688,6 +1704,7 @@ pub async fn run_upload(
             retries: seq_retries.clone(),
             rt: tokio::runtime::Handle::current(),
             skipped: seq_skipped.clone(),
+            progress: pg.clone(),
         })]
     } else {
         spawn_readers(

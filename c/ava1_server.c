@@ -1556,7 +1556,7 @@ int ava1_server_start(const ava1_server_cfg_t *cfg) {
         memset(&S.peers, 0, sizeof S.peers);
         slog("ava1: cannot read %s; pairing stays closed and the file is left alone", cfg->peers_path);
     }
-    /* Opens by itself only while nothing is paired (design review, flaw 2). */
+    /* Opens by itself only while nothing is paired. */
     S.pairing_until_ms = (cfg->pairing_window_s && S.peers_ok && S.peers.n == 0)
                              ? now_ms() + (uint64_t)cfg->pairing_window_s * 1000u
                              : 0;
