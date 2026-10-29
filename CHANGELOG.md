@@ -3,7 +3,9 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
-## Unreleased
+## 1.0.3
+
+The logo, on crates.io and docs.rs. No code changes.
 
 - A logo: the AVA1 mark and name in `branding/` (SVG masters, PNGs, `scripts/brand-assets.py`),
   shown in the READMEs and as the docs.rs logo and favicon.
