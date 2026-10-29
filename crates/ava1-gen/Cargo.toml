@@ -1,0 +1,22 @@
+[package]
+name = "ava1-gen"
+description = "Generates the AVA1 wire protocol's message codecs (Rust and C) from a schema, for the core and for application extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["ava1", "protocol", "codegen", "codec"]
+categories = ["development-tools::build-utils", "encoding"]
+include = ["src/**", "README.md", "LICENSE-*"]
+
+# The public API is the same on every platform: one documentation build is enough.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+serde.workspace = true
+toml = "1"

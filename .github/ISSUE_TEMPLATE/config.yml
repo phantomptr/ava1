@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://discord.gg/fzK3xddtrM
+    about: Ask questions and talk with other users on the Discord server.
+  - name: Security issue
+    url: https://github.com/phantomptr/ava1/security/policy
+    about: Please report security issues privately, as SECURITY.md describes, not as an issue.

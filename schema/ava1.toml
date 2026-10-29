@@ -1,0 +1,949 @@
+# AVA1 core messages (SPEC.md §3). After editing: `cargo run -p ava1-gen`. Applications extend this
+# schema with their own (SPEC.md §7.3, ava1-gen --ext); see docs/extending.md.
+# Field types: u8 u16 u32 u64, b16 b32 (fixed bytes), bytes (u32 length), str (u16 length, UTF-8).
+# `ext` fields are optional and tagged; decoders skip unknown tags.
+# `doc` (optional, on a const, message, struct, field or ext field) becomes the generated item's
+# documentation: `///` in Rust, a `/* */` comment in the C header. It may span lines ("""...""")
+# and may not contain `/*` or `*/`.
+
+[[const]]
+name = "PROTOCOL_VERSION"
+ty = "u16"
+value = 1
+doc = "The protocol version this code speaks: the range in `HelloInfo` and the choice in `ServerInfo` (SPEC.md §5)."
+[[const]]
+name = "DEFAULT_PORT"
+ty = "u16"
+value = 9120
+doc = "The TCP port a node listens on unless its application picks another (SPEC.md §1)."
+[[const]]
+name = "MAX_LANES"
+ty = "u8"
+value = 8
+doc = "Data lanes per session; lane ids are 1..=8, lane 0 is the control connection (SPEC.md §1, §9)."
+[[const]]
+name = "METHOD_NODE_INFO"
+ty = "u16"
+value = 1
+doc = "RPC `node.info`: empty request, `NodeInfo` reply (SPEC.md §7.1)."
+[[const]]
+name = "METHOD_PAIRING_OPEN"
+ty = "u16"
+value = 2
+doc = "RPC `pairing.open`: `PairingOpen` request, empty reply; opens the pairing window (SPEC.md §5, §7.1)."
+[[const]]
+name = "METHOD_CRYPTO_BENCH"
+ty = "u16"
+value = 3
+doc = "RPC `crypto.bench`: `CryptoBench` request, `CryptoBenchResult` reply; a diagnostic (SPEC.md §7.1)."
+[[const]]
+name = "STATUS_OK"
+ty = "u16"
+value = 0
+doc = "`RpcResponse.status` (and job status) for success (SPEC.md §7)."
+[[const]]
+name = "ERR_NOT_PAIRED"
+ty = "u16"
+value = 1
+doc = "An RPC or a lane join from a session whose pairing is not accepted (SPEC.md §5, §7.2)."
+[[const]]
+name = "ERR_PAIRING_CLOSED"
+ty = "u16"
+value = 2
+doc = "An unknown client while the pairing window is closed, or an unconfirmed session whose window or 60 s ended (SPEC.md §5, §7.2)."
+[[const]]
+name = "ERR_UNSUPPORTED_VERSION"
+ty = "u16"
+value = 3
+doc = "The two peers' version ranges do not overlap; sent unsealed (SPEC.md §5, §7.2)."
+[[const]]
+name = "ERR_PROTOCOL"
+ty = "u16"
+value = 4
+doc = "A frame or body that does not decode or is not allowed where it arrived, or a request the protocol forbids (SPEC.md §7.2)."
+[[const]]
+name = "ERR_BAD_JOIN"
+ty = "u16"
+value = 5
+doc = "A `Join` for an unknown session, a lane id outside 1..=8, a wrong tag or a replayed nonce (SPEC.md §9, §7.2)."
+[[const]]
+name = "ERR_UNKNOWN_METHOD"
+ty = "u16"
+value = 6
+doc = "A method the node does not serve (SPEC.md §7.2, §7.3)."
+[[const]]
+name = "ERR_INTERNAL"
+ty = "u16"
+value = 7
+doc = "The node failed for a reason that is neither the peer's nor the disk's, such as out of memory (SPEC.md §7.2)."
+[[const]]
+name = "ERR_BUSY"
+ty = "u16"
+value = 8
+doc = "A limit was reached (connections, sessions, in-flight RPCs, jobs, a destination in use, buffer budget); retry later (SPEC.md §7.2, §8)."
+
+# Noise XX handshake messages (SPEC.md §5). `noise` is the raw Noise message; its
+# payload is the struct named in the doc, encoded with these same rules.
+[[message]]
+name = "Hs1"
+type = 0x01
+doc = "Handshake step 1, client to node, unsealed (SPEC.md §5)."
+fields = [{ name = "noise", ty = "bytes", doc = "Noise XX message 1; its payload is a `HelloInfo`, in plaintext." }]
+
+[[message]]
+name = "Hs2"
+type = 0x02
+doc = "Handshake step 2, node to client (SPEC.md §5)."
+fields = [{ name = "noise", ty = "bytes", doc = "Noise XX message 2; its payload is a `ServerInfo`, encrypted." }]
+
+[[message]]
+name = "Hs3"
+type = 0x03
+doc = "Handshake step 3, client to node; every later frame on lane 0 is sealed (SPEC.md §5)."
+fields = [{ name = "noise", ty = "bytes", doc = "Noise XX message 3; its payload is a `ClientInfo`, encrypted." }]
+
+# First sealed frame from the server, after Hs3: under XX the server learns the
+# client's key only in message 3, so "do I know you" cannot travel earlier.
+[[message]]
+name = "Welcome"
+type = 0x04
+doc = "The node's first sealed frame, after `Hs3`: whether it knows the client's key (SPEC.md §5 step 4)."
+fields = [
+  { name = "knows_you", ty = "u8", doc = "Nonzero when the node already trusts the client's key (or a ticket admits it, SPEC.md §18.2); 0 means the client must pair." },
+  { name = "nonce_s", ty = "b16", doc = "The reveal of `ServerInfo.pair_commit`: BLAKE2b-256 of it must equal that commit (SPEC.md §4.6). Required, so it cannot be stripped." },
+]
+ext = [{ tag = 1, name = "launch_proof", ty = "b16", doc = "Proof of the launch token, sent only to the key in this node's trust slot when the slot carries a token (SPEC.md §5.2). Older clients skip it." }]
+
+# Pairing is a PAKE keyed by a random code that only the node's display shows (SPEC.md
+# §4.6, §5.5). The client sends PairPakeClient, the node answers PairPakeServer, then the
+# client proves it derived the same key with PairConfirm and the node answers PairResult.
+[[message]]
+name = "PairPakeClient"
+type = 0x0D
+doc = "Pairing step 1, client to node: the client's CPace public value (SPEC.md §4.6, §5.5)."
+fields = [{ name = "y", ty = "b32", doc = "`X25519(x, G)` for a fresh scalar x, with G derived from the handshake hash and the code." }]
+
+[[message]]
+name = "PairPakeServer"
+type = 0x0E
+doc = "Pairing step 2, node to client: the node's CPace public value (SPEC.md §4.6, §5.5)."
+fields = [{ name = "y", ty = "b32", doc = "`X25519(x, G)` for the node's fresh scalar x." }]
+
+[[message]]
+name = "PairConfirm"
+type = 0x05
+doc = "Pairing step 3, client to node: the client's key confirmation (SPEC.md §4.6, §5.5)."
+fields = [{ name = "mac", ty = "b32", doc = "Keyed BLAKE2b-256(key = K, \"client\" || h). Required." }]
+
+[[message]]
+name = "PairResult"
+type = 0x06
+doc = "Pairing step 4, node to client: the outcome; the session ends unless accepted (SPEC.md §4.6, §5.5)."
+fields = [
+  { name = "accepted", ty = "u8", doc = "1 when the node verified the client's `mac` and stored its key, else 0." },
+  { name = "mac", ty = "b32", doc = "Keyed BLAKE2b-256(key = K, \"server\" || h) when accepted, else zero: the node's key confirmation, which the client checks before it stores the node." },
+]
+
+# A data lane (SPEC.md §9). Both nonces are fresh random per join and feed the lane
+# keys, so no two joins of one lane id ever share a key (§4.3).
+[[message]]
+name = "Join"
+type = 0x07
+doc = "Opens a data lane: the first frame on a new connection, client to node, unsealed (SPEC.md §9)."
+fields = [
+  { name = "session_id", ty = "b16", doc = "The session's id, from `ServerInfo`." },
+  { name = "lane_id", ty = "u16", doc = "The lane, 1..=8." },
+  { name = "client_nonce", ty = "b16", doc = "Fresh random per join; feeds the lane keys (SPEC.md §4.3)." },
+  { name = "tag", ty = "b16", doc = "The Join proof (SPEC.md §4.5)." },
+]
+
+[[message]]
+name = "JoinAck"
+type = 0x08
+doc = "Accepts a `Join`, node to client, unsealed; both sides then seal under the lane's keys (SPEC.md §9)."
+fields = [
+  { name = "lane_id", ty = "u16", doc = "The lane, as in the `Join`." },
+  { name = "server_nonce", ty = "b16", doc = "Fresh random per join; feeds the lane keys (SPEC.md §4.3)." },
+  { name = "tag", ty = "b16", doc = "The JoinAck proof (SPEC.md §4.5)." },
+]
+
+[[message]]
+name = "Ping"
+type = 0x09
+doc = "Heartbeat, every 2 s by default on every connection, channel 0; answered by `Pong` (SPEC.md §6)."
+fields = [
+  { name = "seq", ty = "u32", doc = "The sender's sequence number, echoed in the `Pong`." },
+  { name = "t_us", ty = "u64", doc = "The sender's monotonic clock in microseconds when the Ping was written; RTT = now - t_us." },
+]
+
+[[message]]
+name = "Pong"
+type = 0x0A
+doc = "Answer to a `Ping`, with its values (SPEC.md §6)."
+fields = [
+  { name = "seq", ty = "u32", doc = "The Ping's `seq`." },
+  { name = "t_us", ty = "u64", doc = "The Ping's `t_us`." },
+]
+
+[[message]]
+name = "Error"
+type = 0x0B
+doc = "Reports why the connection ends; the sender then closes it (SPEC.md §6, §7.2)."
+fields = [
+  { name = "code", ty = "u16", doc = "An `ERR_*` code." },
+  { name = "message", ty = "str", doc = "The cause, as text." },
+]
+
+[[message]]
+name = "Bye"
+type = 0x0C
+doc = "Ends the session (SPEC.md §6)."
+fields = [{ name = "reason", ty = "u8", doc = "Not interpreted by version 1; implementations send 0." }]
+
+[[message]]
+name = "RpcRequest"
+type = 0x60
+doc = "An RPC call on the control connection; the frame's channel is the request id (SPEC.md §7)."
+fields = [
+  { name = "method", ty = "u16", doc = "A `METHOD_*` number, or an application's (SPEC.md §7.1, §7.3)." },
+  { name = "body", ty = "bytes", doc = "The method's request body, at most 56 KiB (SPEC.md §7.4)." },
+]
+
+[[message]]
+name = "RpcResponse"
+type = 0x61
+doc = "The answer to an `RpcRequest`, on the request's channel (SPEC.md §7)."
+fields = [
+  { name = "status", ty = "u16", doc = "`STATUS_OK` or an `ERR_*` code (SPEC.md §7.2)." },
+  { name = "body", ty = "bytes", doc = "On `STATUS_OK` the method's reply body; on an error the cause as UTF-8 text. At most 256 KiB (SPEC.md §7.4)." },
+]
+
+[[struct]]
+name = "NodeInfo"
+doc = "The `node.info` reply (SPEC.md §7.1)."
+fields = [
+  { name = "version", ty = "str", doc = "The node software's version." },
+  { name = "platform", ty = "str", doc = "The platform the node runs on." },
+  { name = "name", ty = "str", doc = "The node's name." },
+]
+ext = [{ tag = 1, name = "firmware", ty = "str", doc = "The platform's system software version." }]
+
+[[struct]]
+name = "HelloInfo"
+doc = "The payload of `Hs1`: the protocol versions the client speaks (SPEC.md §5 step 1)."
+fields = [
+  { name = "version_min", ty = "u16", doc = "The lowest protocol version the client speaks." },
+  { name = "version_max", ty = "u16", doc = "The highest protocol version the client speaks." },
+  { name = "caps", ty = "u64", doc = "Client capabilities; 0 in version 1." },
+]
+
+[[struct]]
+name = "ServerInfo"
+doc = "The payload of `Hs2` (SPEC.md §5 step 2)."
+fields = [
+  { name = "version", ty = "u16", doc = "The protocol version the node chose from the client's range." },
+  { name = "caps", ty = "u64", doc = "The node's `CAP_*` bits." },
+  { name = "session_id", ty = "b16", doc = "Random id of this session; lanes name it in `Join`." },
+  { name = "pair_commit", ty = "b32", doc = "BLAKE2b-256(nonce_s), revealed in `Welcome` (SPEC.md §4.6). Kept for wire stability." },
+]
+ext = [{ tag = 1, name = "name", ty = "str", doc = "The node's name, for the client to show." }]
+
+[[struct]]
+name = "ClientInfo"
+doc = "The payload of `Hs3` (SPEC.md §5 step 3)."
+fields = [{ name = "nonce_c", ty = "b16", doc = "The client's pairing nonce (SPEC.md §4.6). Required; kept for wire stability." }]
+ext = [
+  { tag = 1, name = "name", ty = "str", doc = "The client's name, which the node stores with its key when they pair." },
+  { tag = 2, name = "token", ty = "b16", doc = "A node sending to another node shows the ticket that node's `c2c.allow` handed out; it admits that one key for that one job (SPEC.md §18.2)." },
+]
+
+[[struct]]
+name = "PairingOpen"
+doc = "The `pairing.open` request (SPEC.md §5 step 6, §7.1)."
+fields = [{ name = "seconds", ty = "u16", doc = "How long to keep the pairing window open, in seconds; at most 600." }]
+
+[[struct]]
+name = "CryptoBench"
+doc = "The `crypto.bench` request (SPEC.md §7.1)."
+fields = [{ name = "mib", ty = "u16", doc = "How much data to seal and open, in MiB." }]
+
+[[struct]]
+name = "CryptoBenchResult"
+doc = "The `crypto.bench` reply, a diagnostic (SPEC.md §7.1)."
+fields = [
+  { name = "bytes", ty = "u64", doc = "The bytes measured." },
+  { name = "micros", ty = "u64", doc = "Microseconds to seal `bytes` as 1 MiB frames." },
+]
+ext = [
+  { tag = 1, name = "open_micros", ty = "u64", doc = "Microseconds to open them." },
+  { tag = 2, name = "backend", ty = "str", doc = "The ChaCha20 implementation in use: \"avx2\" or \"portable\"." },
+]
+
+# ── Data plane (SPEC.md §11–§16) ─────────────────────────────────────────────
+# Every data-plane message has `job_id` first: routers read body[0..16].
+
+[[const]]
+name = "CAP_DATA_PLANE"
+ty = "u64"
+value = 1
+doc = "`ServerInfo.caps` bit: the node hosts the data plane, jobs and methods 16–19 (SPEC.md §5 step 2)."
+[[const]]
+name = "CAP_MGMT"
+ty = "u64"
+value = 2
+doc = "`ServerInfo.caps` bit: the node serves the methods 4 and up other than 16–19, among them `job.run`, `job.list` and the application's (SPEC.md §5 step 2, §7.3)."
+[[const]]
+name = "CAP_SHARED_JOBS"
+ty = "u64"
+value = 4
+doc = "`ServerInfo.caps` bit: any paired device may read and cancel a transfer and take over a parked upload (SPEC.md §18.5)."
+[[const]]
+name = "METHOD_JOB_COPY"
+ty = "u16"
+value = 16
+doc = "RPC `job.copy`: `JobCopy` request, `Status` reply; a copy or move on the node itself (SPEC.md §7.1, §15.5)."
+[[const]]
+name = "METHOD_JOB_STATUS"
+ty = "u16"
+value = 17
+doc = "RPC `job.status`: `JobRef` request, `Status` reply (SPEC.md §7.1)."
+[[const]]
+name = "METHOD_JOB_CANCEL"
+ty = "u16"
+value = 18
+doc = "RPC `job.cancel`: `JobRef` request, empty reply (SPEC.md §7.1, §11.7)."
+[[const]]
+name = "METHOD_DISK_CALIBRATE"
+ty = "u16"
+value = 19
+doc = "RPC `disk.calibrate`: `DiskCalibrate` request, `DiskCalibrateResult` reply (SPEC.md §16.10)."
+[[const]]
+name = "METHOD_C2C_ALLOW"
+ty = "u16"
+value = 22
+doc = "RPC `c2c.allow`, on the receiving node: `C2cAllow` request, `C2cTicket` reply; admits one job from another node (SPEC.md §18.1)."
+[[const]]
+name = "METHOD_C2C_SEND"
+ty = "u16"
+value = 23
+doc = "RPC `c2c.send`, on the sending node: `C2cSend` request, `Status` reply; sends to another node directly (SPEC.md §18.2)."
+[[const]]
+name = "ERR_PATH"
+ty = "u16"
+value = 9
+doc = "A path that breaks SPEC.md §11.2, a root the node's policy refuses, or a source or staging parent that cannot be used (SPEC.md §7.2)."
+[[const]]
+name = "ERR_NO_SPACE"
+ty = "u16"
+value = 10
+doc = "The destination drive is full (SPEC.md §7.2)."
+[[const]]
+name = "ERR_UNKNOWN_JOB"
+ty = "u16"
+value = 11
+doc = "A job the node does not list, or lists for another peer key (SPEC.md §7.2)."
+[[const]]
+name = "ERR_IO"
+ty = "u16"
+value = 12
+doc = "A disk or filesystem failure on the node's side (SPEC.md §7.2)."
+[[const]]
+name = "ERR_VERIFY"
+ty = "u16"
+value = 13
+doc = "Bytes that do not match their root and that a `FileRetry` cannot fix (SPEC.md §7.2)."
+[[const]]
+name = "ERR_EXISTS"
+ty = "u16"
+value = 14
+doc = "A destination that already exists and may not be replaced (SPEC.md §7.2)."
+[[const]]
+name = "ERR_CANCELLED"
+ty = "u16"
+value = 15
+doc = "The job was cancelled (SPEC.md §7.2)."
+[[const]]
+name = "ERR_CROSS_DEVICE"
+ty = "u16"
+value = 16
+doc = "A rename whose two sides are on different devices; never attempted (SPEC.md §7.2)."
+[[const]]
+name = "ERR_CREDIT"
+ty = "u16"
+value = 17
+doc = "A lane frame larger than the credit the receiver granted (SPEC.md §12.4)."
+[[const]]
+name = "ERR_STALLED"
+ty = "u16"
+value = 18
+doc = "The receiver ended a job whose sender kept the link alive but sent no file data (SPEC.md §12.8)."
+[[const]]
+name = "ERR_PAIRING_CODE"
+ty = "u16"
+value = 19
+doc = "Client side: the node refused the typed pairing code, or could not prove it knows it (SPEC.md §5.5, §7.2)."
+# Job kinds, as seen by the node that receives JobOpen.
+[[const]]
+name = "JOB_UPLOAD"
+ty = "u8"
+value = 1
+doc = "Job kind: the node that receives the `JobOpen` receives the files (SPEC.md §11.3)."
+[[const]]
+name = "JOB_DOWNLOAD"
+ty = "u8"
+value = 2
+doc = "Job kind: the node that receives the `JobOpen` sends the files (SPEC.md §11.3)."
+[[const]]
+name = "JOB_COPY"
+ty = "u8"
+value = 3
+doc = "Job kind: the node copies `src` to the root locally (`job.copy`, SPEC.md §11.3, §15.5)."
+[[const]]
+name = "POLICY_REPLACE"
+ty = "u8"
+value = 0
+doc = "Job policy: send everything the receiver's map does not list (SPEC.md §11.4)."
+[[const]]
+name = "POLICY_SKIP_EXISTING"
+ty = "u8"
+value = 1
+doc = "Job policy: the receiver marks a file done when one of the same size and mtime seconds exists (SPEC.md §11.4)."
+[[const]]
+name = "POLICY_VERIFY"
+ty = "u8"
+value = 2
+doc = "Job policy: the receiver marks a file done when an existing file of the same size hashes to the root in `ManifestEntry.root` (SPEC.md §11.4)."
+[[const]]
+name = "JF_SINGLE_FILE"
+ty = "u32"
+value = 1
+doc = "Job flag: the root is a file path and the manifest has one file entry (SPEC.md §11.8)."
+[[const]]
+name = "JF_ORDERED"
+ty = "u32"
+value = 2
+doc = "Job flag: the receiver consumes the files in manifest order, as a download into a zip (SPEC.md §11.8)."
+[[const]]
+name = "JF_UNSAFE_READ"
+ty = "u32"
+value = 4
+doc = "Job flag: the sender may read outside the roots its read policy allows, such as system files (SPEC.md §11.8)."
+[[const]]
+name = "JF_MOVE"
+ty = "u32"
+value = 8
+doc = "Job flag, `job.copy` only: delete each source file once its copy is durable (SPEC.md §11.8)."
+[[const]]
+name = "JF_OVERWRITE"
+ty = "u32"
+value = 16
+doc = "Job flag, `job.copy` only: replace destination files that already exist; unset, an existing destination root is refused with `ERR_EXISTS` (SPEC.md §11.8)."
+[[const]]
+name = "ENTRY_FILE"
+ty = "u8"
+value = 0
+doc = "`ManifestEntry.kind`: a file (SPEC.md §11.3)."
+[[const]]
+name = "ENTRY_DIR"
+ty = "u8"
+value = 1
+doc = "`ManifestEntry.kind`: a directory (SPEC.md §11.3)."
+[[const]]
+name = "GROUP_SHIFT"
+ty = "u8"
+value = 20
+doc = "log2 of the verification group size: files are hashed in groups of 1 MiB (SPEC.md §13.1)."
+[[const]]
+name = "LARGE_CUTOFF"
+ty = "u32"
+value = 262144
+doc = """
+Bytes: a file of at least this size is a large file and travels in `Chunk`s; smaller files
+travel whole as `BundleRecord`s. A protocol constant both sides use (SPEC.md §12.2)."""
+[[const]]
+name = "BN_NONE"
+ty = "u8"
+value = 0
+doc = "Bottleneck: none reported yet (SPEC.md §16)."
+[[const]]
+name = "BN_NETWORK"
+ty = "u8"
+value = 1
+doc = "Bottleneck: the network (SPEC.md §16)."
+[[const]]
+name = "BN_SOURCE"
+ty = "u8"
+value = 2
+doc = "Bottleneck: the sender's source reads (SPEC.md §16)."
+[[const]]
+name = "BN_DISK"
+ty = "u8"
+value = 3
+doc = "Bottleneck: the receiver's disk; its workers are at their maximum or adding one did not help (SPEC.md §16.9)."
+[[const]]
+name = "BN_WORKERS"
+ty = "u8"
+value = 4
+doc = "Bottleneck: the receiver's workers, while it is still adding them (SPEC.md §16.9)."
+[[const]]
+name = "BN_CREDIT"
+ty = "u8"
+value = 5
+doc = "Bottleneck: the sender waits for credit and the receiver reported no bottleneck of its own (SPEC.md §16)."
+[[const]]
+name = "RETRY_VERIFY"
+ty = "u16"
+value = 1
+doc = "`FileRetry.reason`: the file's root did not match (SPEC.md §11.9)."
+[[const]]
+name = "RETRY_IO"
+ty = "u16"
+value = 2
+doc = "`FileRetry.reason`: the receiver lost the part file or outboard (SPEC.md §11.9)."
+[[const]]
+name = "RETRY_CHANGED"
+ty = "u16"
+value = 3
+doc = "`FileRetry.reason`: the record's length disagrees with the manifest (SPEC.md §11.9)."
+
+[[struct]]
+name = "ManifestEntry"
+doc = "One manifest entry, a file or a directory (SPEC.md §11.2, §11.3)."
+fields = [
+  { name = "file_id", ty = "u32", doc = "The entry's index in manifest order, from 0." },
+  { name = "kind", ty = "u8", doc = "`ENTRY_FILE` or `ENTRY_DIR`." },
+  { name = "mode", ty = "u32", doc = "Unix permission bits." },
+  { name = "size", ty = "u64", doc = "Size in bytes." },
+  { name = "mtime", ty = "u64", doc = "Last modification, in seconds since the Unix epoch; 0 when unknown, and always 0 for a directory (SPEC.md §11.4)." },
+  { name = "path", ty = "str", doc = "Relative to the job root, '/'-separated (SPEC.md §11.2)." },
+]
+ext = [{ tag = 1, name = "root", ty = "b32", doc = "The file's BLAKE3 root, under `POLICY_VERIFY` only (SPEC.md §11.4)." }]
+
+[[struct]]
+name = "FileRun"
+doc = "Files `first..first + count` (records item)."
+fields = [
+  { name = "first", ty = "u32", doc = "The first file id." },
+  { name = "count", ty = "u32", doc = "How many consecutive file ids." },
+]
+
+[[struct]]
+name = "FileRange"
+doc = "Bytes `offset..offset + len` of one file (records item)."
+fields = [
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "offset", ty = "u64", doc = "The first byte." },
+  { name = "len", ty = "u64", doc = "The length in bytes." },
+]
+
+[[struct]]
+name = "BundleRecord"
+doc = "One whole small file, inside a `Bundle` (SPEC.md §12.2, §15.2)."
+fields = [
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "root", ty = "b32", doc = "BLAKE3 of `data` (SPEC.md §13.2)." },
+  { name = "data", ty = "bytes", doc = "The file's whole content." },
+]
+
+[[struct]]
+name = "RootItem"
+doc = "A file's BLAKE3 root, as the journal records it (records item, SPEC.md §14.2)."
+fields = [
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "root", ty = "b32", doc = "Its BLAKE3 root (SPEC.md §13.1)." },
+]
+
+[[message]]
+name = "JobOpen"
+type = 0x20
+doc = "Opens a job, or reopens a known one to resume it; opener to peer, control connection (SPEC.md §11.3, §11.5)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job's id, chosen by the opener (SPEC.md §11.1)." },
+  { name = "kind", ty = "u8", doc = "A `JOB_*` kind, as seen by the node that receives this." },
+  { name = "policy", ty = "u8", doc = "A `POLICY_*`." },
+  { name = "flags", ty = "u32", doc = "`JF_*` bits (SPEC.md §11.8)." },
+  { name = "root", ty = "str", doc = "Upload: the destination; download: the source." },
+]
+ext = [
+  { tag = 1, name = "src", ty = "str", doc = "`JOB_COPY`: the source." },
+  { tag = 2, name = "credit", ty = "u64", doc = "`JOB_DOWNLOAD`: the credit the opener grants, in bytes (SPEC.md §12.4)." },
+]
+
+[[message]]
+name = "JobOpenAck"
+type = 0x21
+doc = "The answer to a `JobOpen` (SPEC.md §11.3)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "status", ty = "u16", doc = "`STATUS_OK` or an `ERR_*` refusal." },
+  { name = "credit", ty = "u64", doc = "`JOB_UPLOAD`: lane-frame body bytes the sender may have outstanding (SPEC.md §12.4)." },
+  { name = "staged", ty = "u8", doc = "1 when the receiver writes under `<root>.ava-part/` and renames at the end (SPEC.md §11.6)." },
+  { name = "workers", ty = "u8", doc = "The receiver's current number of write workers." },
+]
+ext = [{ tag = 1, name = "message", ty = "str", doc = "The cause of a refusal, as text." }]
+
+[[message]]
+name = "ManifestPage"
+type = 0x22
+doc = "One page of the manifest, sender to receiver; pages are sized to fit a control frame (SPEC.md §11.3, §11.7)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "entries", ty = "records", of = "ManifestEntry", doc = "The next entries, in manifest order." },
+]
+
+[[message]]
+name = "ManifestEnd"
+type = 0x23
+doc = "Ends the manifest, sender to receiver (SPEC.md §11.3)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "files", ty = "u32", doc = "How many entries are files." },
+  { name = "bytes", ty = "u64", doc = "The files' total size in bytes." },
+  { name = "manifest_hash", ty = "b32", doc = "BLAKE3 over every entry, without its ext (SPEC.md §11.3)." },
+]
+
+[[message]]
+name = "JobMap"
+type = 0x24
+doc = "What the receiver already has, receiver to sender; everything else is needed. May span pages (SPEC.md §11.5)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "status", ty = "u16", doc = "`STATUS_OK`, or an `ERR_*` such as `ERR_UNKNOWN_JOB` for a `Resume` the receiver cannot serve." },
+  { name = "last", ty = "u8", doc = "1 on the final page." },
+  { name = "done", ty = "records", of = "FileRun", doc = "Files the receiver already has whole." },
+  { name = "partial", ty = "records", of = "FileRange", doc = "Durable ranges of unfinished files." },
+]
+ext = [
+  { tag = 1, name = "message", ty = "str", doc = "The cause of an error status, as text." },
+  { tag = 2, name = "held", ty = "u64", doc = """
+Final page: bytes the drive already holds for this job's unfinished large files (the allocated
+blocks of their part files, at most each file's size). A sender that checks free space credits it;
+absent means none is claimed (SPEC.md §11.5).""" },
+]
+
+[[message]]
+name = "Resume"
+type = 0x25
+doc = "Fast-path resume when the sender still holds the same manifest; answered by `JobMap` (SPEC.md §11.5)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "manifest_hash", ty = "b32", doc = "The hash of the manifest the sender holds." },
+]
+
+[[message]]
+name = "Chunk"
+type = 0x26
+doc = "Part of a large file, on a lane only (SPEC.md §12.2)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "offset", ty = "u64", doc = "Where `data` starts in the file: a multiple of 1 MiB." },
+  { name = "data", ty = "bytes", doc = "Whole 1 MiB groups, except at the end of the file." },
+]
+
+[[message]]
+name = "Bundle"
+type = 0x27
+doc = "Small files, whole, on a lane only (SPEC.md §12.2)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "records", ty = "records", of = "BundleRecord", doc = "One record per file." },
+]
+
+[[message]]
+name = "Received"
+type = 0x28
+doc = "A lane frame is in the receiver's memory, before any disk work (SPEC.md §12.3)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "lane", ty = "u16", doc = "The lane the frame arrived on." },
+  { name = "seq", ty = "u32", doc = "The frame's header channel: the sender's per-job sequence number (SPEC.md §12.1)." },
+]
+
+[[message]]
+name = "Credit"
+type = 0x29
+doc = "Buffer space returned to the sender; adds to its window (SPEC.md §12.4)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "bytes", ty = "u64", doc = "Lane-frame body bytes freed." },
+]
+
+[[message]]
+name = "Durable"
+type = 0x2A
+doc = "Data synced and journaled, receiver to sender; never paged (SPEC.md §12.6)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "files", ty = "records", of = "FileRun", doc = "Files now complete and durable." },
+  { name = "ranges", ty = "records", of = "FileRange", doc = "Newly durable ranges of unfinished files." },
+]
+
+[[message]]
+name = "FileRoot"
+type = 0x2B
+doc = "A large file's BLAKE3 root, sender to receiver, once its last group is read (SPEC.md §13.2)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "root", ty = "b32", doc = "Its BLAKE3 root (SPEC.md §13.1)." },
+]
+
+[[message]]
+name = "FileRetry"
+type = 0x2C
+doc = "The receiver dropped this file; send all of it again (SPEC.md §11.9, §13.3)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "file_id", ty = "u32", doc = "The file." },
+  { name = "reason", ty = "u16", doc = "A `RETRY_*` code." },
+]
+
+[[message]]
+name = "Status"
+type = 0x2D
+doc = "A job's progress: sent by the receiver every 250 ms, IGNORABLE; also the reply body of `job.status` and the job-starting methods (SPEC.md §7.1, §16.9)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "files_done", ty = "u32", doc = "Files finished." },
+  { name = "files_total", ty = "u32", doc = "Files in the job; 0 while unknown." },
+  { name = "bytes_received", ty = "u64", doc = "Bytes the receiver has received." },
+  { name = "bytes_durable", ty = "u64", doc = "Bytes durable on the receiver." },
+  { name = "bytes_total", ty = "u64", doc = "Bytes in the job; 0 while unknown." },
+  { name = "bottleneck", ty = "u8", doc = "The receiver's own `BN_*` bottleneck." },
+  { name = "workers", ty = "u8", doc = "The receiver's write workers." },
+  { name = "lanes", ty = "u8", doc = "Data lanes in use." },
+  { name = "sequential", ty = "u8", doc = "Reserved for the sender's sequential choice (SPEC.md §16); version 1 receivers send 0." },
+]
+ext = [
+  { tag = 1, name = "current", ty = "str", doc = "The current step; on a failed job, the cause." },
+  { tag = 2, name = "state", ty = "u8", doc = "RPC replies: 0 running, 1 finished OK, 2 failed (SPEC.md §7.1)." },
+  { tag = 3, name = "result", ty = "bytes", doc = "`job.run`: the finished operation's reply body, at most 128 KiB (SPEC.md §7.1.1)." },
+  { tag = 4, name = "code", ty = "u16", doc = "A failed job's `ERR_*` code." },
+  { tag = 5, name = "unswept", ty = "u32", doc = "Durable-by-log: done files not yet durable in place; absent means 0 (SPEC.md §15.7)." },
+]
+
+[[message]]
+name = "JobDone"
+type = 0x2E
+doc = "The job ended, receiver to sender; sent after the last durable commit (SPEC.md §12.6)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "status", ty = "u16", doc = "`STATUS_OK` or the `ERR_*` the job ended with." },
+  { name = "files", ty = "u32", doc = "Files done." },
+  { name = "bytes", ty = "u64", doc = "Bytes durable." },
+]
+ext = [
+  { tag = 1, name = "message", ty = "str", doc = "The cause of a failure, as text." },
+  { tag = 2, name = "settling", ty = "u8", doc = "1: the log is durable but files are still being made durable in place (SPEC.md §15.7)." },
+]
+
+[[message]]
+name = "JobCancel"
+type = 0x2F
+doc = "Ends a job; either peer may send it, and the receiver keeps the journal (SPEC.md §11.7)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "reason", ty = "u16", doc = "The `ERR_*` code the ender wants reported, such as `ERR_CANCELLED` for a user's cancel." },
+]
+
+# Older receivers ignore SkipProgress as an unknown data-plane type.
+[[message]]
+name = "SkipProgress"
+type = 0x30
+doc = """
+Job-scoped liveness (SPEC.md §12.8): a sender reading past data the receiver already holds (a
+solid archive decoded from its start on resume) sends this at least every 10 s; the receiver
+counts it as progress for that job."""
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "bytes_skipped", ty = "u64", doc = "Running total of bytes the sender has read past for this job; informational." },
+]
+
+# RPC bodies (SPEC.md §16)
+[[struct]]
+name = "JobCopy"
+doc = "The `job.copy` request: copy or move on the node itself (SPEC.md §15.5)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job's id, chosen by the caller; a repeat with the same parameters answers the existing job." },
+  { name = "src", ty = "str", doc = "The source path." },
+  { name = "dest", ty = "str", doc = "The destination root." },
+  { name = "flags", ty = "u32", doc = "`JF_*` bits, such as `JF_MOVE` and `JF_OVERWRITE` (SPEC.md §11.8)." },
+]
+
+[[struct]]
+name = "JobRef"
+doc = "The `job.status` and `job.cancel` request (SPEC.md §7.1)."
+fields = [{ name = "job_id", ty = "b16", doc = "The job." }]
+
+[[struct]]
+name = "DiskCalibrate"
+doc = "The `disk.calibrate` request (SPEC.md §16.10)."
+fields = [
+  { name = "dir", ty = "str", doc = "Where to write the test files; must pass the node's write policy." },
+  { name = "files", ty = "u32", doc = "Files to write per measurement, at most 20,000." },
+  { name = "size", ty = "u32", doc = "Bytes per file, at most 1 MiB." },
+]
+
+[[struct]]
+name = "CalPoint"
+doc = "One `disk.calibrate` measurement (SPEC.md §16.10)."
+fields = [
+  { name = "workers", ty = "u8", doc = "The number of workers writing at once." },
+  { name = "files_per_s", ty = "u32", doc = "Files written and synced per second." },
+  { name = "create_us", ty = "u32", doc = "Mean microseconds to create and write one file." },
+  { name = "fsync_us", ty = "u32", doc = "Mean microseconds to fsync one file." },
+]
+
+[[struct]]
+name = "DiskCalibrateResult"
+doc = "The `disk.calibrate` reply: a hint for a client's starting worker count, not a contract (SPEC.md §16.10)."
+fields = [{ name = "points", ty = "records", of = "CalPoint", doc = "One measurement each at 1, 2, 4, 8 and 16 workers." }]
+
+# Node to node (SPEC.md §18).
+[[struct]]
+name = "C2cAllow"
+doc = "The `c2c.allow` request, on the receiving node (SPEC.md §18.1)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The one job the ticket admits." },
+  { name = "key", ty = "b32", doc = "The sending node's identity (its static X25519 key)." },
+  { name = "root", ty = "str", doc = "Where the job may write." },
+]
+
+[[struct]]
+name = "C2cTicket"
+doc = "The `c2c.allow` reply; the sending node shows the token in its `ClientInfo` (SPEC.md §18.1)."
+fields = [{ name = "token", ty = "b16", doc = "16 random bytes; valid for 10 minutes from its last use." }]
+
+[[struct]]
+name = "C2cSend"
+doc = "The `c2c.send` request, on the sending node (SPEC.md §18.2)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job, as allowed on the receiving node." },
+  { name = "host", ty = "str", doc = "The receiving node's IPv4 address." },
+  { name = "port", ty = "u16", doc = "Its TCP port." },
+  { name = "key", ty = "b32", doc = "Its identity; the handshake must prove it." },
+  { name = "token", ty = "b16", doc = "The ticket from its `c2c.allow`." },
+  { name = "src", ty = "str", doc = "The source path on the sending node." },
+  { name = "dest", ty = "str", doc = "The destination root on the receiving node." },
+  { name = "flags", ty = "u32", doc = "`JF_*` bits (SPEC.md §11.8)." },
+]
+[[const]]
+name = "METHOD_JOB_RUN"
+ty = "u16"
+value = 20
+doc = "RPC `job.run`: `JobRun` request, `Status` reply; starts an application operation as a job (SPEC.md §7.1.1)."
+[[const]]
+name = "METHOD_JOB_LIST"
+ty = "u16"
+value = 21
+doc = "RPC `job.list`: empty request, `JobListResult` reply (SPEC.md §7.1.1)."
+# Size constants of the application methods (SPEC.md §7.3-§7.4).
+[[const]]
+name = "RPC_TEXT_MAX"
+ty = "u32"
+value = 262128
+doc = "The largest `MgmtText` text in a reply, in bytes: the 256 KiB reply cap minus 16 (SPEC.md §7.3)."
+
+# Bodies shared by application methods and job.run (SPEC.md §7.1.1, §7.3).
+[[struct]]
+name = "MgmtText"
+doc = "An application method's opaque text body, in practice UTF-8 JSON (SPEC.md §7.3)."
+fields = [{ name = "body", ty = "bytes", doc = "The text, carried unchanged." }]
+ext = [{ tag = 1, name = "more", ty = "u8", doc = "1: call again with the next offset (paged methods); absent or 0 when the reply is complete." }]
+
+[[struct]]
+name = "JobRun"
+doc = "The `job.run` request (SPEC.md §7.1.1)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job's id, chosen by the caller." },
+  { name = "op", ty = "u8", doc = "The operation, a number the application registered." },
+  { name = "args", ty = "bytes", doc = "The operation's request body, opaque to the protocol; at most 60 KiB." },
+]
+
+[[struct]]
+name = "JobEntry"
+doc = "One job in a `job.list` reply (SPEC.md §7.1.1)."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "kind", ty = "u8", doc = "1 upload, 2 download, 3 copy, 4 operation." },
+  { name = "state", ty = "u8", doc = "0 running, 1 finished OK, 2 failed." },
+  { name = "files_done", ty = "u32", doc = "Files finished." },
+  { name = "files_total", ty = "u32", doc = "Files in the job; 0 while unknown." },
+  { name = "bytes_done", ty = "u64", doc = "Bytes done (durable, for a transfer)." },
+  { name = "bytes_total", ty = "u64", doc = "Bytes in the job; 0 while unknown." },
+]
+
+[[struct]]
+name = "JobListResult"
+doc = "The `job.list` reply: the caller's jobs of every kind (SPEC.md §7.1.1)."
+fields = [{ name = "jobs", ty = "records", of = "JobEntry", doc = "One entry per job." }]
+
+# Journal records (SPEC.md §14); never on the wire.
+[[struct]]
+name = "JnlOpen"
+doc = "Journal record kind 1: the job as opened (SPEC.md §14.1). Never on the wire."
+fields = [
+  { name = "job_id", ty = "b16", doc = "The job." },
+  { name = "manifest_hash", ty = "b32", doc = "The hash of the stored manifest." },
+  { name = "kind", ty = "u8", doc = "The job's `JOB_*` kind." },
+  { name = "flags", ty = "u32", doc = "The job's `JF_*` flags." },
+  { name = "staged", ty = "u8", doc = "Bit 0: the tree is written under `<root>.ava-part`; bit 1: the receiver took `<root>` with `mkdir` (SPEC.md §11.6)." },
+  { name = "root", ty = "str", doc = "The destination root." },
+]
+
+[[struct]]
+name = "JnlBatch"
+doc = "Journal record kind 2: one sync batch (SPEC.md §14.2). Never on the wire."
+fields = [
+  { name = "files", ty = "records", of = "FileRun", doc = "Files now done; their ranges are dropped." },
+  { name = "ranges", ty = "records", of = "FileRange", doc = "Durable ranges added." },
+  { name = "roots", ty = "records", of = "RootItem", doc = "Roots recorded." },
+]
+# Durable-by-log (SPEC.md §15.7): the pack extension is present when the batch wrote small files to
+# the pack log.
+ext = [
+  { tag = 1, name = "pack_segment", ty = "u32", doc = "Durable-by-log: the pack segment `pack.<n>` that holds this batch's `PackFile` records (SPEC.md §15.7)." },
+  { tag = 2, name = "pack_offset", ty = "u64", doc = "Where those records start in the segment, in bytes." },
+  { tag = 3, name = "pack_len", ty = "u64", doc = "Their length in bytes." },
+]
+
+[[struct]]
+name = "PackRef"
+doc = "Where a batch's `PackFile` records live; in journal snapshots only (SPEC.md §14.2, §15.7)."
+fields = [
+  { name = "segment", ty = "u32", doc = "The pack segment `pack.<n>`." },
+  { name = "offset", ty = "u64", doc = "Where the records start, in bytes." },
+  { name = "len", ty = "u64", doc = "Their length in bytes." },
+  { name = "first_file", ty = "u32", doc = "The first file id the records cover." },
+  { name = "count", ty = "u32", doc = "File ids covered: `first_file..first_file + count`." },
+]
+
+[[struct]]
+name = "JnlSweep"
+doc = "Journal record kind 6: these files are now durable in place (SPEC.md §14.2, §15.7). Never on the wire."
+fields = [{ name = "files", ty = "records", of = "FileRun", doc = "The files swept." }]
+
+[[struct]]
+name = "JnlReset"
+doc = "Journal record kind 3: forget one file's progress (SPEC.md §14.2). Never on the wire."
+fields = [{ name = "file_id", ty = "u32", doc = "The file." }]
+
+[[struct]]
+name = "JnlSnapshot"
+doc = "Journal record kind 4: the whole state, written when the journal is compacted (SPEC.md §14.1, §14.2). Never on the wire."
+fields = [
+  { name = "done", ty = "records", of = "FileRun", doc = "Files done." },
+  { name = "ranges", ty = "records", of = "FileRange", doc = "Durable ranges of unfinished files." },
+  { name = "roots", ty = "records", of = "RootItem", doc = "Roots recorded." },
+]
+# Records cannot be extensions, so these carry the records' item streams as bytes.
+ext = [
+  { tag = 1, name = "unswept", ty = "bytes", doc = "The `FileRun` item stream of done files not yet swept (SPEC.md §14.2)." },
+  { tag = 2, name = "segments", ty = "bytes", doc = "The `PackRef` item stream of the pack ranges whose files are not all swept (SPEC.md §14.2)." },
+]
+
+[[struct]]
+name = "JnlDone"
+doc = "Journal record kind 5: the job's final status (SPEC.md §14.2). Never on the wire."
+fields = [{ name = "status", ty = "u16", doc = "`STATUS_OK` or an `ERR_*` code." }]

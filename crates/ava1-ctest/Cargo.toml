@@ -1,0 +1,21 @@
+[package]
+name = "ava1-ctest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ava1 = { path = "../ava1" }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+# pure: the Rust oracle must not embed its own C BLAKE3, or its blake3_* symbols
+# collide with the vendored C ones ava1b3 links (a hard error on GNU ld).
+blake3 = { workspace = true, features = ["pure"] }
+serde_json.workspace = true
+ava1-chaos = { path = "../ava1-chaos" }
+tokio = { workspace = true, features = ["net", "time", "io-util", "macros", "rt-multi-thread"] }

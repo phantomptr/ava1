@@ -1,0 +1,40 @@
+[package]
+name = "ava1"
+description = "AVA1: an encrypted, resumable, multi-lane file-transfer protocol (client and node), designed for sending files to a PlayStation 5, with a C implementation tested against it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/ava1"
+readme = "README.md"
+keywords = ["file-transfer", "protocol", "ps5", "resumable", "noise"]
+categories = ["network-programming", "cryptography", "filesystem"]
+include = ["src/**", "examples/**", "README.md", "LICENSE-*"]
+
+# The public API is the same on every platform: one documentation build is enough.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "io-util", "rt"] }
+blake2 = "0.11"
+# Manifest hashes (SPEC.md §11.3); pinned by the workspace.
+blake3.workspace = true
+getrandom = "0.4"
+# Frame AEAD: assembly ChaCha20-Poly1305 (NEON on aarch64/armv7, AVX2 on x86-64). Already
+# in the tree through snow and rustls, so it builds for every shipped target.
+ring = { version = "0.17", default-features = false }
+snow = { version = "0.10", features = ["risky-raw-split"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+zeroize = "1"
+
+[dev-dependencies]
+# The frame AEAD before ring: the differential oracle in tests/aead.rs.
+chacha20poly1305 = "0.11"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "io-util", "macros", "rt-multi-thread", "test-util"] }
+ava1-chaos = { path = "../ava1-chaos" }

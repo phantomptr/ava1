@@ -1,0 +1,6 @@
+# LeakSanitizer suppressions for `AVA1_CTEST_SANITIZE=1 cargo test -p ava1-ctest`.
+#
+# Only TEST-SIDE intentional leaks may be listed here, each with its reason. Not one C leak from the
+# library is suppressed: a leak whose stack runs through c/ or csrc/ fails the job.
+#
+# None today.

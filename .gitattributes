@@ -1,0 +1,6 @@
+# Text stays LF on every checkout: the generated codecs and the embedded schema are compared byte
+# for byte, and the test vectors are hashed.
+* text=auto eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.S text eol=lf
