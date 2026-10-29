@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in the crates or the C library isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report!
+        Security issues go privately to the maintainer instead (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. What did you expect? What actually happened?
+      placeholder: "When I ..."
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part?
+      multiple: true
+      options:
+        - Rust crate (ava1), client side
+        - Rust crate (ava1), node side
+        - C library (libava1)
+        - Code generator (ava1-gen)
+        - Specification or test vectors
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "e.g. ava1 1.0.2, or the commit you built the C library from"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "e.g. macOS 15 on Apple Silicon, Ubuntu 24.04 x86-64, PS5 9.60"
+    validations:
+      required: true
+  - type: input
+    id: peer
+    attributes:
+      label: The other side
+      description: What runs on the other end of the connection, and its version, if it is involved.
+      placeholder: "e.g. the C node in ps5upload, on a PS5"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: The error and a few lines of context. The library's diagnostic lines go to standard error unless you set `ava1::diag::set_sink`.
+      render: shell
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest program or the exact steps that show it, if you have them.
+      placeholder: "1. ...\n2. ...\n3. ..."
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Once
+        - Sometimes
+        - Every time

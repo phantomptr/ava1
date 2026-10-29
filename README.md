@@ -1,9 +1,19 @@
 # AVA1
 
-[![ci](https://github.com/phantomptr/ava1/actions/workflows/ci.yml/badge.svg)](https://github.com/phantomptr/ava1/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/ava1.svg)](https://crates.io/crates/ava1)
-[![docs.rs](https://img.shields.io/docsrs/ava1)](https://docs.rs/ava1)
-[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/png/lockup-horizontal-white.png" />
+    <img src="branding/png/lockup-horizontal-black.png" alt="AVA1" width="420" />
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://github.com/phantomptr/ava1/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/phantomptr/ava1/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="https://crates.io/crates/ava1"><img alt="crates.io" src="https://img.shields.io/crates/v/ava1" /></a>
+  <a href="https://docs.rs/ava1"><img alt="docs.rs" src="https://img.shields.io/docsrs/ava1" /></a>
+  <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" /></a>
+  <a href="https://discord.gg/fzK3xddtrM"><img alt="discord" src="https://img.shields.io/badge/discord-join-5865F2" /></a>
+</p>
 
 **AVA1 (Adaptive Verified Assembly, version 1)** is a protocol for moving large files and folders
 between two devices over TCP, fast and safely. It was designed for sending files from a PC, phone or
@@ -106,6 +116,7 @@ crates/ava1-ctest  the C library's tests, driven from Rust against the Rust impl
 crates/ava1-chaos  a TCP proxy that misbehaves on purpose, for the tests
 c/               the C implementation; c/gen is generated, c/third_party is Monocypher and BLAKE3
 docs/            using the C library, extending the protocol
+branding/        the logo: SVG masters, PNGs (scripts/brand-assets.py renders them)
 ```
 
 ## Development
@@ -125,6 +136,21 @@ The wire format is version 1. Its frames start with the bytes `A1`, and it grows
 older peers through tagged extension fields, ignorable frame types and capability bits. A change
 that old peers could not follow would be a new protocol with a new name. The crates follow
 semantic versioning separately from that.
+
+## Author
+
+Created and maintained by **PhantomPtr**.
+
+* [Follow me on X (@phantomptr)](https://x.com/phantomptr)
+
+## Support
+
+If you find AVA1 useful, consider buying me a coffee!
+
+* Discord server: [https://discord.gg/fzK3xddtrM](https://discord.gg/fzK3xddtrM)
+* Support me on Ko-fi: [https://ko-fi.com/B0B81S0WUA](https://ko-fi.com/B0B81S0WUA)
+
+[![Support me on Ko-fi](https://storage.ko-fi.com/cdn/kofi3.png?v=3)](https://ko-fi.com/B0B81S0WUA)
 
 ## License
 

@@ -86,9 +86,14 @@
 //! [specification]: https://github.com/phantomptr/ava1/blob/main/spec/SPEC.md
 //! [repository]: https://github.com/phantomptr/ava1
 //! [ps5upload]: https://github.com/phantomptr/ps5upload
-#![warn(missing_docs)]
-
 //! [examples]: https://github.com/phantomptr/ava1/tree/main/crates/ava1/examples
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/phantomptr/ava1/main/branding/png/icon-256.png"
+)]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/phantomptr/ava1/main/branding/png/favicon-32.png"
+)]
+#![warn(missing_docs)]
 pub mod conn;
 pub mod cpace;
 pub mod crc32c;
