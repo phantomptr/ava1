@@ -11,6 +11,7 @@
 #include "ava1_frame.h"
 #include "ava1_noise.h"
 #include "ava1_platform.h"
+#include "ava1_thread.h"
 #include "ava1_wire.h"
 #include "monocypher.h"
 
@@ -366,7 +367,7 @@ int ava1_conn_post(ava1_conn_t *c, uint8_t type, uint8_t flags, uint32_t channel
             (void)pthread_attr_init(&attr);
             (void)pthread_attr_setstacksize(&attr, 64u * 1024u);
             (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-            if (pthread_create(&c->q_thread, &attr, q_writer, c) != 0) rc = AVA1_E_IO;
+            if (ava1_thread_create(&c->q_thread, &attr, q_writer, c) != 0) rc = AVA1_E_IO;
             else c->q_started = 1;
             pthread_attr_destroy(&attr);
         }

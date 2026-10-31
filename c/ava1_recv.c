@@ -1128,7 +1128,8 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
                 if (!(d[nd].dir = strdup(parent))) status = AVA1_ERR_INTERNAL;
                 else d[nd++].id = i;
             } else {
-                snprintf(msg, cap, "cannot create %.100s", rel);
+                int e = errno;
+                snprintf(msg, cap, "cannot create %.80s: %s", rel, strerror(e));
                 status = AVA1_ERR_IO;
             }
         }

@@ -1957,3 +1957,22 @@ async fn a_flood_of_sessions_shows_the_newest_code_and_drops_the_older_ones_on_t
         "the screen shows the newest session's code"
     );
 }
+
+extern "C" {
+    fn ava1_server_resumed(mono_prev: u64, mono_now: u64, real_prev: u64, real_now: u64) -> i32;
+}
+
+#[test]
+fn the_accept_loop_reads_a_frozen_process_from_either_clock() {
+    let s = 1_000u64;
+    let r = |mp, mn, rp, rn| unsafe { ava1_server_resumed(mp, mn, rp, rn) };
+    // One 5 s window, both clocks together: no resume.
+    assert_eq!(r(0, 5 * s, 100 * s, 105 * s), 0);
+    // A monotonic clock that counts the sleep: a long gap on it.
+    assert_eq!(r(0, 60 * s, 100 * s, 160 * s), 1);
+    // A monotonic clock that stopped (a console's rest mode): the wall clock ran ahead.
+    assert_eq!(r(0, 5 * s, 100 * s, 480 * s), 1);
+    // A wall clock set back, or a little ahead: not a resume.
+    assert_eq!(r(0, 5 * s, 100 * s, 50 * s), 0);
+    assert_eq!(r(0, 5 * s, 100 * s, 112 * s), 0);
+}

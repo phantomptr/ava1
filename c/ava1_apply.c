@@ -546,6 +546,27 @@ static void worker_fail(ava1_job_t *j, uint16_t status, const char *what, int er
     pthread_mutex_unlock(&j->mu);
 }
 
+/* The same for a failure on one file: `<what> <rel path>: <errno text>`, the path relative to the
+ * destination and cut from the front (its end tells files apart) so the cause still fits. */
+static void worker_fail_file(ava1_job_t *j, uint16_t status, const char *what, int err, uint32_t file_id) {
+    const char *rel = file_id < j->m.n ? ava1_mstore_path(&j->m, file_id) : NULL;
+    char shown[72];
+    size_t l;
+    if (!rel || !rel[0]) {
+        worker_fail(j, status, what, err);
+        return;
+    }
+    l = strlen(rel);
+    if (l >= sizeof shown) snprintf(shown, sizeof shown, "...%s", rel + l - (sizeof shown - 4));
+    else snprintf(shown, sizeof shown, "%s", rel);
+    pthread_mutex_lock(&j->mu);
+    if (!j->finished && !j->final_status) {
+        j->final_status = status;
+        snprintf(j->message, sizeof j->message, "%s %s%s%s", what, shown, err ? ": " : "", err ? strerror(err) : "");
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
 /* ---- credit ------------------------------------------------------------------------ */
 
 int ava1_apply_reserve(ava1_job_t *j, size_t n) {
@@ -1430,6 +1451,7 @@ static void run_sweep(ava1_job_t *j) {
 
 static void run_work(ava1_job_t *j, ava1_work_t *w) {
     int rc = 0;
+    uint32_t failed_id = w->file_id; /* the file a failure is about (a bundle: its failing record's) */
     if (w->kind == AVA1_W_COMMIT) {
         run_commit(j, w->file_id);
         return;
@@ -1445,11 +1467,14 @@ static void run_work(ava1_job_t *j, ava1_work_t *w) {
         ava1_bundle_record_t r;
         int k;
         ava1_r_init(&it, w->data, w->len);
-        while (rc == 0 && (k = ava1_bundle_record_next(&it, &r)) == 1) rc = apply_record(j, &r);
+        while (rc == 0 && (k = ava1_bundle_record_next(&it, &r)) == 1) {
+            rc = apply_record(j, &r);
+            failed_id = r.file_id;
+        }
     }
     if (rc == -ENOSPC) worker_fail(j, AVA1_ERR_NO_SPACE, "the destination drive is full", ENOSPC);
     else if (rc == BAD_RECORD) worker_fail(j, AVA1_ERR_PROTOCOL, "a bundle record names no file", 0);
-    else if (rc < 0) worker_fail(j, AVA1_ERR_IO, "write failed", -rc);
+    else if (rc < 0) worker_fail_file(j, AVA1_ERR_IO, "write failed:", -rc, failed_id);
     release_owned(w->owned, w->owned_cap);
     give_back(j, w->owned_len);
 }

@@ -919,3 +919,73 @@ fn gc_keeps_a_recent_staged_upload_and_its_copy() {
     assert_eq!(jobs_gc(&t.join("jobs"), 0, 86_400), 0);
     assert!(t.join("dest.ava-part").exists());
 }
+
+// ---- messages that name the path and the reason --------------------------------------
+
+extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn read_only(p: &std::path::Path, on: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if on { 0o555 } else { 0o755 };
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn a_folder_that_cannot_be_created_is_named_with_the_reason() {
+    if unsafe { geteuid() } == 0 {
+        return; // root writes anywhere
+    }
+    let t = tmp("mkdirmsg");
+    let dest = t.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("theirs"), b"keep").unwrap(); // a folder with files: merged in place
+    read_only(&dest, true);
+    let dir = Entry {
+        kind: ENTRY_DIR,
+        mode: 0o755,
+        size: 0,
+        mtime: 1,
+        path: "assets".into(),
+        root: None,
+    };
+    let r = CRecv::open(&t.join("jobs"), &dest, 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&Manifest {
+        entries: vec![dir, f("assets/a", 4, 1)],
+    });
+    let st = r.wait(10_000);
+    let ev = r.events();
+    read_only(&dest, false);
+    assert_eq!(st, gen::ERR_IO as i32, "{ev}");
+    assert!(
+        ev.contains("cannot create assets: Permission denied"),
+        "{ev}"
+    );
+}
+
+#[test]
+fn a_file_that_cannot_be_written_is_named_with_the_reason() {
+    if unsafe { geteuid() } == 0 {
+        return;
+    }
+    let t = tmp("writemsg");
+    let dest = t.join("dest");
+    std::fs::create_dir_all(dest.join("sub")).unwrap();
+    read_only(&dest.join("sub"), true);
+    let d = big(2 * GROUP as usize + 1, 9);
+    let r = CRecv::open(&t.join("jobs"), &dest, 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&Manifest {
+        entries: vec![f("sub/big", d.len() as u64, 1)],
+    });
+    r.wait_event("map status=0", 5000);
+    let _ = r.try_chunk(0, 0, &d[..GROUP as usize]);
+    let st = r.wait(10_000);
+    let ev = r.events();
+    read_only(&dest.join("sub"), false);
+    assert_eq!(st, gen::ERR_IO as i32, "{ev}");
+    assert!(
+        ev.contains("write failed: sub/big: Permission denied"),
+        "{ev}"
+    );
+}

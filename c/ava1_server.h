@@ -86,8 +86,17 @@ typedef struct ava1_server_cfg {
     uint64_t caps; /* advertised in ServerInfo */
 } ava1_server_cfg_t;
 
-/* 0, or a negative errno. Waits up to 5 s for an earlier server's connections to end. */
+/* 0, or a negative errno. Waits up to 5 s for an earlier server's connections to end.
+ * The accept loop replaces its listening socket after the process was frozen (a clock gap of
+ * AVA1_RESUME_GAP_MS: a console's rest mode leaves the old one dead on the network) and when
+ * poll or accept keep failing for AVA1_BROKEN_MS. */
 int ava1_server_start(const ava1_server_cfg_t *cfg);
+#define AVA1_RESUME_GAP_MS 10000u
+#define AVA1_BROKEN_MS 3000u
+#define AVA1_WATCH_MS 5000u /* how often the accept loop compares the two clocks */
+/* Whether two readings of the monotonic and wall clocks (ms) taken by the accept loop, at least
+ * AVA1_WATCH_MS apart, say the process was frozen in between (pure; exported for the tests). */
+int ava1_server_resumed(uint64_t mono_prev, uint64_t mono_now, uint64_t real_prev, uint64_t real_now);
 uint16_t ava1_server_port(void);
 void ava1_server_open_pairing(uint32_t seconds);
 int ava1_server_pairing_open(void);

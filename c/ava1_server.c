@@ -26,6 +26,7 @@
 #include "ava1_platform.h"
 #include "ava1_rpc_gate.h"
 #include "ava1_store.h"
+#include "ava1_thread.h"
 #include "monocypher.h"
 
 #define MAX_SESSIONS 16
@@ -193,7 +194,7 @@ static int spawn_detached_stack(void *(*fn)(void *), void *arg, size_t stack) {
     if (pthread_attr_init(&attr) != 0) return -1;
     (void)pthread_attr_setstacksize(&attr, stack);
     (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    rc = pthread_create(&t, &attr, fn, arg);
+    rc = ava1_thread_create(&t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     return rc == 0 ? 0 : -1;
 }
@@ -1450,7 +1451,64 @@ static void refuse_busy(int fd, const char *why) {
     close(fd);
 }
 
+/* Opens the listening socket on `port`; the fd, or -errno. */
+static int open_listener(uint16_t port, int loopback, uint16_t *bound) {
+    struct sockaddr_in a;
+    socklen_t alen = sizeof a;
+    int one = 1, fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -errno;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    /* The buffers are asked for here as well as after accept(): a connection takes its window
+     * scale from the listening socket at the handshake, so a size set only once the connection
+     * exists cannot open the window past what was negotiated. Whatever the kernel grants is
+     * inherited by every accepted connection. */
+    (void)ava1_conn_tune_buffers(fd, NULL, NULL);
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 64) != 0 ||
+        getsockname(fd, (struct sockaddr *)&a, &alen) != 0) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    if (bound) *bound = ntohs(a.sin_port);
+    return fd;
+}
+
+static uint64_t real_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+int ava1_server_resumed(uint64_t mono_prev, uint64_t mono_now, uint64_t real_prev, uint64_t real_now) {
+    uint64_t mono = mono_now >= mono_prev ? mono_now - mono_prev : 0;
+    uint64_t real = real_now >= real_prev ? real_now - real_prev : 0;
+    /* The loop wakes every 200 ms: a long gap on either clock means the process was frozen (a
+     * console's rest mode): on the monotonic clock when it counts the sleep, on the wall clock
+     * (running ahead of the monotonic one) when it does not. A clock set forward by hand looks the
+     * same and costs one harmless rebind. */
+    if (mono > AVA1_RESUME_GAP_MS) return 1;
+    if (real > mono + AVA1_RESUME_GAP_MS) return 1;
+    return 0;
+}
+
+/* Replaces the listening socket with a new one on the same port. A console's rest mode leaves
+ * the old one open in the process but dead on the network: every connection refused while the
+ * server looks fine (the helper that "dies" in rest mode). The new fd, or -1 (retried). */
+static int rebind_listener(int old_fd, const char *why) {
+    int fd;
+    if (old_fd >= 0) close(old_fd);
+    fd = open_listener(S.port, S.cfg.bind_loopback, NULL);
+    if (fd >= 0) slog("ava1: listener on port %u rebound (%s)", (unsigned)S.port, why);
+    else slog("ava1: rebinding port %u (%s) failed: errno %d; retrying", (unsigned)S.port, why, -fd);
+    return fd >= 0 ? fd : -1;
+}
+
 static void *accept_main(void *arg) {
+    uint64_t mono_prev = now_ms(), real_prev = real_ms(), err_since = 0;
     (void)arg;
     while (!S.stopping) {
         struct pollfd p;
@@ -1459,23 +1517,68 @@ static void *accept_main(void *arg) {
         uint32_t ip;
         int fd, one = 1, admit, per_ip = 0, pr, i, slot = -1;
         conn_t *k;
+        uint64_t mono = now_ms(), real = real_ms();
+        /* Checked over a window of AVA1_WATCH_MS, not per 200 ms slice: a wall clock that catches
+         * up after a resume in steps (measured on a FW 13.60 Pro: the console's own web UI saw the
+         * gap, a per-slice check did not) still adds up to a gap over the window. */
+        if (mono - mono_prev >= AVA1_WATCH_MS || mono < mono_prev) {
+            if (ava1_server_resumed(mono_prev, mono, real_prev, real)) {
+                slog("ava1: resumed (clock gap); rebinding port %u", (unsigned)S.port);
+                S.listen_fd = rebind_listener(S.listen_fd, "resume");
+                err_since = 0;
+            }
+            mono_prev = mono;
+            real_prev = real;
+        }
+        if (S.listen_fd < 0) {
+            /* A rebind that failed: try again each second (the port can be held for a moment). */
+            ava1_platform_sleep_ms(1000);
+            S.listen_fd = rebind_listener(-1, "retry");
+            mono_prev = now_ms();
+            real_prev = real_ms();
+            continue;
+        }
         p.fd = S.listen_fd;
         p.events = POLLIN;
         p.revents = 0;
         pr = poll(&p, 1, 200);
-        if (pr < 0) {
+        if (pr == 0) {
+            err_since = 0; /* a quiet, healthy listener */
+            continue;
+        }
+        if (pr < 0 || (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            if (pr < 0 && errno == EINTR) continue;
+            /* A broken listener (the network went away under it): rebind once it has failed for a
+             * while, instead of failing every slice forever. */
+            if (!err_since) err_since = now_ms();
+            else if (now_ms() - err_since >= AVA1_BROKEN_MS) {
+                S.listen_fd = rebind_listener(S.listen_fd, "poll failing");
+                err_since = 0;
+                continue;
+            }
             ava1_platform_sleep_ms(50);
             continue;
         }
-        if (pr == 0) continue;
         memset(&from, 0, sizeof from);
         fd = accept(S.listen_fd, (struct sockaddr *)&from, &from_len);
         if (fd < 0) {
-            /* Never leave this loop on an errno: Sony returns undocumented ones (163)
-             * and once that killed the helper's accept loop. */
+            /* Never leave this loop on an errno: Sony returns undocumented ones (163) and once
+             * that killed the helper's accept loop. Out of descriptors or buffers the listener is
+             * fine; any other error that goes on is a broken listener: rebind it. */
+            int e = errno;
+            if (e != EMFILE && e != ENFILE && e != ENOBUFS && e != ENOMEM && e != EAGAIN && e != EWOULDBLOCK &&
+                e != EINTR && e != ECONNABORTED) {
+                if (!err_since) err_since = now_ms();
+                else if (now_ms() - err_since >= AVA1_BROKEN_MS) {
+                    S.listen_fd = rebind_listener(S.listen_fd, "accept failing");
+                    err_since = 0;
+                    continue;
+                }
+            }
             ava1_platform_sleep_ms(50);
             continue;
         }
+        err_since = 0;
         (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 #ifdef SO_NOSIGPIPE
         (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -1529,9 +1632,7 @@ static void *accept_main(void *arg) {
 }
 
 int ava1_server_start(const ava1_server_cfg_t *cfg) {
-    struct sockaddr_in a;
-    socklen_t alen = sizeof a;
-    int one = 1, i, busy = 1;
+    int i, busy = 1;
     for (i = 0; i < 500 && busy; i++) {
         pthread_mutex_lock(&mu);
         busy = S.conns > 0 || S.accept_started;
@@ -1561,27 +1662,12 @@ int ava1_server_start(const ava1_server_cfg_t *cfg) {
                              ? now_ms() + (uint64_t)cfg->pairing_window_s * 1000u
                              : 0;
     pthread_mutex_unlock(&mu);
-    S.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (S.listen_fd < 0) return -errno;
-    (void)setsockopt(S.listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    /* The buffers are asked for here as well as after accept(): a connection takes its window
-     * scale from the listening socket at the handshake, so a size set only once the connection
-     * exists cannot open the window past what was negotiated. Whatever the kernel grants is
-     * inherited by every accepted connection. */
-    (void)ava1_conn_tune_buffers(S.listen_fd, NULL, NULL);
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(cfg->port);
-    a.sin_addr.s_addr = htonl(cfg->bind_loopback ? INADDR_LOOPBACK : INADDR_ANY);
-    if (bind(S.listen_fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(S.listen_fd, 64) != 0 ||
-        getsockname(S.listen_fd, (struct sockaddr *)&a, &alen) != 0) {
-        int e = errno;
-        close(S.listen_fd);
-        S.listen_fd = -1;
-        return -e;
+    {
+        int fd = open_listener(cfg->port, cfg->bind_loopback, &S.port);
+        if (fd < 0) return fd;
+        S.listen_fd = fd;
     }
-    S.port = ntohs(a.sin_port);
-    if (pthread_create(&S.accept_thread, NULL, accept_main, NULL) != 0) {
+    if (ava1_thread_create(&S.accept_thread, NULL, accept_main, NULL) != 0) {
         close(S.listen_fd);
         S.listen_fd = -1;
         return -EAGAIN;
