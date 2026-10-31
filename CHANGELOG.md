@@ -3,6 +3,16 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## Unreleased
+
+C library only; nothing changes on the wire, on disk or in the Rust API.
+
+- The server's accept loop replaces its listening socket after the process was frozen (a clock
+  gap over a 5 s window) or after 3 s of failing `poll`/`accept`. A PS5 helper left its listener
+  dead on the network after rest mode.
+- `ava1_thread_set_start_hook`: every thread the library starts runs an embedder hook first.
+- "write failed" names the file and the reason; "cannot create <folder>" adds the reason.
+
 ## 1.0.5
 
 The repository history, squashed to one commit by the maintainer's account. No code changes;
