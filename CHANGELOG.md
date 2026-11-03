@@ -5,7 +5,19 @@ see [README](README.md#versions).
 
 ## Unreleased
 
-C library only; nothing changes on the wire, on disk or in the Rust API.
+Nothing changes on the wire, on disk or in the public API.
+
+- Rust sender: a lane the governor closed because it wanted fewer lanes counted as a stalled
+  lane. The next tick then dropped another lane and halved the chunk, which closed another lane:
+  one failed lane probe took a job down to one lane and 1 MiB chunks, resending every closed
+  lane's frames on the way, and the probes that followed did it again. On a shared 12 MiB/s link
+  (`resume_perf`, `AVA1_BENCH_LINK=12`) a 384 MiB upload went from 9.4 to 12.1 MB/s fresh and
+  from 8.0 to 11.5 MB/s resumed, holding 4-6 lanes instead of falling to one. The lane the
+  governor retires is now the one with the least in flight.
+- `ava1-chaos`: `link_bytes_per_sec`, one link every connection queues for (a Wi-Fi network).
+- `ava1-ctest`: `resume_perf`, a by-hand probe of a large upload fresh and resumed.
+
+C library:
 
 - The server's accept loop replaces its listening socket after the process was frozen (a clock
   gap over a 5 s window) or after 3 s of failing `poll`/`accept`. A PS5 helper left its listener

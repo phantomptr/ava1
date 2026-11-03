@@ -471,6 +471,15 @@ impl Window {
     pub fn credit(&mut self, n: u64) {
         self.credit = self.credit.saturating_add(n);
     }
+    /// The lane of `lanes` with the fewest unreceived bytes: the one to retire when the
+    /// governor wants fewer lanes, since its in-flight frames are requeued and sent again.
+    pub(crate) fn least_loaded(&self, lanes: &[u16]) -> Option<u16> {
+        lanes
+            .iter()
+            .copied()
+            .min_by_key(|l| (self.lanes.get(l).map_or(0, |f| f.0), u16::MAX - l))
+    }
+
     /// Unreceived frames of a dead lane (I3): a lane's death does NOT release window
     /// credit. The frames are requeued for a re-send and their bytes stay charged here —
     /// the receiver may still charge them if it admitted them — so the sender can never
@@ -550,6 +559,11 @@ struct Sched {
     small_durable_tick: u64,
     large_durable_tick: u64,
     stalls: u32,
+    /// Lanes this sender closed because the governor wanted fewer: their `LaneDown` is
+    /// not a stall. Counted as one, each retirement made the next tick drop another lane
+    /// and halve the chunk, which closed another lane: one failed lane probe took the job
+    /// down to a single lane and 1 MiB chunks, and it never climbed back for long.
+    retiring: HashSet<u16>,
 }
 
 /// A genuine credit stall: frames are queued and the window cannot hold the smallest
@@ -1510,7 +1524,10 @@ fn lane_sweep(sh: &Shared, id: u16) -> Untaken {
                 s.requeue.push_back(f);
             }
         }
-        s.stalls += 1;
+        // A lane the sender retired is not a stall (see `Sched::retiring`).
+        if !s.retiring.remove(&id) {
+            s.stalls += 1;
+        }
         untaken
     }
 }
@@ -1953,6 +1970,9 @@ pub async fn run_upload(
                 None => break Err(SendError::Disconnected("the session ended".into())),
                 Some(Inbound::Closed(why)) => break Err(SendError::Disconnected(why)),
                 Some(Inbound::LaneUp(id)) => {
+                    // A retirement whose LaneDown never came (the lane was already gone)
+                    // must not excuse the death of the new lane on this id.
+                    sh.sched.lock().unwrap().retiring.remove(&id);
                     if dying.contains_key(&id) {
                         up_after.insert(id); // its task starts once the old lane settled
                     } else {
@@ -2226,8 +2246,12 @@ pub async fn run_upload(
                             opening = Some((start_open(op), false));
                         }
                     } else if lanes_now > d.lanes {
-                        if let Some(l) = link.lanes().last() {
-                            op.close(l.id); // LaneDown follows and requeues
+                        let ids: Vec<u16> = link.lanes().iter().map(|l| l.id).collect();
+                        let pick = sh.window.lock().unwrap().least_loaded(&ids);
+                        if let Some(id) = pick {
+                            // LaneDown follows and requeues; it is not a stall.
+                            sh.sched.lock().unwrap().retiring.insert(id);
+                            op.close(id);
                         }
                     }
                 }
@@ -3126,6 +3150,44 @@ mod tests {
             _budget: Vec::new(),
             taken: None,
         }
+    }
+
+    #[test]
+    fn a_lane_the_sender_retired_is_requeued_but_is_not_a_stall() {
+        // The governor's own lane close came back as a LaneDown that counted as a stall:
+        // the next tick then dropped another lane and halved the chunk, closing another
+        // lane, until one lane and 1 MiB chunks were left (the slow resumed upload).
+        let sh = test_shared(governor::START_CHUNK, 4);
+        for (seq, lane) in [(1u32, 1u16), (2, 2)] {
+            let f = test_frame(Chunk::TYPE, 1024);
+            let len = f.body.len() as u64;
+            assert!(sh.window.lock().unwrap().sent(lane, seq, len));
+            sh.sched.lock().unwrap().inflight.insert(seq, (lane, f));
+        }
+        sh.sched.lock().unwrap().retiring.insert(1);
+        lane_sweep(&sh, 1);
+        {
+            let s = sh.sched.lock().unwrap();
+            assert_eq!(s.stalls, 0, "a retired lane is not a stall");
+            assert_eq!(s.requeue.len(), 1, "its frame is requeued all the same");
+            assert!(s.retiring.is_empty());
+        }
+        lane_sweep(&sh, 2);
+        let s = sh.sched.lock().unwrap();
+        assert_eq!(s.stalls, 1, "a lane that died is a stall");
+        assert_eq!(s.requeue.len(), 2);
+    }
+
+    #[test]
+    fn the_retired_lane_is_the_one_with_the_least_in_flight() {
+        let mut w = Window::new(1 << 20);
+        assert!(w.sent(1, 1, 3000));
+        assert!(w.sent(2, 2, 1000));
+        assert!(w.sent(3, 3, 2000));
+        assert_eq!(w.least_loaded(&[1, 2, 3]), Some(2));
+        // A lane with nothing in flight goes first; among equals, the highest id.
+        assert_eq!(w.least_loaded(&[1, 2, 3, 4, 5]), Some(5));
+        assert_eq!(w.least_loaded(&[]), None);
     }
 
     #[tokio::test]

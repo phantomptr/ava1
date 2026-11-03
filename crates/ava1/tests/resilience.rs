@@ -70,6 +70,7 @@ async fn latency_and_a_bandwidth_cap_do_not_kill_a_session() {
         delay: Duration::from_millis(60),
         bytes_per_sec: Some(32 * 1024),
         kill_every: None,
+        link_bytes_per_sec: None,
     };
     let proxy = ChaosProxy::start(addr, cfg).await.unwrap();
     // The subject is the 500 ms dead_after; the handshake's several round trips through a

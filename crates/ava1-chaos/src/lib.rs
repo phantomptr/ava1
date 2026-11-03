@@ -18,6 +18,9 @@ pub struct ChaosConfig {
     pub bytes_per_sec: Option<u64>,
     /// Kill every connection this often.
     pub kill_every: Option<Duration>,
+    /// One link for every connection, bytes/s: all connections queue for it in turn, as on
+    /// a Wi-Fi network (where `bytes_per_sec` gives each connection a link of its own).
+    pub link_bytes_per_sec: Option<u64>,
 }
 
 struct Ctl {
@@ -27,6 +30,8 @@ struct Ctl {
     /// `kill_all` calls that actually aborted a live connection.
     kills: AtomicU64,
     conns: Mutex<Vec<[AbortHandle; 2]>>,
+    /// When the shared link (`link_bytes_per_sec`) is next free.
+    link_free: Mutex<tokio::time::Instant>,
 }
 
 pub struct ChaosProxy {
@@ -61,6 +66,7 @@ impl ChaosProxy {
             bytes_per_sec: AtomicU64::new(cfg.bytes_per_sec.unwrap_or(0)),
             kills: AtomicU64::new(0),
             conns: Mutex::default(),
+            link_free: Mutex::new(tokio::time::Instant::now()),
         });
         let mut tasks = Vec::new();
         {
@@ -211,7 +217,7 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, cfg: ChaosConfig,
             0 => None,
             bps => Some(bps),
         };
-        let slice = match cap {
+        let slice = match cap.or(cfg.link_bytes_per_sec) {
             Some(bps) => ((bps / 50).max(1) as usize).min(n),
             None => n,
         };
@@ -222,6 +228,15 @@ async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, cfg: ChaosConfig,
                     part.len() as f64 / bps.max(1) as f64,
                 ))
                 .await;
+            }
+            if let Some(bps) = cfg.link_bytes_per_sec {
+                let until = {
+                    let mut free = ctl.link_free.lock().unwrap();
+                    let start = (*free).max(tokio::time::Instant::now());
+                    *free = start + Duration::from_secs_f64(part.len() as f64 / bps.max(1) as f64);
+                    *free
+                };
+                tokio::time::sleep_until(until).await;
             }
             if to.write_all(part).await.is_err() {
                 failed = true;
