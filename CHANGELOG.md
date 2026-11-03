@@ -3,7 +3,7 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
-## Unreleased
+## 1.0.6
 
 Nothing changes on the wire, on disk or in the public API.
 

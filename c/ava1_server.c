@@ -1477,9 +1477,11 @@ static int open_listener(uint16_t port, int loopback, uint16_t *bound) {
     return fd;
 }
 
+/* The wall clock on purpose: it is compared with the monotonic clock only to notice a frozen
+ * process (ava1_server_resumed), never used for timing. */
 static uint64_t real_ms(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0; /* lint: wall clock ok */
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 

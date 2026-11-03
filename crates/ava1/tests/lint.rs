@@ -26,10 +26,14 @@ fn the_c_library_uses_only_monotonic_clocks() {
         let src = std::fs::read_to_string(p).unwrap();
         for bad in ["gettimeofday", "CLOCK_REALTIME", "clock_settime", "ftime("] {
             // Whole identifiers only: strftime( formats a display timestamp (the event log), not timing.
+            // A line marked `lint: wall clock ok` reads the wall clock on purpose (comparing it with
+            // the monotonic clock to notice a frozen process), not for timing.
             let hit = src.match_indices(bad).any(|(i, _)| {
-                i == 0
+                let line_end = src[i..].find('\n').map_or(src.len(), |n| i + n);
+                let whole = i == 0
                     || !src.as_bytes()[i - 1].is_ascii_alphanumeric()
-                        && src.as_bytes()[i - 1] != b'_'
+                        && src.as_bytes()[i - 1] != b'_';
+                whole && !src[i..line_end].contains("lint: wall clock ok")
             });
             assert!(!hit, "{} uses {bad}; use CLOCK_MONOTONIC", p.display());
         }
