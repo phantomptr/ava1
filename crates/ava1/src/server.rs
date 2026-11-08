@@ -790,14 +790,10 @@ async fn control(
     slot: &Arc<ConnSlot>,
     deadline: tokio::time::Instant,
 ) -> Result<(), Ava1Error> {
-    // Reserve atomically before the handshake; released on every exit path by the guard.
-    let Some(_slot) = SessionSlot::take(ctx) else {
-        refuse_by(deadline, &mut w, gen::ERR_BUSY, "too many sessions").await;
-        return Err(Ava1Error::Refused {
-            code: gen::ERR_BUSY,
-            message: "too many sessions".into(),
-        });
-    };
+    // The session slot is taken once message 3 has proved the client's key, not at Hs1: a peer
+    // that opens handshakes and never finishes them must not hold the slots paired devices need
+    // (it is bounded by the connection limits instead). Released on every exit path by the guard.
+    let mut session_slot: Option<SessionSlot> = None;
     let slot_ip = slot.ip;
     // Held while the session is welcomed but unconfirmed; dropped when it pairs or ends.
     let mut unpaired_slot: Option<UnpairedSlot> = None;
@@ -814,8 +810,17 @@ async fn control(
                 // Message 3 has just proved the client holds `k`. Any session that key still
                 // has is replaced, before the limits below (and before Welcome, so the
                 // client's lanes find the old connections' counts already given back).
-                if ctx.is_known(k) {
+                let known = ctx.is_known(k);
+                if known || ctx.pairing_open() {
+                    // Any session that key still has is given back first, so a reconnect
+                    // at the limit replaces its own old session instead of being refused.
                     ctx.supersede(k);
+                    session_slot = SessionSlot::take(ctx);
+                    if session_slot.is_none() {
+                        return Admission::Refuse(gen::ERR_BUSY, "too many sessions");
+                    }
+                }
+                if known {
                     Admission::Known
                 } else if !ctx.pairing_open() {
                     Admission::Refuse(
@@ -823,7 +828,6 @@ async fn control(
                         "this device is not paired and pairing is closed",
                     )
                 } else {
-                    ctx.supersede(k);
                     match UnpairedSlot::take(ctx) {
                         Some(slot) => {
                             if ctx.pair_budget.lock().unwrap().welcome_allowed(
@@ -1100,6 +1104,13 @@ async fn control(
                 }
             }
             t if is_data_type(t) => {
+                // SPEC.md §5.5: a data-plane frame before the pairing is accepted is a protocol
+                // error, answered and closed (as the C node does), not dropped with the session
+                // left open.
+                if !entry.paired.load(Ordering::SeqCst) {
+                    refuse_on(&outbox, gen::ERR_NOT_PAIRED, "this device is not paired").await;
+                    break;
+                }
                 // A JobOpen for a job id that is still registered (the sender cancelled it a
                 // moment ago and is resuming it on this session) must not be routed to the old
                 // job: its receiver is draining what the old lanes buffered, ends on the

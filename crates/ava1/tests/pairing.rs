@@ -870,3 +870,40 @@ async fn a_flood_of_sessions_shows_the_newest_code_and_drops_the_older_ones() {
     assert_eq!(shown.len(), 4, "the 4th and 5th were dropped: {shown:?}");
     assert_eq!(shown[3].1, last_code, "the newest session's own code");
 }
+
+/// SPEC.md §5.5: a data-plane frame on a session whose pairing is not accepted is refused with
+/// `ERR_NOT_PAIRED` and the connection closes; it is not dropped with the session left open.
+#[tokio::test]
+async fn a_job_frame_before_pairing_ends_the_session() {
+    use ava1::wire::FrameMessage;
+    let (addr, _ctx, _shown) = open_server(Limits::default()).await;
+    let s = TcpStream::connect(addr).await.unwrap();
+    let (rh, wh) = s.into_split();
+    let (mut r, mut w) = (
+        ava1::conn::FrameReader::new(rh),
+        ava1::conn::FrameWriter::new(wh),
+    );
+    let me = Identity::generate().unwrap();
+    let est = ava1::handshake::client(&mut r, &mut w, &me, "x", |_| false, 0)
+        .await
+        .unwrap();
+    assert!(est.pairing.is_some());
+    w.send_msg(0, &gen::JobOpen::default()).await.unwrap();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(3), r.recv())
+            .await
+            .expect("an answer")
+            .expect("the Error before the close");
+        if f.ty == gen::Ping::TYPE || f.ty == gen::Pong::TYPE {
+            continue;
+        }
+        assert_eq!(f.ty, gen::Error::TYPE);
+        let e: gen::Error = f.decode().unwrap();
+        assert_eq!(e.code, gen::ERR_NOT_PAIRED);
+        break;
+    }
+    let end = tokio::time::timeout(Duration::from_secs(3), r.recv())
+        .await
+        .expect("the connection closes");
+    assert!(end.is_err(), "nothing after the Error");
+}

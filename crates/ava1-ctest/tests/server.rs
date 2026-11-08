@@ -436,6 +436,46 @@ async fn c_server_refuses_a_storm_then_recovers() {
         .unwrap();
 }
 
+/// Handshakes that stop after message 1 hold no session slot: a peer that opens them and never
+/// finishes cannot lock paired devices out of the C node (only the connection limits bound it).
+#[tokio::test(flavor = "multi_thread")]
+async fn c_server_stalled_handshakes_do_not_take_the_session_slots() {
+    use ava1::wire::Message;
+    let d = dir("stalled-hs");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start_with(SECRET, &d.join("peers"), roomy(5000));
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let s = TcpStream::connect(srv.addr()).await.unwrap();
+        let (rh, wh) = s.into_split();
+        let mut w = FrameWriter::new(wh);
+        let stranger = Identity::generate().unwrap();
+        let mut hs = ava1::keys::Handshake::initiator(&stranger).unwrap();
+        let hello = gen::HelloInfo {
+            version_min: gen::PROTOCOL_VERSION,
+            version_max: gen::PROTOCOL_VERSION,
+            caps: 0,
+        }
+        .to_bytes()
+        .unwrap();
+        w.send_msg(
+            0,
+            &gen::Hs1 {
+                noise: hs.write(&hello).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        held.push((rh, w, hs)); // never sends message 3
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = connect(&srv.addr(), me, peers, "laptop", fast())
+        .await
+        .expect("a paired device gets in while the stalled handshakes wait");
+    s.node_info().await.unwrap();
+    drop(held);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn c_server_drops_a_blackholed_session() {
     // Review focus 3.
