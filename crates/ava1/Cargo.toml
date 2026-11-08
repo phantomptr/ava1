@@ -32,6 +32,11 @@ snow = { version = "0.10", features = ["risky-raw-split"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = "1"
 
+# O_NOFOLLOW for the receiver's file opens (SPEC.md §15.2): its value differs between unix
+# targets. Already in the tree through tokio and getrandom.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The frame AEAD before ring: the differential oracle in tests/aead.rs.
 chacha20poly1305 = "0.11"

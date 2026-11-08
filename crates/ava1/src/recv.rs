@@ -231,14 +231,14 @@ impl LocalSink {
             let st = self.st.lock().unwrap();
             self.path(&st, id, false)
         };
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&p)?;
+        self.parents_for(&p)?;
+        let f = open_nofollow(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true),
+            &p,
+        )?;
         verify::write_all_at(&f, data, 0)?;
         f.set_len(data.len() as u64)
     }
@@ -280,7 +280,7 @@ impl LocalSink {
                 self.path(&st, l.id, false)
             };
             let size = m.entry(l.id).map_or(0, |e| e.size);
-            let open = || std::fs::OpenOptions::new().write(true).open(&p);
+            let open = || open_nofollow(std::fs::OpenOptions::new().write(true), &p);
             let f = match open() {
                 Ok(f) if f.metadata().map(|md| md.len() == size).unwrap_or(false) => f,
                 _ => {
@@ -312,6 +312,28 @@ impl LocalSink {
         } else {
             self.root.clone()
         }
+    }
+
+    /// Whether the folders the job writes into may already hold someone else's entries: a
+    /// merge into an existing folder. A staged tree and a single file's own path are this job's.
+    fn merging(&self) -> bool {
+        !self.single && !self.staged.load(Ordering::Relaxed)
+    }
+
+    /// Makes the parent folders of `p` (a path under `base()`), first refusing, in a merge, any
+    /// existing one that is a symlink or not a folder. A manifest need not list a file's parent
+    /// folders, so `prepare` cannot have seen them all, and `create_dir_all` and the open would
+    /// follow a symlink out of the destination.
+    fn parents_for(&self, p: &Path) -> io::Result<()> {
+        let Some(parent) = p.parent() else {
+            return Ok(());
+        };
+        if self.merging() {
+            if let Ok(rel) = parent.strip_prefix(self.base()) {
+                refuse_links(&self.base(), rel, &mut HashSet::new())?;
+            }
+        }
+        std::fs::create_dir_all(parent)
     }
 
     /// The path for `id`, part or final. Every `.ava-part` path is derived from the final
@@ -349,16 +371,16 @@ impl LocalSink {
             }
         }
         let p = self.path(&st, id, part);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.parents_for(&p)?;
         let open = || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(truncate)
-                .open(&p)
+            open_nofollow(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .read(true)
+                    .truncate(truncate),
+                &p,
+            )
         };
         // Descriptors are bounded: past the cap the cache drops its other entries (their data is
         // fsynced later through a reopen, see `sync`), and the process running out anyway is
@@ -388,7 +410,7 @@ impl LocalSink {
             }
             (self.path(&st, id, false), self.path(&st, id, true))
         };
-        let open = |p: &Path| std::fs::OpenOptions::new().write(true).open(p);
+        let open = |p: &Path| open_nofollow(std::fs::OpenOptions::new().write(true), p);
         // The part file first: a large file mid-write lives there, while a small file written
         // whole has no part file and is at its final path.
         match open(&part) {
@@ -399,6 +421,95 @@ impl LocalSink {
             Err(e) => Err(e),
         }
     }
+}
+
+/// A path the receiver will not write through (SPEC.md §15.5): the job ends `ERR_PATH`.
+#[derive(Debug)]
+struct PathRefused(String);
+
+impl std::fmt::Display for PathRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PathRefused {}
+
+fn path_refused(why: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, PathRefused(why))
+}
+
+/// Whether `e` is a refused path, which the run reports to the sender as `ERR_PATH`.
+fn is_path_refused(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<PathRefused>())
+}
+
+/// Whether a manifest path, joined onto the destination, stays below it: only plain names, no
+/// root, prefix, `.` or `..`. `manifest::check_path` splits on '/' only, which is the whole
+/// story on unix; on Windows '\\' is a separator too, `C:` a drive and `name:stream` an
+/// alternate data stream, so a path holding either character is refused there outright.
+fn plain_relative(rel: &str) -> bool {
+    #[cfg(windows)]
+    if rel.contains(['\\', ':']) {
+        return false;
+    }
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Refuses `rel` (a folder path under `base`) when any of its folders that already exists is a
+/// symlink or not a folder; one that does not exist yet ends the walk (nothing exists below
+/// it). `seen` holds the folders already found sound, so a manifest's shared parents are
+/// looked at once.
+fn refuse_links(base: &Path, rel: &Path, seen: &mut HashSet<PathBuf>) -> io::Result<()> {
+    let mut at = PathBuf::new();
+    for c in rel.components() {
+        at.push(c);
+        if seen.contains(&at) {
+            continue;
+        }
+        match std::fs::symlink_metadata(base.join(&at)) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(path_refused(format!(
+                    "{:.100} is a symbolic link",
+                    at.display()
+                )))
+            }
+            Ok(md) if !md.is_dir() => {
+                return Err(path_refused(format!(
+                    "{:.100} is not a folder",
+                    at.display()
+                )))
+            }
+            Ok(_) => {
+                seen.insert(at.clone());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Opens a job file without following a symlink at its last component (SPEC.md §15.2:
+/// `O_NOFOLLOW`): a link planted where a file goes must not lead the write outside the
+/// destination. Such a link is a refused path, not an I/O error.
+fn open_nofollow(o: &mut std::fs::OpenOptions, p: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(p).map_err(|e| {
+        let link = std::fs::symlink_metadata(p).is_ok_and(|md| md.file_type().is_symlink());
+        if link && !is_fd_exhausted(&e) {
+            path_refused(format!("{} is a symbolic link", p.display()))
+        } else {
+            e
+        }
+    })
 }
 
 /// The most files a `LocalSink` keeps open at once (large files being written; a small file's
@@ -517,7 +628,32 @@ impl Sink for LocalSink {
         let mut st = self.st.lock().unwrap();
         st.m = Some(Arc::new(m.clone()));
         if !self.single {
+            for e in &m.entries {
+                if !plain_relative(&e.path) {
+                    return Err(path_refused(format!(
+                        "{:.100} is not a plain relative path here",
+                        e.path
+                    )));
+                }
+            }
             let base = self.base();
+            // A merge into an existing folder (SPEC.md §15.5): a manifest folder, or a file's
+            // parent folder, that already exists as a symlink or as something other than a
+            // folder is refused before anything is created through it.
+            if self.merging() {
+                let mut seen = HashSet::new();
+                for e in &m.entries {
+                    let rel = Path::new(&e.path);
+                    let dirs = if e.kind == gen::ENTRY_DIR {
+                        Some(rel)
+                    } else {
+                        rel.parent()
+                    };
+                    if let Some(d) = dirs {
+                        refuse_links(&base, d, &mut seen)?;
+                    }
+                }
+            }
             std::fs::create_dir_all(&base)?;
             for e in m.entries.iter().filter(|e| e.kind == gen::ENTRY_DIR) {
                 std::fs::create_dir_all(base.join(&e.path))?;
@@ -669,7 +805,11 @@ impl Sink for LocalSink {
                 let st = self.st.lock().unwrap();
                 self.path(&st, rec.file_id, false)
             };
-            let same = std::fs::read(&path)
+            let same = open_nofollow(std::fs::OpenOptions::new().read(true), &path)
+                .and_then(|mut f| {
+                    let mut b = Vec::new();
+                    io::Read::read_to_end(&mut f, &mut b).map(|_| b)
+                })
                 .map(|b| *blake3::hash(&b).as_bytes() == rec.root)
                 .unwrap_or(false);
             if !same {
@@ -690,7 +830,7 @@ impl Sink for LocalSink {
             let st = self.st.lock().unwrap();
             self.path(&st, id, true)
         };
-        let f = std::fs::File::open(p)?;
+        let f = open_nofollow(std::fs::OpenOptions::new().read(true), &p)?;
         verify::read_exact_at(&f, buf, off).map(|_| buf.len())
     }
 
@@ -727,7 +867,7 @@ impl Sink for LocalSink {
         // The cached descriptor, or (the cache having been trimmed) the part file reopened.
         let f = match cached {
             Some(f) => Some(f),
-            None => match std::fs::OpenOptions::new().write(true).open(&part) {
+            None => match open_nofollow(std::fs::OpenOptions::new().write(true), &part) {
                 Ok(f) => Some(f),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
@@ -1383,7 +1523,30 @@ async fn run(
     if let Some(h) = batch_handle.take() {
         let _ = h.await;
     }
-    outcome
+    match outcome {
+        // A path the sink will not write through (a symlink or a non-folder in the way, a path
+        // that is not plain here) is the sender's to hear about, as for a bad manifest path:
+        // `ERR_PATH` in a JobDone, not a session that just goes quiet.
+        Err(SendError::Source(e)) if is_path_refused(&e) => {
+            let message = e.to_string();
+            let _ = link
+                .control
+                .send(&JobDone {
+                    job_id: link.job_id,
+                    status: gen::ERR_PATH,
+                    files: 0,
+                    bytes: 0,
+                    message: Some(message.clone()),
+                    settling: None,
+                })
+                .await;
+            Err(SendError::Refused {
+                status: gen::ERR_PATH,
+                message,
+            })
+        }
+        o => o,
+    }
 }
 
 /// Held by a run for its whole life, and by the work it hands off (the sync batch, the
@@ -5180,5 +5343,164 @@ mod tests {
             .unwrap();
         assert_eq!(rep.files, 2);
         assert_eq!(f0.unwrap(), d0, "file 0 holds the resent bytes");
+    }
+
+    /// A destination folder that already exists (a merge) beside a folder outside it, for the
+    /// symlink tests. Returns (scratch dir, destination, outside).
+    #[cfg(unix)]
+    fn merge_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let d = std::env::temp_dir().join(format!("ava1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (root, outside) = (d.join("dest"), d.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"precious").unwrap();
+        (d, root, outside)
+    }
+
+    #[cfg(unix)]
+    fn entry(kind: u8, size: u64, path: &str) -> Entry {
+        Entry {
+            kind,
+            mode: 0o644,
+            size,
+            mtime: 0,
+            path: path.into(),
+            root: None,
+        }
+    }
+
+    /// SPEC.md §15.5: a merge refuses a manifest folder that is a symlink (or not a folder), and
+    /// a file's parent folder that is one even when the manifest does not list it.
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_refuses_a_folder_that_is_a_symlink_listed_or_not() {
+        use std::os::unix::fs::symlink;
+        let (d, root, outside) = merge_dirs("merge-dirlink");
+        symlink(&outside, root.join("sub")).unwrap();
+        std::fs::write(root.join("plain"), b"x").unwrap();
+        let sink = || LocalSink::new(root.clone(), false).with_log(false, PackOpts::default());
+        let listed = Manifest {
+            entries: vec![
+                entry(gen::ENTRY_DIR, 0, "sub"),
+                entry(gen::ENTRY_DIR, 0, "sub/deeper"),
+            ],
+        };
+        let unlisted = Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "sub/new")],
+        };
+        let not_a_folder = Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "plain/new")],
+        };
+        let r1 = sink().prepare(&listed);
+        let r2 = sink().prepare(&unlisted);
+        let r3 = sink().prepare(&not_a_folder);
+        let created = outside.join("deeper").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        for r in [r1, r2, r3] {
+            assert!(r.as_ref().is_err_and(is_path_refused), "{r:?}");
+        }
+        assert!(!created, "nothing was made through the link");
+    }
+
+    /// A symlink planted after the prepare (or under a folder the manifest never named) is
+    /// still not written through: the parents are checked again when a file is made, and the
+    /// file itself is opened O_NOFOLLOW (SPEC.md §15.2), its part file too. An existing regular
+    /// file is overwritten, as intended for a merge.
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_never_writes_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let (d, root, outside) = merge_dirs("merge-filelink");
+        std::fs::write(root.join("existing"), b"user data").unwrap();
+        let m = Manifest {
+            entries: vec![
+                entry(gen::ENTRY_FILE, 4, "a"),
+                entry(gen::ENTRY_FILE, 4, "late/new"),
+                entry(gen::ENTRY_FILE, 4, "existing"),
+                entry(gen::ENTRY_FILE, 2 * GROUP, "big"),
+            ],
+        };
+        let sink = LocalSink::new(root.clone(), false).with_log(false, PackOpts::default());
+        sink.prepare(&m).unwrap();
+        symlink(outside.join("victim"), root.join("a")).unwrap();
+        symlink(&outside, root.join("late")).unwrap();
+        symlink(outside.join("victim"), root.join("big.ava-part")).unwrap();
+        let file = sink.write_whole(0, b"EVIL");
+        let parent = sink.write_whole(1, b"EVIL");
+        let part = sink.write_at(3, 0, &[7; GROUP as usize]);
+        sink.write_whole(2, b"mine").unwrap();
+        let victim = std::fs::read(outside.join("victim")).unwrap();
+        let planted = outside.join("new").exists();
+        let existing = std::fs::read(root.join("existing")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        for r in [file, parent, part] {
+            assert!(r.as_ref().is_err_and(is_path_refused), "{r:?}");
+        }
+        assert_eq!(
+            victim, b"precious",
+            "a file outside the root was overwritten"
+        );
+        assert!(!planted, "a file was made outside the root");
+        assert_eq!(
+            existing, b"mine",
+            "a regular file in a merge is overwritten"
+        );
+    }
+
+    /// The sender hears about a refused path as `ERR_PATH`, as for a bad manifest path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_path_ends_the_job_with_err_path() {
+        use std::os::unix::fs::symlink;
+        let job = [0x7a; 16];
+        let (d, root, outside) = merge_dirs("merge-errpath");
+        symlink(&outside, root.join("sub")).unwrap();
+        let Wired {
+            mut link,
+            mut peer,
+            _keep,
+            ..
+        } = wired(job, None);
+        let o = opts("merge-errpath", 64 << 20, Some(Duration::from_secs(1)));
+        let jobs_dir = o.jobs_dir.clone();
+        let m = Arc::new(Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "sub/new")],
+        });
+        let sink: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()));
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let done: JobDone = until(&mut peer, JobDone::TYPE).await.decode().unwrap();
+        let r = task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(done.status, gen::ERR_PATH);
+        assert!(
+            matches!(&r, Err(SendError::Refused { status, .. }) if *status == gen::ERR_PATH),
+            "{r:?}"
+        );
+    }
+
+    /// Only plain names below the destination: `check_path` already refuses these everywhere;
+    /// this is the receiver's own guard on what it joins onto its base.
+    #[test]
+    fn only_plain_relative_paths_are_joined_onto_the_destination() {
+        for ok in ["a", "a/b", "a b/c.txt", "..a/b.."] {
+            assert!(plain_relative(ok), "{ok}");
+        }
+        for bad in ["", "/abs", "a/../b", "..", "./a"] {
+            assert!(!plain_relative(bad), "{bad}");
+        }
+        // On Windows '\\' is a separator, `C:` a drive and `name:stream` an alternate data
+        // stream; on unix they are plain characters of a name, as the sender allows them.
+        for win in [
+            "a\\..\\..\\x",
+            "C:x",
+            "C:\\x",
+            "file:stream",
+            "\\\\server\\share",
+        ] {
+            assert_eq!(plain_relative(win), cfg!(not(windows)), "{win}");
+        }
     }
 }
