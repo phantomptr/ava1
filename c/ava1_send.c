@@ -838,6 +838,14 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
     msg[0] = 0;
     memcpy(root, o->root, o->root_len);
     root[o->root_len] = 0;
+    /* The same rule as an upload's root (ava1_recv_open): absolute, and the rest follows the
+     * manifest path rules (SPEC.md 11.2), so no ".." can walk a read policy's prefix out of the
+     * folder it allows. Checked before may_read, which then sees a plain path. */
+    if (root[0] != '/' || !ava1_path_ok((const uint8_t *)root + 1, o->root_len - 1)) {
+        ack->status = AVA1_ERR_PATH;
+        snprintf(msg, cap, "the source is not a valid path");
+        return NULL;
+    }
     if (!cfg->may_read || !cfg->may_read(root, (o->flags & AVA1_JF_UNSAFE_READ) != 0)) {
         ack->status = AVA1_ERR_PATH;
         snprintf(msg, cap, "reading %s is not allowed", root);

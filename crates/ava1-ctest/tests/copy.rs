@@ -437,6 +437,46 @@ async fn a_copy_into_its_own_source_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_copy_through_a_symlinked_destination_folder_fails_and_writes_nothing_there() {
+    // The copy merges like an upload (SPEC.md §15.5): a destination folder that is a link must
+    // not lead the copy's files out of the destination.
+    let d = dir("copy-dest-link");
+    std::fs::create_dir_all(d.join("usb/g/sub")).unwrap();
+    std::fs::write(d.join("usb/g/sub/a.bin"), b"payload").unwrap();
+    std::fs::create_dir_all(d.join("data/g")).unwrap();
+    std::fs::create_dir_all(d.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(d.join("elsewhere"), d.join("data/g/sub")).unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let job = [0x7c; 16];
+    assert_eq!(
+        start(
+            &s,
+            job,
+            &d.join("usb/g"),
+            &d.join("data/g"),
+            gen::JF_OVERWRITE
+        )
+        .await,
+        0
+    );
+    let st = wait_finished(&s, job).await;
+    assert_eq!(st.state, Some(2), "{:?}", st.current);
+    assert!(!d.join("elsewhere/a.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_move_refuses_symlink_and_dotdot_aliases_of_its_source() {
     use std::os::unix::fs::symlink;
 

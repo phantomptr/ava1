@@ -989,3 +989,118 @@ fn a_file_that_cannot_be_written_is_named_with_the_reason() {
         "{ev}"
     );
 }
+
+// ---- a merge never leaves its destination ---------------------------------------------
+
+fn dir_entry(p: &str) -> Entry {
+    Entry {
+        kind: ENTRY_DIR,
+        mode: 0o755,
+        size: 0,
+        mtime: 1,
+        path: p.into(),
+        root: None,
+    }
+}
+
+/// Opens a merge into `t/dest` (which holds `link -> t/outside`) for `m` and returns the job's
+/// end status, its events, and what landed in `t/outside`.
+fn merge_through_link(t: &std::path::Path, m: Manifest) -> (i32, String, Vec<std::ffi::OsString>) {
+    let (dest, outside) = (t.join("dest"), t.join("outside"));
+    std::fs::create_dir_all(dest.join("real")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("real/link")).unwrap();
+    let r = CRecv::open(&t.join("jobs"), &dest, 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    let st = r.wait(10_000);
+    let landed = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    (st, r.events(), landed)
+}
+
+#[test]
+fn a_listed_folder_under_an_unlisted_symlinked_parent_is_refused() {
+    let t = tmp("linkdir");
+    let (st, ev, landed) = merge_through_link(
+        &t,
+        Manifest {
+            entries: vec![dir_entry("real/link/sub"), f("real/link/sub/a", 4, 1)],
+        },
+    );
+    assert_eq!(st, gen::ERR_PATH as i32, "{ev}");
+    assert!(ev.contains("real/link is a symbolic link"), "{ev}");
+    assert!(landed.is_empty(), "{landed:?}");
+}
+
+#[test]
+fn a_file_two_levels_under_a_symlinked_parent_is_refused() {
+    let t = tmp("linkdeep");
+    let (st, ev, landed) = merge_through_link(
+        &t,
+        Manifest {
+            entries: vec![f("real/ok", 4, 1), f("real/link/x/y/a", 4, 1)],
+        },
+    );
+    assert_eq!(st, gen::ERR_PATH as i32, "{ev}");
+    assert!(landed.is_empty(), "{landed:?}");
+}
+
+#[test]
+fn a_file_where_a_parent_folder_must_go_is_refused() {
+    let t = tmp("parentfile");
+    let dest = t.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("plain"), b"user").unwrap();
+    let r = CRecv::open(&t.join("jobs"), &dest, 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&Manifest {
+        entries: vec![f("plain/a", 4, 1)],
+    });
+    let st = r.wait(10_000);
+    let ev = r.events();
+    assert_eq!(st, gen::ERR_PATH as i32, "{ev}");
+    assert!(ev.contains("plain is not a folder"), "{ev}");
+    assert_eq!(std::fs::read(dest.join("plain")).unwrap(), b"user");
+}
+
+#[test]
+fn a_merge_with_many_files_under_unlisted_real_parents_lands() {
+    // The ancestor check is per folder, not per file, and real folders pass it.
+    let t = tmp("parentsok");
+    let dest = t.join("dest");
+    std::fs::create_dir_all(dest.join("a/b")).unwrap();
+    let n = 300;
+    let entries = (0..n)
+        .map(|i| f(&format!("a/b/{}/{i}", i % 7), 4, 1))
+        .collect();
+    let r = CRecv::open(&t.join("jobs"), &dest, 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&Manifest { entries });
+    r.wait_event("map status=0", 5000);
+    for i in 0..n {
+        r.record(i as u32, &body(i), *blake3::hash(&body(i)).as_bytes());
+    }
+    assert_eq!(r.wait(20_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(dest.join("a/b/3/10")).unwrap(), body(10));
+}
+
+#[test]
+fn a_single_file_job_with_two_entries_is_refused() {
+    // SPEC.md §11.8: JF_SINGLE_FILE means the manifest has one file entry. Every id of such a
+    // job maps to <root>, so a second entry would write over the first.
+    let t = tmp("single2");
+    let root = t.join("file.bin");
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &root,
+        gen::JF_SINGLE_FILE,
+        gen::POLICY_REPLACE,
+        0,
+    );
+    r.manifest(&Manifest {
+        entries: vec![f("a", 4, 1), f("b", 4, 1)],
+    });
+    let st = r.wait(10_000);
+    assert_eq!(st, gen::ERR_PROTOCOL as i32, "{}", r.events());
+    assert!(!root.exists());
+}

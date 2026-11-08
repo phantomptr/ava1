@@ -5,6 +5,20 @@ see [README](README.md#versions).
 
 ## 1.0.7
 
+Fixes from a review of both implementations. Nothing changes on the wire format, on disk or in the
+public API.
+
+Both servers:
+
+- A device that opened handshakes and never finished them held one of the 16 session slots
+  each until the handshake timed out, so 16 of them locked every paired device out. A slot is
+  now taken only once the device has proved its key.
+
+Rust server:
+
+- A transfer frame sent before pairing finished was ignored and the session stayed open. It is
+  now answered with `ERR_NOT_PAIRED` and the session ends, as the spec says and the C node does.
+
 Rust receiver:
 
 - A large file whose check failed and that the sender resent at once could be thrown away
@@ -16,6 +30,22 @@ Rust receiver:
   writing outside the folder. Files that are already there are still replaced, as before.
 - On Windows, a path with `\` or `:` in it (a drive, an alternate data stream) is refused with
   `ERR_PATH` instead of being written outside the folder.
+
+C library:
+
+- An upload or copy into an existing folder could write outside it: a file whose parent
+  folder was a symbolic link in the destination (and not listed in the manifest) was written
+  wherever the link pointed. The job now ends with `ERR_PATH` when any folder on the way is a
+  symbolic link or a file.
+- A download or console-to-console send whose source is relative or has a `.`, `..` or empty
+  part is refused with `ERR_PATH`, the same rule uploads and copies already had.
+- A single-file job whose manifest is not exactly one file is refused with `ERR_PROTOCOL`
+  (SPEC.md §11.8); a second file would have overwritten the first.
+- Saving the identity and the paired devices no longer reuses a leftover `.tmp` file (whose
+  permissions it kept, or a link it followed), and syncs the folder after the rename, so a
+  power cut cannot bring back an unpaired device or lose a new identity.
+- Giving back a pairing guess no longer makes the address the first one dropped from the
+  pairing table, which reset its limit on new pairing sessions.
 
 ## 1.0.6
 

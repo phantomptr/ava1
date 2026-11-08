@@ -34,6 +34,8 @@ void ava1_peers_remove(ava1_peers_t *ps, const uint8_t key[32]);
 /* Writes the store atomically (temp file + fsync + rename in the same directory). Slow:
  * never call it holding a lock other threads need. */
 int ava1_peers_save(const ava1_peers_t *ps, const char *path);
+/* Tests: each save waits this long before writing (stands for a slow drive). */
+extern uint32_t ava1_store_test_save_delay_ms;
 /* put + save; *ps changes only if the save succeeded. */
 int ava1_peers_add(ava1_peers_t *ps, const uint8_t key[32], const char *name, uint64_t added_unix,
                    const char *path);

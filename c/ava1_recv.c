@@ -1088,14 +1088,59 @@ static uint16_t reconcile(ava1_job_t *j, char *msg, size_t cap) {
     return AVA1_STATUS_OK;
 }
 
-/* The base folder and every directory entry (merge mode refuses one that is a symlink),
- * the parents of what was created synced; then the policies and the resume check. */
+/* A manifest need not list a file's parent folders (SPEC.md 15.1), and every open and mkdir
+ * below follows a symlinked folder on the way (O_NOFOLLOW guards the last component only). So
+ * each folder that already exists between the base and an entry must be a real folder, not a
+ * symbolic link (which would lead the job's writes out of the destination, past may_write) nor
+ * a file: SPEC.md 15.5's ERR_PATH. What does not exist yet this job makes itself, and it makes
+ * folders only. `last` is the parent checked before (its every folder passed); a manifest lists
+ * siblings together, so most entries cost no lstat at all. */
+static uint16_t ancestors_ok(const ava1_job_t *j, const char *rel, char *last, char *msg, size_t cap) {
+    char p[AVA1_PATH_CAP];
+    struct stat st;
+    const char *slash = strrchr(rel, '/');
+    size_t n = slash ? (size_t)(slash - rel) : 0, from = 0, bl = strlen(j->base), i;
+    if (!n || bl + 1 + n >= sizeof p) return AVA1_STATUS_OK; /* too long: never opened (ava1_apply_path) */
+    if (strncmp(last, rel, n) == 0 && (last[n] == 0 || last[n] == '/')) return AVA1_STATUS_OK;
+    for (i = 0; i < n && rel[i] == last[i]; i++)
+        if (rel[i] == '/') from = i; /* the folders before `from` passed with `last` */
+    if (i < n && rel[i] == '/' && last[i] == 0) from = i; /* `last` is itself one of them */
+    snprintf(p, sizeof p, "%s/%.*s", j->base, (int)n, rel);
+    for (i = from ? from + 1 : 0; i <= n; i++) {
+        if (i < n && rel[i] != '/') continue;
+        p[bl + 1 + i] = 0;
+        if (lstat(p, &st) != 0) {
+            int e = errno;
+            if (e == ENOENT) break; /* nothing below it exists either */
+            snprintf(msg, cap, "cannot check %.80s: %s", p + bl + 1, strerror(e));
+            return AVA1_ERR_IO;
+        }
+        if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
+            snprintf(msg, cap, "%.100s is %s", p + bl + 1, S_ISLNK(st.st_mode) ? "a symbolic link" : "not a folder");
+            return AVA1_ERR_PATH;
+        }
+        if (i < n) p[bl + 1 + i] = '/';
+    }
+    memcpy(last, rel, n);
+    last[n] = 0;
+    return AVA1_STATUS_OK;
+}
+
+/* The base folder and every directory entry (merge mode refuses one that is a symlink, and one
+ * under a symlinked folder), the parents of what was created synced; then the policies and the
+ * resume check. */
 static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
     uint32_t i, nd = 0;
-    char p[AVA1_PATH_CAP], parent[AVA1_PATH_CAP];
+    char p[AVA1_PATH_CAP], parent[AVA1_PATH_CAP], last[AVA1_PATH_CAP];
     struct stat st;
     uint16_t status;
     int rc;
+    /* SPEC.md 11.8: a single-file job's manifest has one file entry. Every id of such a job
+     * names <root> (ava1_apply_path), so a second entry would write over the first. */
+    if ((j->flags & AVA1_JF_SINGLE_FILE) && (j->m.n != 1 || j->m.e[0].kind != AVA1_ENTRY_FILE)) {
+        snprintf(msg, cap, "a single-file job has one file entry");
+        return AVA1_ERR_PROTOCOL;
+    }
     if ((status = take_dest(j, 0, msg, cap)) != AVA1_STATUS_OK) return status;
     if (!(j->flags & AVA1_JF_SINGLE_FILE)) {
         ava1_dirent_t *d = calloc((size_t)j->m.n + 1, sizeof *d);
@@ -1109,9 +1154,13 @@ static uint16_t prepare(ava1_job_t *j, char *msg, size_t cap) {
             return AVA1_ERR_IO;
         }
         status = AVA1_STATUS_OK;
+        last[0] = 0;
         for (i = 0; i < j->m.n && status == AVA1_STATUS_OK; i++) {
             const char *rel = ava1_mstore_path(&j->m, i);
-            if (j->m.e[i].kind != AVA1_ENTRY_DIR || !rel) continue;
+            if (!rel) continue;
+            /* Files too: the policies below and every later open take their paths as given. */
+            if ((status = ancestors_ok(j, rel, last, msg, cap)) != AVA1_STATUS_OK) break;
+            if (j->m.e[i].kind != AVA1_ENTRY_DIR) continue;
             if (snprintf(p, sizeof p, "%s/%s", j->base, rel) >= (int)sizeof p) {
                 snprintf(msg, cap, "a path is too long");
                 status = AVA1_ERR_PATH;
