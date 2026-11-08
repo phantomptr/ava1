@@ -99,7 +99,7 @@ async fn next_control(link: &mut JobLink) -> Frame {
 #[tokio::test]
 async fn an_eight_mib_chunk_crosses_a_lane_and_is_acknowledged() {
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(Arc::new(Echo))).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     assert_ne!(s.peer_caps() & gen::CAP_DATA_PLANE, 0);
@@ -139,7 +139,7 @@ async fn an_eight_mib_chunk_crosses_a_lane_and_is_acknowledged() {
 #[tokio::test]
 async fn the_server_pushes_data_on_lanes_the_client_opened() {
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(Arc::new(Pusher))).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     let job = [3u8; 16];
@@ -166,7 +166,7 @@ async fn the_server_pushes_data_on_lanes_the_client_opened() {
 #[tokio::test]
 async fn a_closed_lane_is_reported_to_its_jobs() {
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(Arc::new(Echo))).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     let mut link = s.job([1; 16]);
@@ -185,7 +185,7 @@ async fn a_closed_lane_is_reported_to_its_jobs() {
 #[tokio::test]
 async fn a_late_frame_for_an_unknown_job_does_not_end_the_session() {
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(Arc::new(Echo))).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     let link = s.job([4; 16]);
@@ -204,7 +204,7 @@ async fn a_late_frame_for_an_unknown_job_does_not_end_the_session() {
 #[tokio::test]
 async fn a_server_without_jobs_does_not_advertise_the_data_plane() {
     let (addr, _ctx, id, peers) = common::paired().await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     assert_eq!(s.peer_caps() & gen::CAP_DATA_PLANE, 0);
@@ -213,7 +213,7 @@ async fn a_server_without_jobs_does_not_advertise_the_data_plane() {
 #[tokio::test]
 async fn dropping_the_session_tells_every_job() {
     let (addr, _ctx, id, peers) = common::paired_ctx(|c| c.with_jobs(Arc::new(Echo))).await;
-    let s = connect(&addr.to_string(), id, peers, "client", common::fast())
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
         .await
         .unwrap();
     let mut link = s.job([5; 16]);
