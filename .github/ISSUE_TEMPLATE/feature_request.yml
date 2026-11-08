@@ -1,23 +1,53 @@
 name: Feature request
-description: Suggest an idea for AVA1
+description: Suggest something new for the crates, the C library or the protocol
 labels: ["enhancement"]
 body:
   - type: textarea
     id: problem
     attributes:
       label: What problem does this solve?
-      description: Describe the use case or pain point. "I can't do X because..."
+      description: The use case. "I can't do X because..."
     validations:
       required: true
   - type: textarea
     id: solution
     attributes:
       label: What would you like to see?
-      description: Describe the feature or change you'd like. If it touches the wire format, say how an older peer would cope with it.
+      description: The feature or change you have in mind.
     validations:
       required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part?
+      multiple: true
+      options:
+        - Rust crate (ava1)
+        - C library (libava1)
+        - Code generator (ava1-gen)
+        - The protocol itself
+        - Documentation or examples
+    validations:
+      required: true
+  - type: dropdown
+    id: wire
+    attributes:
+      label: Does it need a protocol change?
+      description: Version 1 peers already run in the field. Many things fit in an application method (docs/extending.md) or stay on one side.
+      options:
+        - No, it stays inside one side's API
+        - It could be an application method
+        - Yes, it needs new frames or fields
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: compat
+    attributes:
+      label: Older peers
+      description: If it changes the protocol, how should a peer that doesn't know about it behave?
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: Have you tried any workarounds? Could an application method (see docs/extending.md) do it without a protocol change?
+      description: Workarounds you tried, or other ways to get the same result.
