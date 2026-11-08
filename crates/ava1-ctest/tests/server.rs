@@ -484,7 +484,10 @@ fn a_stale_or_planted_identity_temp_file_is_neither_adopted_nor_followed() {
     std::os::unix::fs::symlink(&elsewhere, d.join("identity2.tmp")).unwrap();
     c_identity_load_or_create(&id2).unwrap();
     assert_eq!(std::fs::read(&elsewhere).unwrap(), b"theirs");
-    assert!(std::fs::symlink_metadata(&id2).unwrap().file_type().is_file());
+    assert!(std::fs::symlink_metadata(&id2)
+        .unwrap()
+        .file_type()
+        .is_file());
 }
 
 #[test]
@@ -1166,14 +1169,9 @@ async fn a_c_reader_kept_from_reading_past_dead_after_keeps_a_live_session() {
     let (me, _peers) = paired_client(&d.join("peers"));
     let srv = CServer::start(SECRET, &d.join("peers"), 0, 100, 500, 500);
     srv.open_pairing(60);
-    // The pairing write goes to peers.tmp first. As a FIFO, opening it blocks until
-    // someone reads: the pairing below holds the lock for as long as the test likes.
-    let fifo = d.join("peers.tmp");
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .unwrap()
-        .success());
+    // The pairing write is held for a second (a slow drive): the pairing below holds the
+    // lock that long.
+    srv.knob("store_save_delay_ms", 1300);
     let mut a = stranger(&srv).await.unwrap();
     let code = shown_code(&srv, 1).await;
     let a_confirm = tokio::spawn(async move {
@@ -1187,20 +1185,11 @@ async fn a_c_reader_kept_from_reading_past_dead_after_keeps_a_live_session() {
     w.send_msg(1, &gen::PairConfirm { mac: [0; 32] })
         .await
         .unwrap();
-    let release = {
-        let fifo = fifo.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1000));
-            let mut f = std::fs::File::open(&fifo).unwrap();
-            let mut sink = Vec::new();
-            std::io::Read::read_to_end(&mut f, &mut sink).unwrap();
-        })
-    };
     for seq in 0..15 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         w.send_msg(0, &gen::Ping { seq, t_us: 1 }).await.unwrap();
     }
-    release.join().unwrap();
+    srv.knob("store_save_delay_ms", 0);
     let q = gen::RpcRequest {
         method: gen::METHOD_NODE_INFO,
         body: Vec::new(),
@@ -1857,7 +1846,7 @@ fn a_released_guess_keeps_the_address_in_the_pairing_table() {
     let p = buf.as_mut_ptr();
     unsafe {
         ffi::ava1_pl_init(p, 0, 1000, 0, 0); // 6 welcomes per 10 s
-        // 31 of the 32 slots, all seen before address 1.
+                                             // 31 of the 32 slots, all seen before address 1.
         for ip in 100..131u32 {
             assert_eq!(ffi::ava1_pl_welcome_allowed(p, ip, (ip - 99) as u64), 1);
         }

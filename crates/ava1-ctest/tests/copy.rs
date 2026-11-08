@@ -437,7 +437,7 @@ async fn a_copy_into_its_own_source_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_copy_into_a_folder_that_is_a_symlink_in_the_destination_fails_and_writes_nothing_there() {
+async fn a_copy_through_a_symlinked_destination_folder_fails_and_writes_nothing_there() {
     // The copy merges like an upload (SPEC.md §15.5): a destination folder that is a link must
     // not lead the copy's files out of the destination.
     let d = dir("copy-dest-link");
@@ -461,7 +461,14 @@ async fn a_copy_into_a_folder_that_is_a_symlink_in_the_destination_fails_and_wri
         .unwrap();
     let job = [0x7c; 16];
     assert_eq!(
-        start(&s, job, &d.join("usb/g"), &d.join("data/g"), gen::JF_OVERWRITE).await,
+        start(
+            &s,
+            job,
+            &d.join("usb/g"),
+            &d.join("data/g"),
+            gen::JF_OVERWRITE
+        )
+        .await,
         0
     );
     let st = wait_finished(&s, job).await;

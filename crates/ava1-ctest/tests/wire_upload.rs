@@ -777,6 +777,9 @@ async fn a_file_under_an_unlisted_symlinked_parent_is_refused_and_writes_nothing
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert!(escaped.is_empty(), "written outside the destination: {escaped:?}");
+    assert!(
+        escaped.is_empty(),
+        "written outside the destination: {escaped:?}"
+    );
     assert_eq!(map.status, gen::ERR_PATH, "{:?}", map.message);
 }

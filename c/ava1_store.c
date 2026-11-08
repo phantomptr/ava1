@@ -12,6 +12,8 @@
 #include "ava1_platform.h"
 #include "monocypher.h"
 
+uint32_t ava1_store_test_save_delay_ms;
+
 /* Temp file in the same directory, then rename: never crosses a device. A stale <path>.tmp
  * (a crash mid-write, or one planted there) is removed first and the temp made with O_EXCL |
  * O_NOFOLLOW: adopting it would keep its mode (the identity secret world-readable) or follow a
@@ -21,6 +23,10 @@ static int write_file_atomic(const char *path, const uint8_t *data, size_t n, in
     char tmp[300], dir[300];
     int fd, ok = 1;
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
+    {
+        uint32_t delay = __atomic_load_n(&ava1_store_test_save_delay_ms, __ATOMIC_ACQUIRE);
+        if (delay) ava1_platform_sleep_ms(delay);
+    }
     if (unlink(tmp) != 0 && errno != ENOENT) return -1;
     fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
     if (fd < 0) return -1;
