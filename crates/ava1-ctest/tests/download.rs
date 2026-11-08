@@ -14,7 +14,7 @@ use ava1::recv::{download_job, LocalSink, RecvOptions};
 use ava1::router::{Inbound, JobLink};
 use ava1::send::Progress;
 use ava1::session::connect;
-use ava1::wire::FrameMessage;
+use ava1::wire::{FrameMessage, Message};
 use ava1_ctest::{
     CSendWindow, CServer, C_E_CLOSED, C_E_IO, C_E_TOOLONG, SETTLE_EXIT, SETTLE_FATAL, SETTLE_GO_ON,
 };
@@ -911,4 +911,63 @@ async fn a_job_map_after_the_last_page_changes_nothing() {
     })
     .await
     .expect("the test hung");
+}
+
+/// A read policy is a prefix check on the path it is given, so a source with a `..` component
+/// (or a relative one) could name a folder the policy never allowed. Downloads and
+/// console-to-console sends take the upload's rule: an absolute path with no `.`, `..` or empty
+/// component (SPEC.md §11.2), refused with ERR_PATH.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_or_c2c_source_with_a_dotdot_or_relative_path_is_refused() {
+    ava1_ctest::c_set_read_allowed(true);
+    let d = dir("dl-dotdot");
+    std::fs::create_dir_all(d.join("a")).unwrap();
+    std::fs::write(d.join("a/f"), b"x").unwrap();
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let base = d.to_str().unwrap();
+    let bad = [
+        format!("{base}/a/../a"),
+        format!("{base}/./a"),
+        format!("{base}//a"),
+        format!("{base}/a/"),
+        "a".to_string(),
+    ];
+    for (i, src) in bad.iter().enumerate() {
+        let mut link = s.job([0x70 + i as u8; 16]);
+        let sink = Arc::new(LocalSink::new(d.join(format!("got{i}")), false));
+        let e = download(&mut link, src, 0, sink, ro(&d.join("ejobs"), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, ava1::send::SendError::Refused { status, .. } if status == gen::ERR_PATH),
+            "{src}: {e:?}"
+        );
+        let body = gen::C2cSend {
+            job_id: [0x80 + i as u8; 16],
+            host: "127.0.0.1".into(),
+            port: 1,
+            key: [0; 32],
+            token: [0; 16],
+            src: src.clone(),
+            dest: "/x".into(),
+            flags: 0,
+        };
+        let r = s
+            .rpc(gen::METHOD_C2C_SEND, &body.to_bytes().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status, gen::ERR_PATH, "c2c {src}");
+    }
 }

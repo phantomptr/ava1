@@ -1260,6 +1260,11 @@ static int c2c_send(const uint8_t *body, uint32_t len, const uint8_t peer[32], u
     memcpy(dest, c.dest, c.dest_len);
     dest[c.dest_len] = 0;
     if (!D.running) return AVA1_ERR_BUSY;
+    /* An absolute source with no "..", as for a download (ava1_send_open) and an upload. */
+    if (src[0] != '/' || !ava1_path_ok((const uint8_t *)src + 1, c.src_len - 1)) {
+        ava1_rpc_msg(out, cap, out_len, "the source is not a valid path");
+        return AVA1_ERR_PATH;
+    }
     /* may_read first: a denied path must not tell whether it exists. */
     if (!D.cfg.may_read || !D.cfg.may_read(src, (c.flags & AVA1_JF_UNSAFE_READ) != 0)) {
         ava1_rpc_msg(out, cap, out_len, "reading %s is not allowed", src);
