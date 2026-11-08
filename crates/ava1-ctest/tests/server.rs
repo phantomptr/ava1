@@ -465,6 +465,29 @@ async fn c_server_drops_a_blackholed_session() {
 }
 
 #[test]
+fn a_stale_or_planted_identity_temp_file_is_neither_adopted_nor_followed() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = dir("store-tmp");
+    // A world-readable leftover: the new secret must not inherit its mode.
+    let id = d.join("identity");
+    let tmp = d.join("identity.tmp");
+    std::fs::write(&tmp, b"old").unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+    c_identity_load_or_create(&id).unwrap();
+    let mode = std::fs::metadata(&id).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(!tmp.exists());
+    // A symlink where the temp goes: the secret must not be written through it.
+    let id2 = d.join("identity2");
+    let elsewhere = d.join("elsewhere");
+    std::fs::write(&elsewhere, b"theirs").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, d.join("identity2.tmp")).unwrap();
+    c_identity_load_or_create(&id2).unwrap();
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"theirs");
+    assert!(std::fs::symlink_metadata(&id2).unwrap().file_type().is_file());
+}
+
+#[test]
 fn c_store_rejects_bad_identity_and_skips_bad_peers() {
     // Review focus 4.
     let d = dir("store");
@@ -1823,6 +1846,35 @@ fn the_c_pairing_table_never_evicts_a_spent_budget() {
         // A new window frees the table.
         ffi::ava1_pl_reset(p);
         assert_eq!(ffi::ava1_pl_welcome_allowed(p, 500, 4000), 1);
+    }
+}
+
+/// Giving a guess back must not make the address look the least recently seen: the next unseen
+/// address would evict it, and its welcome window (6 per 10 s) would start over.
+#[test]
+fn a_released_guess_keeps_the_address_in_the_pairing_table() {
+    let mut buf = vec![0u8; unsafe { ffi::ava1_test_sizeof_pairlimit() }];
+    let p = buf.as_mut_ptr();
+    unsafe {
+        ffi::ava1_pl_init(p, 0, 1000, 0, 0); // 6 welcomes per 10 s
+        // 31 of the 32 slots, all seen before address 1.
+        for ip in 100..131u32 {
+            assert_eq!(ffi::ava1_pl_welcome_allowed(p, ip, (ip - 99) as u64), 1);
+        }
+        for _ in 0..6 {
+            assert_eq!(ffi::ava1_pl_welcome_allowed(p, 1, 1000), 1);
+        }
+        assert_eq!(ffi::ava1_pl_welcome_allowed(p, 1, 1000), 0);
+        let mut n = 0u32;
+        assert_eq!(ffi::ava1_pl_reserve(p, 1, 1000, &mut n), 1);
+        ffi::ava1_pl_release(p, 1);
+        // A new address takes the oldest slot (address 100), not address 1's.
+        assert_eq!(ffi::ava1_pl_welcome_allowed(p, 200, 1100), 1);
+        assert_eq!(
+            ffi::ava1_pl_welcome_allowed(p, 1, 1200),
+            0,
+            "address 1's welcome window still runs"
+        );
     }
 }
 

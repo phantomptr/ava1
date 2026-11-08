@@ -2,16 +2,25 @@
 
 #include <string.h>
 
-/* The entry for `ip`. With `create`, a missing one takes a free slot, else the least recently
- * touched slot that holds no spent budget. An entry with guesses in this window is never
- * evicted (its removal would hand the address a fresh budget): NULL when every slot is such. */
+/* The entry for `ip`, its seen time untouched. */
+static ava1_pl_ent_t *lookup(ava1_pairlimit_t *p, uint32_t ip) {
+    unsigned i;
+    for (i = 0; i < AVA1_PL_IPS; i++)
+        if (p->e[i].used && p->e[i].ip == ip) return &p->e[i];
+    return NULL;
+}
+
+/* The entry for `ip`, stamped seen at `now_ms`. With `create`, a missing one takes a free slot,
+ * else the least recently touched slot that holds no spent budget. An entry with guesses in
+ * this window is never evicted (its removal would hand the address a fresh budget): NULL when
+ * every slot is such. */
 static ava1_pl_ent_t *find(ava1_pairlimit_t *p, uint32_t ip, uint64_t now_ms, int create) {
     unsigned i, pick = AVA1_PL_IPS;
-    for (i = 0; i < AVA1_PL_IPS; i++)
-        if (p->e[i].used && p->e[i].ip == ip) {
-            p->e[i].seen_ms = now_ms;
-            return &p->e[i];
-        }
+    ava1_pl_ent_t *e = lookup(p, ip);
+    if (e) {
+        e->seen_ms = now_ms;
+        return e;
+    }
     if (!create) return NULL;
     for (i = 0; i < AVA1_PL_IPS; i++) {
         if (!p->e[i].used) {
@@ -69,7 +78,9 @@ int ava1_pl_reserve(ava1_pairlimit_t *p, uint32_t ip, uint64_t now_ms, uint32_t 
 }
 
 void ava1_pl_release(ava1_pairlimit_t *p, uint32_t ip) {
-    ava1_pl_ent_t *e = find(p, ip, 0, 0);
+    /* No new time to stamp: a seen time of 0 would make the address the first one evicted,
+     * which would also restart its welcome window. */
+    ava1_pl_ent_t *e = lookup(p, ip);
     if (e && e->fails) e->fails--;
     if (p->total) p->total--;
 }
