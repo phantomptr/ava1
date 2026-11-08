@@ -723,3 +723,60 @@ async fn a_lane_frame_checked_before_a_new_manifest_is_queued_before_it_replaces
         }
     }
 }
+
+/// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
+/// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
+/// refuses the job with ERR_PATH, and nothing lands where the link points.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_under_an_unlisted_symlinked_parent_is_refused_and_writes_nothing_outside() {
+    let d = dir("wire-escape");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x77u8; 16];
+    let root = d.join("dest");
+    let outside = d.join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let big = big_data((1 << 20) + 5);
+    // No ENTRY_DIR "link": only the files under it.
+    let m = Manifest {
+        entries: vec![file("link/big", big.len() as u64), file("link/pwn", 2)],
+    };
+    let mut link = s.job(job);
+    let ack = open(&mut link, job, &root).await;
+    assert_eq!((ack.status, ack.staged), (0, 0), "merge mode");
+    send_manifest(&link, job, &m).await;
+    let map: JobMap = next_control(&mut link).await.decode().unwrap();
+    if map.status == 0 {
+        // Pre-fix: the job runs and its files land through the link.
+        let lane = link.opener().unwrap().open().await.unwrap();
+        let tx = link.lane(lane).unwrap().tx;
+        tx.send_raw(Bundle::TYPE, 0, 1, bundle(job, 1, b"hi"))
+            .await
+            .unwrap();
+        tx.send_raw(Chunk::TYPE, 0, 2, chunk(job, 0, 0, &big[..1 << 20]))
+            .await
+            .unwrap();
+        tx.send_raw(Chunk::TYPE, 0, 3, chunk(job, 0, 1 << 20, &big[1 << 20..]))
+            .await
+            .unwrap();
+        link.control
+            .send(&FileRoot {
+                job_id: job,
+                file_id: 0,
+                root: *blake3::hash(&big).as_bytes(),
+            })
+            .await
+            .unwrap();
+        let _ = until_done(&mut link).await;
+    }
+    let escaped: Vec<_> = std::fs::read_dir(&outside)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(escaped.is_empty(), "written outside the destination: {escaped:?}");
+    assert_eq!(map.status, gen::ERR_PATH, "{:?}", map.message);
+}
