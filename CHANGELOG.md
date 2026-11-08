@@ -3,6 +3,24 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.7
+
+C library:
+
+- An upload or copy into an existing folder could write outside it: a file whose parent
+  folder was a symbolic link in the destination (and not listed in the manifest) was written
+  wherever the link pointed. The job now ends with `ERR_PATH` when any folder on the way is a
+  symbolic link or a file.
+- A download or console-to-console send whose source is relative or has a `.`, `..` or empty
+  part is refused with `ERR_PATH`, the same rule uploads and copies already had.
+- A single-file job whose manifest is not exactly one file is refused with `ERR_PROTOCOL`
+  (SPEC.md §11.8); a second file would have overwritten the first.
+- Saving the identity and the paired devices no longer reuses a leftover `.tmp` file (whose
+  permissions it kept, or a link it followed), and syncs the folder after the rename, so a
+  power cut cannot bring back an unpaired device or lose a new identity.
+- Giving back a pairing guess no longer makes the address the first one dropped from the
+  pairing table, which reset its limit on new pairing sessions.
+
 ## 1.0.6
 
 Nothing changes on the wire, on disk or in the public API.
