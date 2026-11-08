@@ -1169,12 +1169,14 @@ fn held_cost(len: u64) -> u64 {
 }
 
 /// Validates the key of a data frame before it is buffered: the file
-/// must be a file of the manifest, the range inside it, the key at or past the cursor and not
+/// must be a file of the manifest, the range inside it, the key at or past the cursor (or, for
+/// a file reset behind the cursor, at or past that file's own next offset in `behind`) and not
 /// already held, and the buffer within `REORDER_WINDOWS` of credit.
 #[allow(clippy::too_many_arguments)]
 fn admit_ordered(
     m: &Manifest,
     cursor: (u32, u64),
+    behind: &BTreeMap<u32, u64>,
     held: &BTreeMap<(u32, u64), (bool, Vec<u8>)>,
     held_bytes: u64,
     credit: u64,
@@ -1198,7 +1200,11 @@ fn admit_ordered(
     } else {
         check_chunk_range(e.size, off, len)?;
     }
-    if (file_id, off) < cursor || held.contains_key(&(file_id, off)) {
+    let passed = match behind.get(&file_id) {
+        Some(&next) => off < next,
+        None => (file_id, off) < cursor,
+    };
+    if passed || held.contains_key(&(file_id, off)) {
         return Ok(Admit::Drop);
     }
     if held_bytes.saturating_add(held_cost(len)) > credit.saturating_mul(REORDER_WINDOWS) {
@@ -1262,6 +1268,63 @@ async fn apply_chunk(
     }
     l.written.insert(off, off + len);
     Ok(())
+}
+
+/// Feeds one entry of the ordered reorder buffer to the sink: a chunk, or a bundle record
+/// (`whole`) whose root was checked when it arrived, so the whole-file write is sound without
+/// the chunk machinery.
+async fn feed_ordered(
+    sink: &Arc<dyn Sink>,
+    m: &Arc<Manifest>,
+    dir: &Path,
+    large: &mut HashMap<u32, Large>,
+    pending_small: &mut Vec<u32>,
+    small_held: &mut HashSet<u32>,
+    (fid, off, whole, data): (u32, u64, bool, Vec<u8>),
+) -> Result<(), SendError> {
+    if whole {
+        let s2 = sink.clone();
+        tokio::task::spawn_blocking(move || s2.write_whole(fid, &data))
+            .await
+            .map_err(proto)??;
+        pending_small.push(fid);
+        small_held.insert(fid);
+        Ok(())
+    } else {
+        apply_chunk(sink, m, dir, large, fid, off, data).await
+    }
+}
+
+/// Starts a large file over once a batch has journaled its Reset (a root mismatch), and only
+/// then asks the sender for it again: whatever the sender resends lands in the fresh state, as
+/// in the C receiver (`ava1_apply_reset` clears the file, then emits the retry). In an ordered
+/// job the cursor has passed the file, so its resend is admitted and fed through `behind`.
+#[allow(clippy::too_many_arguments)]
+async fn reset_large(
+    control: &ConnTx,
+    job_id: [u8; 16],
+    large: &mut HashMap<u32, Large>,
+    ordered: bool,
+    cursor: &mut (u32, u64),
+    behind: &mut BTreeMap<u32, u64>,
+    id: u32,
+) -> Result<(), SendError> {
+    large.remove(&id);
+    if ordered {
+        if cursor.0 == id {
+            *cursor = (id, 0);
+        } else if (id, 0) < *cursor {
+            behind.insert(id, 0);
+        }
+    }
+    control
+        .send(&gen::FileRetry {
+            job_id,
+            file_id: id,
+            reason: gen::RETRY_VERIFY,
+        })
+        .await
+        .map_err(|e| SendError::Disconnected(e.to_string()))
 }
 
 /// What a relay holds as the root of a finished file, to compare with the root the source
@@ -1750,6 +1813,10 @@ async fn run_loop(
     // root-checked bundle record rather than a chunk.
     let mut reorder: BTreeMap<(u32, u64), (bool, Vec<u8>)> = BTreeMap::new();
     let mut cursor: (u32, u64) = (0, 0);
+    // Files the cursor had passed when a root mismatch reset them: the resend is fed from offset 0
+    // again, each file in its own order (the next offset it wants), while the cursor stays where
+    // it is. Without this every resent chunk sat behind the cursor and was dropped: a hang.
+    let mut behind: BTreeMap<u32, u64> = BTreeMap::new();
     let mut reorder_bytes = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1764,6 +1831,8 @@ async fn run_loop(
     let mut writes: tokio::task::JoinSet<Result<BundleWritten, SendError>> =
         tokio::task::JoinSet::new();
     let write_gate = Arc::new(tokio::sync::Semaphore::new(WRITE_PAR));
+    // The files a running batch reset (`BatchJob::resets`), started over here as they come.
+    let (reset_tx, mut reset_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     loop {
         if o.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -1800,10 +1869,21 @@ async fn run_loop(
                 }
                 None
             }
+            Some(id) = reset_rx.recv() => {
+                reset_large(&link.control, job_id, &mut large, o.ordered, &mut cursor, &mut behind, id)
+                    .await?;
+                None
+            }
             joined = join_batch(batch_handle), if batch_handle.is_some() => {
                 let b = joined.expect("guarded by `is_some`");
                 *batch_handle = None;
                 tm.batch_done();
+                // A batch hands its resets over before it returns: start them over before the
+                // fold, which counts on it.
+                while let Ok(id) = reset_rx.try_recv() {
+                    reset_large(&link.control, job_id, &mut large, o.ordered, &mut cursor, &mut behind, id)
+                        .await?;
+                }
                 match b {
                     Ok(out) => {
                         if batch_is_progress(batch_worked) {
@@ -1886,6 +1966,7 @@ async fn run_loop(
                             if admit_ordered(
                                 &m,
                                 cursor,
+                                &behind,
                                 &reorder,
                                 reorder_bytes,
                                 granted,
@@ -1952,6 +2033,7 @@ async fn run_loop(
                                 if admit_ordered(
                                     &m,
                                     cursor,
+                                    &behind,
                                     &reorder,
                                     reorder_bytes,
                                     granted,
@@ -1995,6 +2077,33 @@ async fn run_loop(
                 }
                 credit_back += len;
                 if o.ordered {
+                    // A file reset behind the cursor first, each in its own offset order.
+                    let resent: Vec<u32> = behind.keys().copied().collect();
+                    for fid in resent {
+                        while let Some(next) = behind.get(&fid).copied() {
+                            let Some((whole, data)) = reorder.remove(&(fid, next)) else {
+                                break;
+                            };
+                            reorder_bytes -= held_cost(data.len() as u64);
+                            let n = data.len() as u64;
+                            feed_ordered(
+                                &sink,
+                                &m,
+                                &dir,
+                                &mut large,
+                                &mut pending_small,
+                                &mut small_held,
+                                (fid, next, whole, data),
+                            )
+                            .await?;
+                            let size = m.entry(fid).expect("a reset file of the manifest").size;
+                            if next + n >= size {
+                                behind.remove(&fid);
+                            } else {
+                                behind.insert(fid, next + n);
+                            }
+                        }
+                    }
                     // Feed the sink strictly in (file, offset) order; skip files already
                     // done — and zero-byte files, which no frame will ever describe: the
                     // cursor must not wait for a chunk that cannot arrive.
@@ -2037,18 +2146,16 @@ async fn run_loop(
                         };
                         reorder_bytes -= held_cost(data.len() as u64);
                         let (fid, off, n) = (cursor.0, cursor.1, data.len() as u64);
-                        if whole {
-                            // A bundle record: its root was checked when it arrived, so the
-                            // whole-file write is sound without the chunk machinery.
-                            let s2 = sink.clone();
-                            tokio::task::spawn_blocking(move || s2.write_whole(fid, &data))
-                                .await
-                                .map_err(proto)??;
-                            pending_small.push(fid);
-                            small_held.insert(fid);
-                        } else {
-                            apply_chunk(&sink, &m, &dir, &mut large, fid, off, data).await?;
-                        }
+                        feed_ordered(
+                            &sink,
+                            &m,
+                            &dir,
+                            &mut large,
+                            &mut pending_small,
+                            &mut small_held,
+                            (fid, off, whole, data),
+                        )
+                        .await?;
                         cursor = if off + n
                             >= m.entry(fid)
                                 .expect("the cursor is inside the manifest")
@@ -2060,12 +2167,15 @@ async fn run_loop(
                         };
                     }
                     // What the cursor has passed without feeding (a skipped partial range) is no
-                    // longer wanted: it must not sit in the buffer for the rest of the job.
-                    while let Some((&k, _)) = reorder.first_key_value() {
-                        if k >= cursor {
-                            break;
-                        }
-                        if let Some((_, (_, d))) = reorder.pop_first() {
+                    // longer wanted: it must not sit in the buffer for the rest of the job. A
+                    // reset file's resend waiting for its own next offset is still wanted.
+                    let stale: Vec<(u32, u64)> = reorder
+                        .range(..cursor)
+                        .map(|(k, _)| *k)
+                        .filter(|k| behind.get(&k.0).is_none_or(|&next| k.1 < next))
+                        .collect();
+                    for k in stale {
+                        if let Some((_, d)) = reorder.remove(&k) {
                             reorder_bytes -= held_cost(d.len() as u64);
                         }
                     }
@@ -2254,6 +2364,7 @@ async fn run_loop(
                     &pg,
                     &mut pending_small,
                     &mut large,
+                    &reset_tx,
                 )?;
                 let held = dir_lock.clone();
                 *batch_handle = Some(tokio::task::spawn(async move {
@@ -2441,6 +2552,9 @@ struct BatchJob {
     /// loop keeps putting CVs into — and what was durable before this batch, so the commit
     /// check sees the merged coverage without touching the loop's map.
     large: Vec<BatchLarge>,
+    /// Where a root mismatch goes once its Reset is journaled: the loop starts the file over and
+    /// only then sends the FileRetry (`reset_large`).
+    resets: tokio::sync::mpsc::UnboundedSender<u32>,
 }
 
 struct BatchLarge {
@@ -2460,8 +2574,9 @@ struct BatchDone {
     small: BTreeSet<u32>,
     /// Large files committed (part → final): the fold removes them from `large`.
     committed: Vec<u32>,
-    /// Large files whose root mismatched (Reset journaled, FileRetry sent): the fold
-    /// removes them so the next chunk starts them fresh, exactly as before.
+    /// Large files whose root mismatched (Reset journaled, handed to the loop through
+    /// `BatchJob::resets`). The loop has already started them over by the fold, so the fold
+    /// leaves them alone: what `large` holds for them now is the resend.
     reset: Vec<u32>,
     /// The large-file ranges this batch made durable: the fold subtracts each from
     /// `written` — the loop keeps writing while the batch runs, so a whole-file clear (the
@@ -2486,6 +2601,7 @@ fn snapshot_batch(
     pg: &Arc<Progress>,
     small: &mut Vec<u32>,
     large: &mut HashMap<u32, Large>,
+    resets: &tokio::sync::mpsc::UnboundedSender<u32>,
 ) -> Result<BatchJob, SendError> {
     let mut ranges = Vec::new();
     let mut roots = Vec::new();
@@ -2538,6 +2654,7 @@ fn snapshot_batch(
         ranges,
         roots,
         large: entries,
+        resets: resets.clone(),
     })
 }
 
@@ -2562,6 +2679,7 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         ranges,
         roots,
         large,
+        resets,
     } = job;
     let mut jnl = jnl;
     // Nothing written since the last batch: nothing to sync, journal or send — but logged files that
@@ -2722,14 +2840,11 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
             jnl = j;
             r?;
             st.apply(&rec);
-            control
-                .send(&gen::FileRetry {
-                    job_id,
-                    file_id: l.id,
-                    reason: gen::RETRY_VERIFY,
-                })
-                .await
-                .map_err(|e| SendError::Disconnected(e.to_string()))?;
+            // The loop resets the file and sends the FileRetry, not this task: a sender that
+            // resends at once must find the file already started over, or the fold of this
+            // batch would drop the resend it had acknowledged (the C receiver clears the file
+            // before it emits the retry, too). A loop that is gone has nobody to tell.
+            let _ = resets.send(l.id);
             reset.push(l.id);
             continue;
         }
@@ -2937,10 +3052,10 @@ fn fold_batch(
         done.insert(*id);
         large.remove(id);
     }
-    for id in &b.reset {
-        large.remove(id);
-    }
-    for r in &b.ranges {
+    // The reset files were started over by the loop (`reset_large`) before this fold; what
+    // `large` holds for them is the resend, which this batch's ranges (the bad bytes) must not
+    // touch.
+    for r in b.ranges.iter().filter(|r| !b.reset.contains(&r.file_id)) {
         if let Some(l) = large.get_mut(&r.file_id) {
             l.written = subtract(&l.written, r.offset, r.offset + r.len);
             l.durable.insert(r.offset, r.offset + r.len);
@@ -3062,8 +3177,11 @@ mod tests {
         let held: BTreeMap<(u32, u64), (bool, Vec<u8>)> =
             BTreeMap::from([((0, GROUP), (false, vec![]))]);
         let cap_of = |credit: u64| credit * REORDER_WINDOWS;
+        let none = BTreeMap::new();
         let g = |cursor, held_bytes, credit, id, off, len, whole| {
-            admit_ordered(&m, cursor, &held, held_bytes, credit, id, off, len, whole)
+            admit_ordered(
+                &m, cursor, &none, &held, held_bytes, credit, id, off, len, whole,
+            )
         };
         assert_eq!(
             g((0, 0), 0, GROUP, 0, 0, GROUP, false).unwrap(),
@@ -3091,6 +3209,12 @@ mod tests {
         let cap = GROUP * REORDER_WINDOWS;
         assert!(g((0, 0), cap - GROUP - 64, GROUP, 0, 2 * GROUP, GROUP, false).is_ok());
         assert!(g((0, 0), cap - GROUP - 63, GROUP, 0, 2 * GROUP, GROUP, false).is_err());
+        // A file reset behind the cursor takes its resend from its own next offset on.
+        let behind = BTreeMap::from([(0u32, GROUP)]);
+        let r = |off| admit_ordered(&m, (1, 0), &behind, &held, 0, GROUP, 0, off, GROUP, false);
+        assert_eq!(r(0).unwrap(), Admit::Drop, "before its own next offset");
+        assert_eq!(r(GROUP).unwrap(), Admit::Drop, "already held");
+        assert_eq!(r(2 * GROUP).unwrap(), Admit::Keep);
     }
 
     #[test]
@@ -3638,6 +3762,7 @@ mod tests {
             &pg,
             &mut Vec::new(),
             &mut large,
+            &tokio::sync::mpsc::unbounded_channel().0,
         )
         .unwrap();
         let out = batch_task(snap).await.unwrap();
@@ -3980,6 +4105,7 @@ mod tests {
             &pg,
             &mut Vec::new(),
             &mut large,
+            &tokio::sync::mpsc::unbounded_channel().0,
         )
         .unwrap();
         let t = Instant::now();
@@ -4849,5 +4975,210 @@ mod tests {
             DURABLE >> 20
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A `LocalSink` whose commit of file 1 waits at a gate: the batch that commits it is still
+    /// running while the test talks to the receiver.
+    struct CommitGateSink {
+        inner: LocalSink,
+        gate: Arc<Gate>,
+    }
+
+    impl Sink for CommitGateSink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, d: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, d)
+        }
+        fn write_whole(&self, id: u32, d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, d)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, b)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            if id == 1 {
+                self.gate.pass();
+            }
+            self.inner.commit(id)
+        }
+        fn sync_committed(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync_committed(ids)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn resume_key(&self) -> Option<(String, bool)> {
+            self.inner.resume_key()
+        }
+        fn resume_staged(&self, j: bool, a: bool) {
+            self.inner.resume_staged(j, a)
+        }
+    }
+
+    fn root_of(d: &[u8]) -> [u8; 32] {
+        let cvs: Vec<[u8; 32]> = d
+            .chunks(GROUP as usize)
+            .enumerate()
+            .map(|(i, g)| verify::group_cv(g, i as u64))
+            .collect();
+        verify::root_from_cvs(&cvs)
+    }
+
+    /// Two two-group files in one batch: file 0's root mismatches (Reset + FileRetry) while file
+    /// 1's commit is held at the gate. The sender resends file 0 either while that batch still
+    /// runs (`during`) or after it ended; both must finish the job.
+    async fn resend_after_a_reset(tag: &str, job: [u8; 16], during: bool) {
+        let Wired {
+            mut link,
+            router,
+            mut peer,
+            _keep,
+        } = wired(job, None);
+        let o = opts(tag, 64 << 20, Some(Duration::from_secs(1)));
+        let jobs_dir = o.jobs_dir.clone();
+        let root = jobs_dir.with_extension("dest");
+        let _ = std::fs::remove_dir_all(&root);
+        let size = 2 * GROUP;
+        let m = Arc::new(small_manifest(&[size, size]));
+        let gate = Arc::new(Gate::default());
+        let sink: Arc<dyn Sink> = Arc::new(CommitGateSink {
+            inner: LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()),
+            gate: gate.clone(),
+        });
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let d0 = vec![1u8; size as usize];
+        let d1 = vec![2u8; size as usize];
+        let chunk = |id: u32, d: &Vec<u8>| Chunk {
+            job_id: job,
+            file_id: id,
+            offset: 0,
+            data: d.clone(),
+        };
+        let file_root = |id: u32, root: [u8; 32]| FileRoot {
+            job_id: job,
+            file_id: id,
+            root,
+        };
+        router.route_lane(1, frame_of(&chunk(1, &d1), 0)).await;
+        router
+            .route_control(frame_of(&file_root(1, root_of(&d1)), 0))
+            .await;
+        router.route_lane(1, frame_of(&chunk(0, &d0), 1)).await;
+        router
+            .route_control(frame_of(&file_root(0, [9; 32]), 0))
+            .await;
+        let fr = until(&mut peer, gen::FileRetry::TYPE).await;
+        assert_eq!(fr.decode::<gen::FileRetry>().unwrap().file_id, 0);
+        gate.entered(1).await;
+        if !during {
+            gate.open();
+            tokio::time::sleep(Duration::from_millis(300)).await; // the fold has run
+        }
+        // The sender answers the FileRetry at once: the whole file again, with its root.
+        router.route_lane(1, frame_of(&chunk(0, &d0), 2)).await;
+        router
+            .route_control(frame_of(&file_root(0, root_of(&d0)), 0))
+            .await;
+        if during {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            gate.open();
+        }
+        let r = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let f0 = std::fs::read(root.join("f0"));
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let rep = r
+            .expect("the resend was lost: the job never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep.files, 2);
+        assert_eq!(f0.unwrap(), d0, "file 0 holds the resent bytes");
+    }
+
+    /// The batch that reset a file used to send the FileRetry itself and then, at its fold,
+    /// drop the file's state — including the resend the sender had made in between, already
+    /// acknowledged, so it never came again and the job hung.
+    #[tokio::test]
+    async fn a_resend_during_the_batch_that_reset_the_file_is_kept() {
+        resend_after_a_reset("reset-during", [0x77; 16], true).await;
+    }
+
+    #[tokio::test]
+    async fn a_resend_after_the_batch_that_reset_the_file_is_kept() {
+        resend_after_a_reset("reset-after", [0x78; 16], false).await;
+    }
+
+    /// An ordered job's cursor has passed a file by the time its root mismatches: the resend is
+    /// behind the cursor and used to be dropped as stale, a hang every time.
+    #[tokio::test]
+    async fn an_ordered_job_takes_the_resend_of_a_file_reset_behind_its_cursor() {
+        let job = [0x79; 16];
+        let Wired {
+            mut link,
+            router,
+            mut peer,
+            _keep,
+        } = wired(job, None);
+        let mut o = opts("reset-ordered", 64 << 20, Some(Duration::from_secs(1)));
+        o.ordered = true;
+        let jobs_dir = o.jobs_dir.clone();
+        let root = jobs_dir.with_extension("dest");
+        let _ = std::fs::remove_dir_all(&root);
+        // File 0 is reset behind the cursor; file 1 is still to come after it.
+        let size = 2 * GROUP;
+        let m = Arc::new(small_manifest(&[size, size]));
+        let sink: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()));
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let d0 = vec![1u8; size as usize];
+        let d1 = vec![2u8; size as usize];
+        let g = GROUP as usize;
+        let chunk = |id: u32, off: usize, d: &[u8]| Chunk {
+            job_id: job,
+            file_id: id,
+            offset: off as u64,
+            data: d.to_vec(),
+        };
+        let file_root = |id: u32, root: [u8; 32]| FileRoot {
+            job_id: job,
+            file_id: id,
+            root,
+        };
+        router.route_lane(1, frame_of(&chunk(0, 0, &d0), 0)).await;
+        router
+            .route_control(frame_of(&file_root(0, [9; 32]), 0))
+            .await;
+        let fr = until(&mut peer, gen::FileRetry::TYPE).await;
+        assert_eq!(fr.decode::<gen::FileRetry>().unwrap().file_id, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await; // the fold has run
+                                                              // The resend in two chunks, the second first; then file 1, which the cursor wants.
+        router
+            .route_lane(1, frame_of(&chunk(0, g, &d0[g..]), 1))
+            .await;
+        router
+            .route_lane(1, frame_of(&chunk(0, 0, &d0[..g]), 2))
+            .await;
+        router
+            .route_control(frame_of(&file_root(0, root_of(&d0)), 0))
+            .await;
+        router.route_lane(1, frame_of(&chunk(1, 0, &d1), 3)).await;
+        router
+            .route_control(frame_of(&file_root(1, root_of(&d1)), 0))
+            .await;
+        let r = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let f0 = std::fs::read(root.join("f0"));
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let rep = r
+            .expect("the ordered resend was dropped: the job never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep.files, 2);
+        assert_eq!(f0.unwrap(), d0, "file 0 holds the resent bytes");
     }
 }
