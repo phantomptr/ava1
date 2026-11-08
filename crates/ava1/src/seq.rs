@@ -1371,9 +1371,13 @@ mod tests {
                 .collect(),
             10,
         );
-        let mut r = start(&m, &s, Need::default(), None, 96 * 1024, GROUP);
+        // A budget of a few records parks the decoder long before the end, so the pass cannot
+        // finish before the cancel however the threads are scheduled (a 96 MiB budget let a
+        // fast decoder deliver all 200 first, on a loaded CI runner).
+        let mut r = start(&m, &s, Need::default(), None, 16, GROUP);
         assert!(matches!(r.next().await, Read::Record { .. }));
         r.cancel.store(true, Ordering::Relaxed);
+        r.budget.close(); // the sender's teardown does the same, waking a parked decoder
         let h = std::mem::replace(&mut r.h, std::thread::spawn(|| {}));
         tokio::task::spawn_blocking(move || h.join().unwrap())
             .await
