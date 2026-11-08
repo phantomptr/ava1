@@ -1,18 +1,35 @@
 name: Bug report
-description: Something in the crates or the C library isn't working as expected
+description: A transfer, pairing or connection that goes wrong, or a crate or the C library misbehaving
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to file a bug report!
-        Security issues go privately to the maintainer instead (see SECURITY.md).
+        Thanks for the report. Security issues go privately to the maintainer instead (see SECURITY.md).
+        If the Rust crate and the C library disagree about the protocol, or the spec looks wrong, use **Protocol or interop problem** instead.
   - type: textarea
     id: what-happened
     attributes:
       label: What happened?
-      description: A clear description of the bug. What did you expect? What actually happened?
-      placeholder: "When I ..."
+      description: What you expected, and what happened instead.
+      placeholder: "When I upload a folder with ..., the job ends with ERR_VERIFY instead of ..."
+    validations:
+      required: true
+  - type: dropdown
+    id: doing
+    attributes:
+      label: What were you doing?
+      multiple: true
+      options:
+        - Pairing (the code, or the first connection)
+        - Connecting to a device that is already paired
+        - Uploading files or folders
+        - Downloading files or folders
+        - Copying or moving on the node
+        - Resuming or cancelling a job
+        - An application method (docs/extending.md)
+        - Building or generating code
+        - Something else
     validations:
       required: true
   - type: dropdown
@@ -22,37 +39,49 @@ body:
       multiple: true
       options:
         - Rust crate (ava1), client side
-        - Rust crate (ava1), node side
+        - Rust crate (ava1), server or receiver side
         - C library (libava1)
         - Code generator (ava1-gen)
-        - Specification or test vectors
+        - Not sure
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: Version
-      placeholder: "e.g. ava1 1.0.2, or the commit you built the C library from"
-    validations:
-      required: true
-  - type: input
-    id: platform
-    attributes:
-      label: Platform
-      placeholder: "e.g. macOS 15 on Apple Silicon, Ubuntu 24.04 x86-64, PS5 9.60"
+      placeholder: "e.g. ava1 1.0.7, or the commit you built the C library from"
     validations:
       required: true
   - type: input
     id: peer
     attributes:
       label: The other side
-      description: What runs on the other end of the connection, and its version, if it is involved.
-      placeholder: "e.g. the C node in ps5upload, on a PS5"
+      description: What runs on the other end of the connection, and its version.
+      placeholder: "e.g. the C node in ps5upload 11.6.0 on a PS5 (firmware 9.60)"
+  - type: input
+    id: platform
+    attributes:
+      label: Your platform
+      placeholder: "e.g. macOS 15 on Apple Silicon, Windows 11 x86-64, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: code
+    attributes:
+      label: Error code
+      description: The `ERR_*` code or status number you got, if any.
+      placeholder: "e.g. ERR_STALLED, ERR_PATH, 13"
+  - type: input
+    id: size
+    attributes:
+      label: How much data
+      description: For transfer problems, roughly how many files and how big, and the network (Wi-Fi, wired, the same machine).
+      placeholder: "e.g. 40,000 files, 85 GB, wired gigabit"
   - type: textarea
     id: logs
     attributes:
-      label: Relevant logs
-      description: The error and a few lines of context. The library's diagnostic lines go to standard error unless you set `ava1::diag::set_sink`.
+      label: Logs
+      description: The error and a few lines around it. The library's diagnostic lines go to standard error unless you set `ava1::diag::set_sink`. Remove anything private, such as pairing codes or keys.
       render: shell
   - type: textarea
     id: repro

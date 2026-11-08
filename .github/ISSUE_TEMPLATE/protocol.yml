@@ -1,0 +1,46 @@
+name: Protocol or interop problem
+description: The Rust crate and the C library disagree, a peer breaks the spec, or the spec is wrong or unclear
+labels: ["protocol"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Version 1 peers already run in the field, so anything here is checked against `spec/SPEC.md`, the schema and the test vectors.
+        Security issues (a way past pairing, the handshake or the path checks) go privately to the maintainer instead (see SECURITY.md).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem?
+      options:
+        - The Rust crate and the C library behave differently
+        - A peer does something the spec does not allow
+        - The spec is wrong, contradicts itself or leaves something open
+        - A test vector looks wrong
+    validations:
+      required: true
+  - type: input
+    id: section
+    attributes:
+      label: Spec section
+      description: The part of `spec/SPEC.md` (or `CLIENT_CONTRACT.md`) this is about.
+      placeholder: "e.g. SPEC.md §11.8"
+  - type: textarea
+    id: details
+    attributes:
+      label: What happens, and what the spec says should happen
+      description: Which side sends what, and what the other side does with it. Frame types and field values help.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions on each side
+      placeholder: "e.g. ava1 1.0.7 client, libava1 from commit a6ee659 as the server"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: A test in `crates/ava1-ctest`, a frame dump or exact steps, if you have them.
+      render: shell

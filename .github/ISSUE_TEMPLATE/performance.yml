@@ -1,0 +1,49 @@
+name: Slow transfer
+description: Transfers run slower than the link allows, stall, or use too much memory or CPU
+labels: ["performance"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you see?
+      description: The speed you got, the speed you expected, and how you measured both.
+      placeholder: "Uploads run at 30 MB/s; the same files over SMB run at 110 MB/s."
+    validations:
+      required: true
+  - type: input
+    id: data
+    attributes:
+      label: The data
+      description: How many files, their total size, and whether they are mostly small or mostly large.
+      placeholder: "e.g. 120,000 files, 60 GB, mostly under 64 KB"
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: The network
+      placeholder: "e.g. wired gigabit through one switch, 5 GHz Wi-Fi, the same machine"
+    validations:
+      required: true
+  - type: input
+    id: sides
+    attributes:
+      label: Both ends and their versions
+      placeholder: "e.g. ava1 1.0.7 on macOS 15 (M2) to libava1 in ps5upload 11.6.0 on a PS5"
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      options:
+        - Upload
+        - Download
+        - Copy or move on the node
+        - Both directions
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings and logs
+      description: Any lane, window or governor settings you changed, and the diagnostic lines from the transfer.
+      render: shell
