@@ -1132,7 +1132,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     uint32_t ch;
     ava1_w_t w;
     sess_terms_t terms;
-    int known, open, busy = 0, notify = 0, idx, filled = 0, ci_ok, ticket = -1;
+    int known, open, busy = 0, notify = 0, idx = -1, filled = 0, ci_ok, ticket = -1;
     uint32_t pair_code = 0;
 
     memset(&terms, 0, sizeof terms);
@@ -1140,11 +1140,6 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     memset(&eph, 0, sizeof eph);
     memset(c2s, 0, sizeof c2s);
     memset(s2c, 0, sizeof s2c);
-    idx = sess_reserve();
-    if (idx < 0) {
-        (void)send_error(&k->io, AVA1_ERR_BUSY, "too many sessions");
-        return;
-    }
     if (ava1_hs1_decode(buf, len, &m1) != 0) {
         (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad Hs1");
         goto out;
@@ -1196,6 +1191,13 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     if (!ci_ok) {
         /* No pairing nonce (SPEC.md 4.6): refused, sealed like every frame from here on. */
         (void)send_error(&k->io, AVA1_ERR_PROTOCOL, "bad ClientInfo");
+        goto out;
+    }
+    /* The session slot is taken once message 3 has proved the client's key, not at Hs1: a peer
+     * that opens handshakes and never finishes them must not hold the slots paired devices
+     * need (the connection limits bound it instead). */
+    if ((idx = sess_reserve()) < 0) {
+        (void)send_error(&k->io, AVA1_ERR_BUSY, "too many sessions");
         goto out;
     }
     /* The owner's rules for devices (admit_new / refused) decide before the pairing rules. A
@@ -1327,7 +1329,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     if (S.cfg.data && S.cfg.data->on_session_end) S.cfg.data->on_session_end(sid);
     sess_remove(idx, sid);
 out:
-    if (!filled) sess_release(idx);
+    if (!filled && idx >= 0) sess_release(idx);
     ava1_noise_wipe(&ns);
     crypto_wipe(&eph, sizeof eph);
     crypto_wipe(secret, sizeof secret);

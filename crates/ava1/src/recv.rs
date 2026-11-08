@@ -231,14 +231,14 @@ impl LocalSink {
             let st = self.st.lock().unwrap();
             self.path(&st, id, false)
         };
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&p)?;
+        self.parents_for(&p)?;
+        let f = open_nofollow(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true),
+            &p,
+        )?;
         verify::write_all_at(&f, data, 0)?;
         f.set_len(data.len() as u64)
     }
@@ -280,7 +280,7 @@ impl LocalSink {
                 self.path(&st, l.id, false)
             };
             let size = m.entry(l.id).map_or(0, |e| e.size);
-            let open = || std::fs::OpenOptions::new().write(true).open(&p);
+            let open = || open_nofollow(std::fs::OpenOptions::new().write(true), &p);
             let f = match open() {
                 Ok(f) if f.metadata().map(|md| md.len() == size).unwrap_or(false) => f,
                 _ => {
@@ -312,6 +312,28 @@ impl LocalSink {
         } else {
             self.root.clone()
         }
+    }
+
+    /// Whether the folders the job writes into may already hold someone else's entries: a
+    /// merge into an existing folder. A staged tree and a single file's own path are this job's.
+    fn merging(&self) -> bool {
+        !self.single && !self.staged.load(Ordering::Relaxed)
+    }
+
+    /// Makes the parent folders of `p` (a path under `base()`), first refusing, in a merge, any
+    /// existing one that is a symlink or not a folder. A manifest need not list a file's parent
+    /// folders, so `prepare` cannot have seen them all, and `create_dir_all` and the open would
+    /// follow a symlink out of the destination.
+    fn parents_for(&self, p: &Path) -> io::Result<()> {
+        let Some(parent) = p.parent() else {
+            return Ok(());
+        };
+        if self.merging() {
+            if let Ok(rel) = parent.strip_prefix(self.base()) {
+                refuse_links(&self.base(), rel, &mut HashSet::new())?;
+            }
+        }
+        std::fs::create_dir_all(parent)
     }
 
     /// The path for `id`, part or final. Every `.ava-part` path is derived from the final
@@ -349,16 +371,16 @@ impl LocalSink {
             }
         }
         let p = self.path(&st, id, part);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.parents_for(&p)?;
         let open = || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(truncate)
-                .open(&p)
+            open_nofollow(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .read(true)
+                    .truncate(truncate),
+                &p,
+            )
         };
         // Descriptors are bounded: past the cap the cache drops its other entries (their data is
         // fsynced later through a reopen, see `sync`), and the process running out anyway is
@@ -388,7 +410,7 @@ impl LocalSink {
             }
             (self.path(&st, id, false), self.path(&st, id, true))
         };
-        let open = |p: &Path| std::fs::OpenOptions::new().write(true).open(p);
+        let open = |p: &Path| open_nofollow(std::fs::OpenOptions::new().write(true), p);
         // The part file first: a large file mid-write lives there, while a small file written
         // whole has no part file and is at its final path.
         match open(&part) {
@@ -399,6 +421,95 @@ impl LocalSink {
             Err(e) => Err(e),
         }
     }
+}
+
+/// A path the receiver will not write through (SPEC.md §15.5): the job ends `ERR_PATH`.
+#[derive(Debug)]
+struct PathRefused(String);
+
+impl std::fmt::Display for PathRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PathRefused {}
+
+fn path_refused(why: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, PathRefused(why))
+}
+
+/// Whether `e` is a refused path, which the run reports to the sender as `ERR_PATH`.
+fn is_path_refused(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<PathRefused>())
+}
+
+/// Whether a manifest path, joined onto the destination, stays below it: only plain names, no
+/// root, prefix, `.` or `..`. `manifest::check_path` splits on '/' only, which is the whole
+/// story on unix; on Windows '\\' is a separator too, `C:` a drive and `name:stream` an
+/// alternate data stream, so a path holding either character is refused there outright.
+fn plain_relative(rel: &str) -> bool {
+    #[cfg(windows)]
+    if rel.contains(['\\', ':']) {
+        return false;
+    }
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Refuses `rel` (a folder path under `base`) when any of its folders that already exists is a
+/// symlink or not a folder; one that does not exist yet ends the walk (nothing exists below
+/// it). `seen` holds the folders already found sound, so a manifest's shared parents are
+/// looked at once.
+fn refuse_links(base: &Path, rel: &Path, seen: &mut HashSet<PathBuf>) -> io::Result<()> {
+    let mut at = PathBuf::new();
+    for c in rel.components() {
+        at.push(c);
+        if seen.contains(&at) {
+            continue;
+        }
+        match std::fs::symlink_metadata(base.join(&at)) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(path_refused(format!(
+                    "{:.100} is a symbolic link",
+                    at.display()
+                )))
+            }
+            Ok(md) if !md.is_dir() => {
+                return Err(path_refused(format!(
+                    "{:.100} is not a folder",
+                    at.display()
+                )))
+            }
+            Ok(_) => {
+                seen.insert(at.clone());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Opens a job file without following a symlink at its last component (SPEC.md §15.2:
+/// `O_NOFOLLOW`): a link planted where a file goes must not lead the write outside the
+/// destination. Such a link is a refused path, not an I/O error.
+fn open_nofollow(o: &mut std::fs::OpenOptions, p: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(p).map_err(|e| {
+        let link = std::fs::symlink_metadata(p).is_ok_and(|md| md.file_type().is_symlink());
+        if link && !is_fd_exhausted(&e) {
+            path_refused(format!("{} is a symbolic link", p.display()))
+        } else {
+            e
+        }
+    })
 }
 
 /// The most files a `LocalSink` keeps open at once (large files being written; a small file's
@@ -517,7 +628,32 @@ impl Sink for LocalSink {
         let mut st = self.st.lock().unwrap();
         st.m = Some(Arc::new(m.clone()));
         if !self.single {
+            for e in &m.entries {
+                if !plain_relative(&e.path) {
+                    return Err(path_refused(format!(
+                        "{:.100} is not a plain relative path here",
+                        e.path
+                    )));
+                }
+            }
             let base = self.base();
+            // A merge into an existing folder (SPEC.md §15.5): a manifest folder, or a file's
+            // parent folder, that already exists as a symlink or as something other than a
+            // folder is refused before anything is created through it.
+            if self.merging() {
+                let mut seen = HashSet::new();
+                for e in &m.entries {
+                    let rel = Path::new(&e.path);
+                    let dirs = if e.kind == gen::ENTRY_DIR {
+                        Some(rel)
+                    } else {
+                        rel.parent()
+                    };
+                    if let Some(d) = dirs {
+                        refuse_links(&base, d, &mut seen)?;
+                    }
+                }
+            }
             std::fs::create_dir_all(&base)?;
             for e in m.entries.iter().filter(|e| e.kind == gen::ENTRY_DIR) {
                 std::fs::create_dir_all(base.join(&e.path))?;
@@ -669,7 +805,11 @@ impl Sink for LocalSink {
                 let st = self.st.lock().unwrap();
                 self.path(&st, rec.file_id, false)
             };
-            let same = std::fs::read(&path)
+            let same = open_nofollow(std::fs::OpenOptions::new().read(true), &path)
+                .and_then(|mut f| {
+                    let mut b = Vec::new();
+                    io::Read::read_to_end(&mut f, &mut b).map(|_| b)
+                })
                 .map(|b| *blake3::hash(&b).as_bytes() == rec.root)
                 .unwrap_or(false);
             if !same {
@@ -690,7 +830,7 @@ impl Sink for LocalSink {
             let st = self.st.lock().unwrap();
             self.path(&st, id, true)
         };
-        let f = std::fs::File::open(p)?;
+        let f = open_nofollow(std::fs::OpenOptions::new().read(true), &p)?;
         verify::read_exact_at(&f, buf, off).map(|_| buf.len())
     }
 
@@ -727,7 +867,7 @@ impl Sink for LocalSink {
         // The cached descriptor, or (the cache having been trimmed) the part file reopened.
         let f = match cached {
             Some(f) => Some(f),
-            None => match std::fs::OpenOptions::new().write(true).open(&part) {
+            None => match open_nofollow(std::fs::OpenOptions::new().write(true), &part) {
                 Ok(f) => Some(f),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
@@ -1169,12 +1309,14 @@ fn held_cost(len: u64) -> u64 {
 }
 
 /// Validates the key of a data frame before it is buffered: the file
-/// must be a file of the manifest, the range inside it, the key at or past the cursor and not
+/// must be a file of the manifest, the range inside it, the key at or past the cursor (or, for
+/// a file reset behind the cursor, at or past that file's own next offset in `behind`) and not
 /// already held, and the buffer within `REORDER_WINDOWS` of credit.
 #[allow(clippy::too_many_arguments)]
 fn admit_ordered(
     m: &Manifest,
     cursor: (u32, u64),
+    behind: &BTreeMap<u32, u64>,
     held: &BTreeMap<(u32, u64), (bool, Vec<u8>)>,
     held_bytes: u64,
     credit: u64,
@@ -1198,7 +1340,11 @@ fn admit_ordered(
     } else {
         check_chunk_range(e.size, off, len)?;
     }
-    if (file_id, off) < cursor || held.contains_key(&(file_id, off)) {
+    let passed = match behind.get(&file_id) {
+        Some(&next) => off < next,
+        None => (file_id, off) < cursor,
+    };
+    if passed || held.contains_key(&(file_id, off)) {
         return Ok(Admit::Drop);
     }
     if held_bytes.saturating_add(held_cost(len)) > credit.saturating_mul(REORDER_WINDOWS) {
@@ -1264,6 +1410,63 @@ async fn apply_chunk(
     Ok(())
 }
 
+/// Feeds one entry of the ordered reorder buffer to the sink: a chunk, or a bundle record
+/// (`whole`) whose root was checked when it arrived, so the whole-file write is sound without
+/// the chunk machinery.
+async fn feed_ordered(
+    sink: &Arc<dyn Sink>,
+    m: &Arc<Manifest>,
+    dir: &Path,
+    large: &mut HashMap<u32, Large>,
+    pending_small: &mut Vec<u32>,
+    small_held: &mut HashSet<u32>,
+    (fid, off, whole, data): (u32, u64, bool, Vec<u8>),
+) -> Result<(), SendError> {
+    if whole {
+        let s2 = sink.clone();
+        tokio::task::spawn_blocking(move || s2.write_whole(fid, &data))
+            .await
+            .map_err(proto)??;
+        pending_small.push(fid);
+        small_held.insert(fid);
+        Ok(())
+    } else {
+        apply_chunk(sink, m, dir, large, fid, off, data).await
+    }
+}
+
+/// Starts a large file over once a batch has journaled its Reset (a root mismatch), and only
+/// then asks the sender for it again: whatever the sender resends lands in the fresh state, as
+/// in the C receiver (`ava1_apply_reset` clears the file, then emits the retry). In an ordered
+/// job the cursor has passed the file, so its resend is admitted and fed through `behind`.
+#[allow(clippy::too_many_arguments)]
+async fn reset_large(
+    control: &ConnTx,
+    job_id: [u8; 16],
+    large: &mut HashMap<u32, Large>,
+    ordered: bool,
+    cursor: &mut (u32, u64),
+    behind: &mut BTreeMap<u32, u64>,
+    id: u32,
+) -> Result<(), SendError> {
+    large.remove(&id);
+    if ordered {
+        if cursor.0 == id {
+            *cursor = (id, 0);
+        } else if (id, 0) < *cursor {
+            behind.insert(id, 0);
+        }
+    }
+    control
+        .send(&gen::FileRetry {
+            job_id,
+            file_id: id,
+            reason: gen::RETRY_VERIFY,
+        })
+        .await
+        .map_err(|e| SendError::Disconnected(e.to_string()))
+}
+
 /// What a relay holds as the root of a finished file, to compare with the root the source
 /// announced: the root of the chunks that passed through it (the CVs of a file of several
 /// groups, the hash of a one-group file) or, when part of the file never passed through here
@@ -1320,7 +1523,30 @@ async fn run(
     if let Some(h) = batch_handle.take() {
         let _ = h.await;
     }
-    outcome
+    match outcome {
+        // A path the sink will not write through (a symlink or a non-folder in the way, a path
+        // that is not plain here) is the sender's to hear about, as for a bad manifest path:
+        // `ERR_PATH` in a JobDone, not a session that just goes quiet.
+        Err(SendError::Source(e)) if is_path_refused(&e) => {
+            let message = e.to_string();
+            let _ = link
+                .control
+                .send(&JobDone {
+                    job_id: link.job_id,
+                    status: gen::ERR_PATH,
+                    files: 0,
+                    bytes: 0,
+                    message: Some(message.clone()),
+                    settling: None,
+                })
+                .await;
+            Err(SendError::Refused {
+                status: gen::ERR_PATH,
+                message,
+            })
+        }
+        o => o,
+    }
 }
 
 /// Held by a run for its whole life, and by the work it hands off (the sync batch, the
@@ -1750,6 +1976,10 @@ async fn run_loop(
     // root-checked bundle record rather than a chunk.
     let mut reorder: BTreeMap<(u32, u64), (bool, Vec<u8>)> = BTreeMap::new();
     let mut cursor: (u32, u64) = (0, 0);
+    // Files the cursor had passed when a root mismatch reset them: the resend is fed from offset 0
+    // again, each file in its own order (the next offset it wants), while the cursor stays where
+    // it is. Without this every resent chunk sat behind the cursor and was dropped: a hang.
+    let mut behind: BTreeMap<u32, u64> = BTreeMap::new();
     let mut reorder_bytes = 0u64;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1764,6 +1994,8 @@ async fn run_loop(
     let mut writes: tokio::task::JoinSet<Result<BundleWritten, SendError>> =
         tokio::task::JoinSet::new();
     let write_gate = Arc::new(tokio::sync::Semaphore::new(WRITE_PAR));
+    // The files a running batch reset (`BatchJob::resets`), started over here as they come.
+    let (reset_tx, mut reset_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     loop {
         if o.cancel.load(Ordering::Relaxed) {
             let _ = link
@@ -1800,10 +2032,21 @@ async fn run_loop(
                 }
                 None
             }
+            Some(id) = reset_rx.recv() => {
+                reset_large(&link.control, job_id, &mut large, o.ordered, &mut cursor, &mut behind, id)
+                    .await?;
+                None
+            }
             joined = join_batch(batch_handle), if batch_handle.is_some() => {
                 let b = joined.expect("guarded by `is_some`");
                 *batch_handle = None;
                 tm.batch_done();
+                // A batch hands its resets over before it returns: start them over before the
+                // fold, which counts on it.
+                while let Ok(id) = reset_rx.try_recv() {
+                    reset_large(&link.control, job_id, &mut large, o.ordered, &mut cursor, &mut behind, id)
+                        .await?;
+                }
                 match b {
                     Ok(out) => {
                         if batch_is_progress(batch_worked) {
@@ -1886,6 +2129,7 @@ async fn run_loop(
                             if admit_ordered(
                                 &m,
                                 cursor,
+                                &behind,
                                 &reorder,
                                 reorder_bytes,
                                 granted,
@@ -1952,6 +2196,7 @@ async fn run_loop(
                                 if admit_ordered(
                                     &m,
                                     cursor,
+                                    &behind,
                                     &reorder,
                                     reorder_bytes,
                                     granted,
@@ -1995,6 +2240,33 @@ async fn run_loop(
                 }
                 credit_back += len;
                 if o.ordered {
+                    // A file reset behind the cursor first, each in its own offset order.
+                    let resent: Vec<u32> = behind.keys().copied().collect();
+                    for fid in resent {
+                        while let Some(next) = behind.get(&fid).copied() {
+                            let Some((whole, data)) = reorder.remove(&(fid, next)) else {
+                                break;
+                            };
+                            reorder_bytes -= held_cost(data.len() as u64);
+                            let n = data.len() as u64;
+                            feed_ordered(
+                                &sink,
+                                &m,
+                                &dir,
+                                &mut large,
+                                &mut pending_small,
+                                &mut small_held,
+                                (fid, next, whole, data),
+                            )
+                            .await?;
+                            let size = m.entry(fid).expect("a reset file of the manifest").size;
+                            if next + n >= size {
+                                behind.remove(&fid);
+                            } else {
+                                behind.insert(fid, next + n);
+                            }
+                        }
+                    }
                     // Feed the sink strictly in (file, offset) order; skip files already
                     // done — and zero-byte files, which no frame will ever describe: the
                     // cursor must not wait for a chunk that cannot arrive.
@@ -2037,18 +2309,16 @@ async fn run_loop(
                         };
                         reorder_bytes -= held_cost(data.len() as u64);
                         let (fid, off, n) = (cursor.0, cursor.1, data.len() as u64);
-                        if whole {
-                            // A bundle record: its root was checked when it arrived, so the
-                            // whole-file write is sound without the chunk machinery.
-                            let s2 = sink.clone();
-                            tokio::task::spawn_blocking(move || s2.write_whole(fid, &data))
-                                .await
-                                .map_err(proto)??;
-                            pending_small.push(fid);
-                            small_held.insert(fid);
-                        } else {
-                            apply_chunk(&sink, &m, &dir, &mut large, fid, off, data).await?;
-                        }
+                        feed_ordered(
+                            &sink,
+                            &m,
+                            &dir,
+                            &mut large,
+                            &mut pending_small,
+                            &mut small_held,
+                            (fid, off, whole, data),
+                        )
+                        .await?;
                         cursor = if off + n
                             >= m.entry(fid)
                                 .expect("the cursor is inside the manifest")
@@ -2060,12 +2330,15 @@ async fn run_loop(
                         };
                     }
                     // What the cursor has passed without feeding (a skipped partial range) is no
-                    // longer wanted: it must not sit in the buffer for the rest of the job.
-                    while let Some((&k, _)) = reorder.first_key_value() {
-                        if k >= cursor {
-                            break;
-                        }
-                        if let Some((_, (_, d))) = reorder.pop_first() {
+                    // longer wanted: it must not sit in the buffer for the rest of the job. A
+                    // reset file's resend waiting for its own next offset is still wanted.
+                    let stale: Vec<(u32, u64)> = reorder
+                        .range(..cursor)
+                        .map(|(k, _)| *k)
+                        .filter(|k| behind.get(&k.0).is_none_or(|&next| k.1 < next))
+                        .collect();
+                    for k in stale {
+                        if let Some((_, d)) = reorder.remove(&k) {
                             reorder_bytes -= held_cost(d.len() as u64);
                         }
                     }
@@ -2254,6 +2527,7 @@ async fn run_loop(
                     &pg,
                     &mut pending_small,
                     &mut large,
+                    &reset_tx,
                 )?;
                 let held = dir_lock.clone();
                 *batch_handle = Some(tokio::task::spawn(async move {
@@ -2441,6 +2715,9 @@ struct BatchJob {
     /// loop keeps putting CVs into — and what was durable before this batch, so the commit
     /// check sees the merged coverage without touching the loop's map.
     large: Vec<BatchLarge>,
+    /// Where a root mismatch goes once its Reset is journaled: the loop starts the file over and
+    /// only then sends the FileRetry (`reset_large`).
+    resets: tokio::sync::mpsc::UnboundedSender<u32>,
 }
 
 struct BatchLarge {
@@ -2460,8 +2737,9 @@ struct BatchDone {
     small: BTreeSet<u32>,
     /// Large files committed (part → final): the fold removes them from `large`.
     committed: Vec<u32>,
-    /// Large files whose root mismatched (Reset journaled, FileRetry sent): the fold
-    /// removes them so the next chunk starts them fresh, exactly as before.
+    /// Large files whose root mismatched (Reset journaled, handed to the loop through
+    /// `BatchJob::resets`). The loop has already started them over by the fold, so the fold
+    /// leaves them alone: what `large` holds for them now is the resend.
     reset: Vec<u32>,
     /// The large-file ranges this batch made durable: the fold subtracts each from
     /// `written` — the loop keeps writing while the batch runs, so a whole-file clear (the
@@ -2486,6 +2764,7 @@ fn snapshot_batch(
     pg: &Arc<Progress>,
     small: &mut Vec<u32>,
     large: &mut HashMap<u32, Large>,
+    resets: &tokio::sync::mpsc::UnboundedSender<u32>,
 ) -> Result<BatchJob, SendError> {
     let mut ranges = Vec::new();
     let mut roots = Vec::new();
@@ -2538,6 +2817,7 @@ fn snapshot_batch(
         ranges,
         roots,
         large: entries,
+        resets: resets.clone(),
     })
 }
 
@@ -2562,6 +2842,7 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
         ranges,
         roots,
         large,
+        resets,
     } = job;
     let mut jnl = jnl;
     // Nothing written since the last batch: nothing to sync, journal or send — but logged files that
@@ -2722,14 +3003,11 @@ async fn batch_task(job: BatchJob) -> Result<BatchDone, SendError> {
             jnl = j;
             r?;
             st.apply(&rec);
-            control
-                .send(&gen::FileRetry {
-                    job_id,
-                    file_id: l.id,
-                    reason: gen::RETRY_VERIFY,
-                })
-                .await
-                .map_err(|e| SendError::Disconnected(e.to_string()))?;
+            // The loop resets the file and sends the FileRetry, not this task: a sender that
+            // resends at once must find the file already started over, or the fold of this
+            // batch would drop the resend it had acknowledged (the C receiver clears the file
+            // before it emits the retry, too). A loop that is gone has nobody to tell.
+            let _ = resets.send(l.id);
             reset.push(l.id);
             continue;
         }
@@ -2937,10 +3215,10 @@ fn fold_batch(
         done.insert(*id);
         large.remove(id);
     }
-    for id in &b.reset {
-        large.remove(id);
-    }
-    for r in &b.ranges {
+    // The reset files were started over by the loop (`reset_large`) before this fold; what
+    // `large` holds for them is the resend, which this batch's ranges (the bad bytes) must not
+    // touch.
+    for r in b.ranges.iter().filter(|r| !b.reset.contains(&r.file_id)) {
         if let Some(l) = large.get_mut(&r.file_id) {
             l.written = subtract(&l.written, r.offset, r.offset + r.len);
             l.durable.insert(r.offset, r.offset + r.len);
@@ -3062,8 +3340,11 @@ mod tests {
         let held: BTreeMap<(u32, u64), (bool, Vec<u8>)> =
             BTreeMap::from([((0, GROUP), (false, vec![]))]);
         let cap_of = |credit: u64| credit * REORDER_WINDOWS;
+        let none = BTreeMap::new();
         let g = |cursor, held_bytes, credit, id, off, len, whole| {
-            admit_ordered(&m, cursor, &held, held_bytes, credit, id, off, len, whole)
+            admit_ordered(
+                &m, cursor, &none, &held, held_bytes, credit, id, off, len, whole,
+            )
         };
         assert_eq!(
             g((0, 0), 0, GROUP, 0, 0, GROUP, false).unwrap(),
@@ -3091,6 +3372,12 @@ mod tests {
         let cap = GROUP * REORDER_WINDOWS;
         assert!(g((0, 0), cap - GROUP - 64, GROUP, 0, 2 * GROUP, GROUP, false).is_ok());
         assert!(g((0, 0), cap - GROUP - 63, GROUP, 0, 2 * GROUP, GROUP, false).is_err());
+        // A file reset behind the cursor takes its resend from its own next offset on.
+        let behind = BTreeMap::from([(0u32, GROUP)]);
+        let r = |off| admit_ordered(&m, (1, 0), &behind, &held, 0, GROUP, 0, off, GROUP, false);
+        assert_eq!(r(0).unwrap(), Admit::Drop, "before its own next offset");
+        assert_eq!(r(GROUP).unwrap(), Admit::Drop, "already held");
+        assert_eq!(r(2 * GROUP).unwrap(), Admit::Keep);
     }
 
     #[test]
@@ -3638,6 +3925,7 @@ mod tests {
             &pg,
             &mut Vec::new(),
             &mut large,
+            &tokio::sync::mpsc::unbounded_channel().0,
         )
         .unwrap();
         let out = batch_task(snap).await.unwrap();
@@ -3980,6 +4268,7 @@ mod tests {
             &pg,
             &mut Vec::new(),
             &mut large,
+            &tokio::sync::mpsc::unbounded_channel().0,
         )
         .unwrap();
         let t = Instant::now();
@@ -4849,5 +5138,369 @@ mod tests {
             DURABLE >> 20
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A `LocalSink` whose commit of file 1 waits at a gate: the batch that commits it is still
+    /// running while the test talks to the receiver.
+    struct CommitGateSink {
+        inner: LocalSink,
+        gate: Arc<Gate>,
+    }
+
+    impl Sink for CommitGateSink {
+        fn prepare(&self, m: &Manifest) -> io::Result<()> {
+            self.inner.prepare(m)
+        }
+        fn write_at(&self, id: u32, off: u64, d: &[u8]) -> io::Result<()> {
+            self.inner.write_at(id, off, d)
+        }
+        fn write_whole(&self, id: u32, d: &[u8]) -> io::Result<()> {
+            self.inner.write_whole(id, d)
+        }
+        fn sync(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync(ids)
+        }
+        fn read_at(&self, id: u32, off: u64, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(id, off, b)
+        }
+        fn commit(&self, id: u32) -> io::Result<()> {
+            if id == 1 {
+                self.gate.pass();
+            }
+            self.inner.commit(id)
+        }
+        fn sync_committed(&self, ids: &[u32]) -> io::Result<()> {
+            self.inner.sync_committed(ids)
+        }
+        fn finish(&self) -> io::Result<()> {
+            self.inner.finish()
+        }
+        fn resume_key(&self) -> Option<(String, bool)> {
+            self.inner.resume_key()
+        }
+        fn resume_staged(&self, j: bool, a: bool) {
+            self.inner.resume_staged(j, a)
+        }
+    }
+
+    fn root_of(d: &[u8]) -> [u8; 32] {
+        let cvs: Vec<[u8; 32]> = d
+            .chunks(GROUP as usize)
+            .enumerate()
+            .map(|(i, g)| verify::group_cv(g, i as u64))
+            .collect();
+        verify::root_from_cvs(&cvs)
+    }
+
+    /// Two two-group files in one batch: file 0's root mismatches (Reset + FileRetry) while file
+    /// 1's commit is held at the gate. The sender resends file 0 either while that batch still
+    /// runs (`during`) or after it ended; both must finish the job.
+    async fn resend_after_a_reset(tag: &str, job: [u8; 16], during: bool) {
+        let Wired {
+            mut link,
+            router,
+            mut peer,
+            _keep,
+        } = wired(job, None);
+        let o = opts(tag, 64 << 20, Some(Duration::from_secs(1)));
+        let jobs_dir = o.jobs_dir.clone();
+        let root = jobs_dir.with_extension("dest");
+        let _ = std::fs::remove_dir_all(&root);
+        let size = 2 * GROUP;
+        let m = Arc::new(small_manifest(&[size, size]));
+        let gate = Arc::new(Gate::default());
+        let sink: Arc<dyn Sink> = Arc::new(CommitGateSink {
+            inner: LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()),
+            gate: gate.clone(),
+        });
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let d0 = vec![1u8; size as usize];
+        let d1 = vec![2u8; size as usize];
+        let chunk = |id: u32, d: &Vec<u8>| Chunk {
+            job_id: job,
+            file_id: id,
+            offset: 0,
+            data: d.clone(),
+        };
+        let file_root = |id: u32, root: [u8; 32]| FileRoot {
+            job_id: job,
+            file_id: id,
+            root,
+        };
+        router.route_lane(1, frame_of(&chunk(1, &d1), 0)).await;
+        router
+            .route_control(frame_of(&file_root(1, root_of(&d1)), 0))
+            .await;
+        router.route_lane(1, frame_of(&chunk(0, &d0), 1)).await;
+        router
+            .route_control(frame_of(&file_root(0, [9; 32]), 0))
+            .await;
+        let fr = until(&mut peer, gen::FileRetry::TYPE).await;
+        assert_eq!(fr.decode::<gen::FileRetry>().unwrap().file_id, 0);
+        gate.entered(1).await;
+        if !during {
+            gate.open();
+            tokio::time::sleep(Duration::from_millis(300)).await; // the fold has run
+        }
+        // The sender answers the FileRetry at once: the whole file again, with its root.
+        router.route_lane(1, frame_of(&chunk(0, &d0), 2)).await;
+        router
+            .route_control(frame_of(&file_root(0, root_of(&d0)), 0))
+            .await;
+        if during {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            gate.open();
+        }
+        let r = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let f0 = std::fs::read(root.join("f0"));
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let rep = r
+            .expect("the resend was lost: the job never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep.files, 2);
+        assert_eq!(f0.unwrap(), d0, "file 0 holds the resent bytes");
+    }
+
+    /// The batch that reset a file used to send the FileRetry itself and then, at its fold,
+    /// drop the file's state — including the resend the sender had made in between, already
+    /// acknowledged, so it never came again and the job hung.
+    #[tokio::test]
+    async fn a_resend_during_the_batch_that_reset_the_file_is_kept() {
+        resend_after_a_reset("reset-during", [0x77; 16], true).await;
+    }
+
+    #[tokio::test]
+    async fn a_resend_after_the_batch_that_reset_the_file_is_kept() {
+        resend_after_a_reset("reset-after", [0x78; 16], false).await;
+    }
+
+    /// An ordered job's cursor has passed a file by the time its root mismatches: the resend is
+    /// behind the cursor and used to be dropped as stale, a hang every time.
+    #[tokio::test]
+    async fn an_ordered_job_takes_the_resend_of_a_file_reset_behind_its_cursor() {
+        let job = [0x79; 16];
+        let Wired {
+            mut link,
+            router,
+            mut peer,
+            _keep,
+        } = wired(job, None);
+        let mut o = opts("reset-ordered", 64 << 20, Some(Duration::from_secs(1)));
+        o.ordered = true;
+        let jobs_dir = o.jobs_dir.clone();
+        let root = jobs_dir.with_extension("dest");
+        let _ = std::fs::remove_dir_all(&root);
+        // File 0 is reset behind the cursor; file 1 is still to come after it.
+        let size = 2 * GROUP;
+        let m = Arc::new(small_manifest(&[size, size]));
+        let sink: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()));
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let d0 = vec![1u8; size as usize];
+        let d1 = vec![2u8; size as usize];
+        let g = GROUP as usize;
+        let chunk = |id: u32, off: usize, d: &[u8]| Chunk {
+            job_id: job,
+            file_id: id,
+            offset: off as u64,
+            data: d.to_vec(),
+        };
+        let file_root = |id: u32, root: [u8; 32]| FileRoot {
+            job_id: job,
+            file_id: id,
+            root,
+        };
+        router.route_lane(1, frame_of(&chunk(0, 0, &d0), 0)).await;
+        router
+            .route_control(frame_of(&file_root(0, [9; 32]), 0))
+            .await;
+        let fr = until(&mut peer, gen::FileRetry::TYPE).await;
+        assert_eq!(fr.decode::<gen::FileRetry>().unwrap().file_id, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await; // the fold has run
+                                                              // The resend in two chunks, the second first; then file 1, which the cursor wants.
+        router
+            .route_lane(1, frame_of(&chunk(0, g, &d0[g..]), 1))
+            .await;
+        router
+            .route_lane(1, frame_of(&chunk(0, 0, &d0[..g]), 2))
+            .await;
+        router
+            .route_control(frame_of(&file_root(0, root_of(&d0)), 0))
+            .await;
+        router.route_lane(1, frame_of(&chunk(1, 0, &d1), 3)).await;
+        router
+            .route_control(frame_of(&file_root(1, root_of(&d1)), 0))
+            .await;
+        let r = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let f0 = std::fs::read(root.join("f0"));
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let rep = r
+            .expect("the ordered resend was dropped: the job never finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep.files, 2);
+        assert_eq!(f0.unwrap(), d0, "file 0 holds the resent bytes");
+    }
+
+    /// A destination folder that already exists (a merge) beside a folder outside it, for the
+    /// symlink tests. Returns (scratch dir, destination, outside).
+    #[cfg(unix)]
+    fn merge_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let d = std::env::temp_dir().join(format!("ava1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (root, outside) = (d.join("dest"), d.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"precious").unwrap();
+        (d, root, outside)
+    }
+
+    #[cfg(unix)]
+    fn entry(kind: u8, size: u64, path: &str) -> Entry {
+        Entry {
+            kind,
+            mode: 0o644,
+            size,
+            mtime: 0,
+            path: path.into(),
+            root: None,
+        }
+    }
+
+    /// SPEC.md §15.5: a merge refuses a manifest folder that is a symlink (or not a folder), and
+    /// a file's parent folder that is one even when the manifest does not list it.
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_refuses_a_folder_that_is_a_symlink_listed_or_not() {
+        use std::os::unix::fs::symlink;
+        let (d, root, outside) = merge_dirs("merge-dirlink");
+        symlink(&outside, root.join("sub")).unwrap();
+        std::fs::write(root.join("plain"), b"x").unwrap();
+        let sink = || LocalSink::new(root.clone(), false).with_log(false, PackOpts::default());
+        let listed = Manifest {
+            entries: vec![
+                entry(gen::ENTRY_DIR, 0, "sub"),
+                entry(gen::ENTRY_DIR, 0, "sub/deeper"),
+            ],
+        };
+        let unlisted = Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "sub/new")],
+        };
+        let not_a_folder = Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "plain/new")],
+        };
+        let r1 = sink().prepare(&listed);
+        let r2 = sink().prepare(&unlisted);
+        let r3 = sink().prepare(&not_a_folder);
+        let created = outside.join("deeper").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        for r in [r1, r2, r3] {
+            assert!(r.as_ref().is_err_and(is_path_refused), "{r:?}");
+        }
+        assert!(!created, "nothing was made through the link");
+    }
+
+    /// A symlink planted after the prepare (or under a folder the manifest never named) is
+    /// still not written through: the parents are checked again when a file is made, and the
+    /// file itself is opened O_NOFOLLOW (SPEC.md §15.2), its part file too. An existing regular
+    /// file is overwritten, as intended for a merge.
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_never_writes_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let (d, root, outside) = merge_dirs("merge-filelink");
+        std::fs::write(root.join("existing"), b"user data").unwrap();
+        let m = Manifest {
+            entries: vec![
+                entry(gen::ENTRY_FILE, 4, "a"),
+                entry(gen::ENTRY_FILE, 4, "late/new"),
+                entry(gen::ENTRY_FILE, 4, "existing"),
+                entry(gen::ENTRY_FILE, 2 * GROUP, "big"),
+            ],
+        };
+        let sink = LocalSink::new(root.clone(), false).with_log(false, PackOpts::default());
+        sink.prepare(&m).unwrap();
+        symlink(outside.join("victim"), root.join("a")).unwrap();
+        symlink(&outside, root.join("late")).unwrap();
+        symlink(outside.join("victim"), root.join("big.ava-part")).unwrap();
+        let file = sink.write_whole(0, b"EVIL");
+        let parent = sink.write_whole(1, b"EVIL");
+        let part = sink.write_at(3, 0, &[7; GROUP as usize]);
+        sink.write_whole(2, b"mine").unwrap();
+        let victim = std::fs::read(outside.join("victim")).unwrap();
+        let planted = outside.join("new").exists();
+        let existing = std::fs::read(root.join("existing")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        for r in [file, parent, part] {
+            assert!(r.as_ref().is_err_and(is_path_refused), "{r:?}");
+        }
+        assert_eq!(
+            victim, b"precious",
+            "a file outside the root was overwritten"
+        );
+        assert!(!planted, "a file was made outside the root");
+        assert_eq!(
+            existing, b"mine",
+            "a regular file in a merge is overwritten"
+        );
+    }
+
+    /// The sender hears about a refused path as `ERR_PATH`, as for a bad manifest path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_path_ends_the_job_with_err_path() {
+        use std::os::unix::fs::symlink;
+        let job = [0x7a; 16];
+        let (d, root, outside) = merge_dirs("merge-errpath");
+        symlink(&outside, root.join("sub")).unwrap();
+        let Wired {
+            mut link,
+            mut peer,
+            _keep,
+            ..
+        } = wired(job, None);
+        let o = opts("merge-errpath", 64 << 20, Some(Duration::from_secs(1)));
+        let jobs_dir = o.jobs_dir.clone();
+        let m = Arc::new(Manifest {
+            entries: vec![entry(gen::ENTRY_FILE, 4, "sub/new")],
+        });
+        let sink: Arc<dyn Sink> =
+            Arc::new(LocalSink::new(root.clone(), false).with_log(false, PackOpts::default()));
+        let task = tokio::spawn(async move { run(&mut link, m, None, sink, o).await });
+        let done: JobDone = until(&mut peer, JobDone::TYPE).await.decode().unwrap();
+        let r = task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&jobs_dir);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(done.status, gen::ERR_PATH);
+        assert!(
+            matches!(&r, Err(SendError::Refused { status, .. }) if *status == gen::ERR_PATH),
+            "{r:?}"
+        );
+    }
+
+    /// Only plain names below the destination: `check_path` already refuses these everywhere;
+    /// this is the receiver's own guard on what it joins onto its base.
+    #[test]
+    fn only_plain_relative_paths_are_joined_onto_the_destination() {
+        for ok in ["a", "a/b", "a b/c.txt", "..a/b.."] {
+            assert!(plain_relative(ok), "{ok}");
+        }
+        for bad in ["", "/abs", "a/../b", "..", "./a"] {
+            assert!(!plain_relative(bad), "{bad}");
+        }
+        // On Windows '\\' is a separator, `C:` a drive and `name:stream` an alternate data
+        // stream; on unix they are plain characters of a name, as the sender allows them.
+        for win in [
+            "a\\..\\..\\x",
+            "C:x",
+            "C:\\x",
+            "file:stream",
+            "\\\\server\\share",
+        ] {
+            assert_eq!(plain_relative(win), cfg!(not(windows)), "{win}");
+        }
     }
 }

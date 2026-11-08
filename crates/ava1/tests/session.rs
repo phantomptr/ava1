@@ -621,12 +621,18 @@ async fn close_returns_even_when_the_peer_stopped_reading() {
 
 #[tokio::test]
 async fn the_session_limit_holds_under_a_handshake_storm() {
-    let (s_id, c_id) = (
-        Identity::generate().unwrap(),
-        Arc::new(Identity::generate().unwrap()),
-    );
+    let n = ava1::server::MAX_SESSIONS + 4;
+    // A key of its own for each client: one key reconnecting replaces its own session, which
+    // is not what this test is about.
+    let s_id = Identity::generate().unwrap();
+    let ids: Vec<Arc<Identity>> = (0..n)
+        .map(|_| Arc::new(Identity::generate().unwrap()))
+        .collect();
+    let c_id = ids[0].clone();
     let mut sp = PeerStore::in_memory();
-    sp.add(c_id.public(), "c").unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        sp.add(id.public(), &format!("c{i}")).unwrap();
+    }
     let mut cp = PeerStore::in_memory();
     cp.add(s_id.public(), "s").unwrap();
     let cp = Arc::new(Mutex::new(cp));
@@ -640,10 +646,9 @@ async fn the_session_limit_holds_under_a_handshake_storm() {
             .with_limits(roomy()),
     )
     .await;
-    let n = ava1::server::MAX_SESSIONS + 4;
     let a = addr.to_string();
-    let results = futures_join_all((0..n).map(|_| {
-        let (a, c_id, cp) = (a.clone(), c_id.clone(), cp.clone());
+    let results = futures_join_all(ids.iter().map(|id| {
+        let (a, c_id, cp) = (a.clone(), id.clone(), cp.clone());
         async move { connect(&a, c_id, cp, "c", timing).await }
     }))
     .await;
@@ -664,6 +669,49 @@ async fn the_session_limit_holds_under_a_handshake_storm() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     connect(&a, c_id, cp, "c", timing).await.unwrap();
+}
+
+/// Handshakes that stop after message 1 hold no session slot: a peer that opens them and never
+/// finishes cannot lock paired devices out. Only the connection limits bound it.
+#[tokio::test]
+async fn stalled_handshakes_do_not_take_the_session_slots() {
+    use ava1::gen::{HelloInfo, Hs1};
+    use ava1::wire::Message;
+    let timing = ava1::session::Timing {
+        handshake: Duration::from_secs(5),
+        ..fast()
+    };
+    let (addr, _ctx, me, peers) = paired_opts(timing, roomy()).await;
+    let mut held = Vec::new();
+    for _ in 0..ava1::server::MAX_SESSIONS {
+        let s = TcpStream::connect(addr).await.unwrap();
+        let (rh, wh) = s.into_split();
+        let mut w = ava1::conn::FrameWriter::new(wh);
+        let stranger = Identity::generate().unwrap();
+        let mut hs = ava1::keys::Handshake::initiator(&stranger).unwrap();
+        let hello = HelloInfo {
+            version_min: gen::PROTOCOL_VERSION,
+            version_max: gen::PROTOCOL_VERSION,
+            caps: 0,
+        }
+        .to_bytes()
+        .unwrap();
+        w.send_msg(
+            0,
+            &Hs1 {
+                noise: hs.write(&hello).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        held.push((rh, w, hs)); // never sends message 3
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = connect(&addr.to_string(), me, peers, "laptop", timing)
+        .await
+        .expect("a paired device gets in while the stalled handshakes wait");
+    s.node_info().await.unwrap();
+    drop(held);
 }
 
 async fn futures_join_all<F: std::future::Future + Send + 'static>(

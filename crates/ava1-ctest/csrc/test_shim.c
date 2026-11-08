@@ -30,6 +30,7 @@
 #include "ava1_ranges.h"
 #include "ava1_send.h"
 #include "ava1_server.h"
+#include "ava1_store.h"
 #include "ava1_thread.h"
 #include "ava1_op.h"
 #include "ava1_events.h"
@@ -2167,6 +2168,8 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "feed_delay_ms")) ava1_data_test_feed_delay_ms = v;
     else if (!strcmp(name, "feed_check_delay_ms")) ava1_data_test_feed_check_delay_ms = v;
     else if (!strcmp(name, "reprep_delay_ms")) ava1_data_test_reprep_delay_ms = v;
+    else if (!strcmp(name, "store_save_delay_ms"))
+        __atomic_store_n(&ava1_store_test_save_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;
     else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
