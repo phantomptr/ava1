@@ -152,6 +152,8 @@ If you find AVA1 useful, consider buying me a coffee!
 
 [![Support me on Ko-fi](https://storage.ko-fi.com/cdn/kofi3.png?v=3)](https://ko-fi.com/B0B81S0WUA)
 
+Crypto addresses and QR codes are on [the PS5Upload website](https://ps5upload.phantomptr.com/#thanks).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
