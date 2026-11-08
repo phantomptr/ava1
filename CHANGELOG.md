@@ -3,6 +3,20 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.7
+
+Rust receiver:
+
+- A large file whose check failed and that the sender resent at once could be thrown away
+  after it arrived, and the job then waited forever. The resend is now kept.
+- In an ordered download (a zip, a relay), a file whose check failed was never accepted again
+  when resent: the job waited forever. It is now taken from the start again.
+- Sending into a folder that already exists no longer writes through a symbolic link: a link
+  where a folder, a file or its `.ava-part` goes ends the job with `ERR_PATH` instead of
+  writing outside the folder. Files that are already there are still replaced, as before.
+- On Windows, a path with `\` or `:` in it (a drive, an alternate data stream) is refused with
+  `ERR_PATH` instead of being written outside the folder.
+
 ## 1.0.6
 
 Nothing changes on the wire, on disk or in the public API.
