@@ -8,15 +8,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ava1_internal.h"
 #include "ava1_platform.h"
 #include "monocypher.h"
 
-/* Temp file in the same directory, then rename: never crosses a device. */
+/* Temp file in the same directory, then rename: never crosses a device. A stale <path>.tmp
+ * (a crash mid-write, or one planted there) is removed first and the temp made with O_EXCL |
+ * O_NOFOLLOW: adopting it would keep its mode (the identity secret world-readable) or follow a
+ * symlink there out of the folder. The folder is synced after the rename, or a power loss could
+ * bring back the old file (a revoked peer) or lose a new identity. */
 static int write_file_atomic(const char *path, const uint8_t *data, size_t n, int mode) {
-    char tmp[300];
+    char tmp[300], dir[300];
     int fd, ok = 1;
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) return -1;
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (unlink(tmp) != 0 && errno != ENOENT) return -1;
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
     if (fd < 0) return -1;
     while (n > 0 && ok) {
         ssize_t k = write(fd, data, n);
@@ -33,7 +39,8 @@ static int write_file_atomic(const char *path, const uint8_t *data, size_t n, in
         unlink(tmp);
         return -1;
     }
-    return 0;
+    ava1_parent_of(path, dir, sizeof dir);
+    return ava1_sync_dir(dir) == 0 ? 0 : -1;
 }
 
 int ava1_identity_load_or_create(const char *path, ava1_identity_t *id) {
