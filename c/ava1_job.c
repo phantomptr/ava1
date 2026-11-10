@@ -295,6 +295,8 @@ static void job_destroy(ava1_job_t *j) {
                 if (j->lf[i]->held) ava1_lf_release(j->lf[i]->held); /* its slots in the large-file budget */
                 ava1_rset_clear(&j->lf[i]->written);
                 ava1_rset_clear(&j->lf[i]->durable);
+                ava1_rset_clear(&j->lf[i]->rb_todo);
+                ava1_rset_clear(&j->lf[i]->rb_done);
                 free(j->lf[i]);
             }
         free(j->lf);

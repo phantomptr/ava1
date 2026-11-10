@@ -52,6 +52,16 @@ typedef struct {        /* one large file being assembled */
     int writers;           /* write_chunk calls that took their own dups and have not yet recorded the range */
     uint8_t held;          /* descriptors counted against the large-file budget (0, 1 or 2) */
     uint8_t rb_bad;        /* read-backs (JF_READBACK) that found the drive's bytes wrong; the file fails at AVA1_READBACK_TRIES */
+    /* JF_READBACK while the file arrives (SPEC.md §13.5; ava1_apply.c, "read-back"), under j->mu.
+     * rb_todo: durable bytes nobody has read back yet (a sync batch adds what it made durable, a write
+     * takes its range out again). rb_done: read back and right since they were last made durable.
+     * rb_gen: bumped by a reset and by a write over durable bytes, so a read-back in flight across
+     * either counts for nothing. rb_busy: read-backs of this file in flight. rb_found: one found the
+     * drive's bytes wrong at group rb_found_g; the commit acts on it (unless that group is written again). */
+    ava1_rset_t rb_todo, rb_done;
+    uint32_t rb_gen;
+    uint8_t rb_busy, rb_found;
+    uint64_t rb_found_g;
 } ava1_lfile_t;
 
 /* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
@@ -208,6 +218,10 @@ struct ava1_job {
     int readback;
     uint64_t rb_files, rb_bytes, rb_us, rb_mismatches;
     uint64_t rb_read_us, rb_hash_us; /* summed over read-back threads: where the time went */
+    uint64_t rb_live_bytes, rb_after_bytes; /* read back while files arrived / after their last byte (rb_us is the latter's wall time) */
+    uint32_t rb_live_items;          /* live read-back work items queued or running (under mu) */
+    uint32_t rb_live_run;            /* ... of those, running */
+    uint32_t rb_bufs;                /* read-back buffers in use, live and at commit (under mu; at most READBACK_STRIPES) */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */

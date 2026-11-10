@@ -143,6 +143,8 @@ static void forget_file(ava1_job_t *j, uint32_t i) {
     ava1_bits_clear(&j->done, i);
     if (j->lf[i]) {
         ava1_rset_clear(&j->lf[i]->durable);
+        ava1_rset_clear(&j->lf[i]->rb_todo);
+        ava1_rset_clear(&j->lf[i]->rb_done);
         j->lf[i]->has_root = j->lf[i]->root_journaled = 0;
     }
 }
@@ -278,6 +280,8 @@ static void free_lf(ava1_job_t *j, uint32_t id, ava1_lfile_t *lf) {
     ava1_lf_close_fds(j, id, lf); /* the descriptors and their slots in the large-file budget */
     ava1_rset_clear(&lf->written);
     ava1_rset_clear(&lf->durable);
+    ava1_rset_clear(&lf->rb_todo);
+    ava1_rset_clear(&lf->rb_done);
     free(lf);
 }
 

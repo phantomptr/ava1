@@ -870,18 +870,28 @@ every partial file and resets a file on any mismatch. The verify policy re-hashe
 
 13.5 Read-back (`JF_READBACK`). Every check above hashes the bytes as they arrived, so a write that
 landed wrong on the drive (a short or misplaced write, a filesystem or drive fault, another process
-writing the file) commits unnoticed. With `JF_READBACK` the receiver, once every byte of a large file is
-durable and its outboard's root equals the sender's root, reads the part file back from the drive and
-compares each group's CV with the outboard's (a file of one group is already hashed from the drive at
-commit). A mismatch resets the file and sends `FileRetry{RETRY_VERIFY}`, so the sender sends the whole
-file again; the receiver logs it. After 3 mismatches of one file in a job the job ends with
-`ERR_VERIFY` (journal kept). A `job.copy` has no sender to resend: there the first mismatch ends the
-copy with `ERR_VERIFY` ("a copied file did not verify", as any copy retry does) and a re-issued copy
-goes on from its journal. A read that fails ends the job with `ERR_IO`. The read-back runs on the
-commit's worker, before the rename; a big file may be read in stripes on several threads. The read
-goes through the receiver's filesystem, so a page cache may answer for bytes still held in memory;
-what it proves is what any later reader of the file will get. Small files are out of its scope (their
-roots are checked from the log record or the file when they are recovered, §15.7).
+writing the file) commits unnoticed. With `JF_READBACK` the receiver reads every group of a large file
+back from the drive and compares its CV with the outboard's before the file is committed (a file of one
+group is already hashed from the drive at commit). A group is read back only once it is durable: the
+sync batch that wrote it has fsynced the part file and the outboard and journaled the range. It may be
+read then, while the rest of the file still arrives, in any order; the commit, once every byte is durable
+and the outboard's root equals the sender's root, reads back the groups that were not (the last batch's,
+those the early reads had no time for, and those made durable before a restart of the receiver). A group
+written again after it was read back (a duplicate chunk) is read back again once that write is durable,
+so each group is read back once after it was last made durable. A mismatch found while the file arrives
+is acted on at the commit, not before (the sender is still sending the file). A mismatch resets the file
+and sends `FileRetry{RETRY_VERIFY}`, so the sender sends the whole file again; the receiver logs it.
+After 3 mismatches of one file in a job the job ends with `ERR_VERIFY` (journal kept). A `job.copy` has
+no sender to resend: there the first mismatch ends the copy with `ERR_VERIFY` ("a copied file did not
+verify", as any copy retry does) and a re-issued copy goes on from its journal. A read that fails ends the
+job with `ERR_IO`. The early reads run on the receiver's own workers, behind the data and never in its
+way (they give their turn up while chunks wait); the commit's run on its worker, before the rename, and a
+big remainder may be read in stripes on several threads. What the read-back proves is what the drive held
+once each group was durable: a byte that changes after its group was read back, while later groups still
+arrive, is not found (no more than one that changes after the commit). The read goes through the
+receiver's filesystem, so a page cache may answer for bytes still held in memory; what it proves is what
+any later reader of the file will get. Small files are out of its scope (their roots are checked from the
+log record or the file when they are recovered, §15.7).
 
 ## 14. Journal and resume
 

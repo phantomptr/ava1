@@ -269,6 +269,8 @@ pub mod ffi {
             out: *mut u64,
             cap: usize,
         ) -> usize;
+        pub fn ava1_test_rset_ops(ops: *const u64, nops: usize, out: *mut u64, cap: usize)
+            -> usize;
         pub fn ava1_test_journal_dump(dir: *const c_char, out: *mut u8, cap: usize) -> usize;
         pub fn ava1_test_journal_write_sample(dir: *const c_char) -> c_int;
         pub fn ava1_test_journal_compact(
@@ -1048,6 +1050,19 @@ pub fn c_rset_after(ops: &[(u64, u64)]) -> Vec<(u64, u64)> {
         ffi::ava1_test_rset_after(flat.as_ptr(), ops.len(), out.as_mut_ptr(), ops.len() + 1)
     };
     out.chunks(2).take(n).map(|p| (p[0], p[1])).collect()
+}
+
+/// A C range set after adds (`true`) and removals (`false`) in order; None when a removal's answer
+/// disagreed with `ava1_rset_overlaps` (or it ran out of memory).
+pub fn c_rset_ops(ops: &[(bool, u64, u64)]) -> Option<Vec<(u64, u64)>> {
+    let flat: Vec<u64> = ops
+        .iter()
+        .flat_map(|(add, s, e)| [u64::from(!*add), *s, *e])
+        .collect();
+    let cap = 2 * ops.len() + 2;
+    let mut out = vec![0u64; 2 * cap];
+    let n = unsafe { ffi::ava1_test_rset_ops(flat.as_ptr(), ops.len(), out.as_mut_ptr(), cap) };
+    (n != usize::MAX).then(|| out.chunks(2).take(n).map(|p| (p[0], p[1])).collect())
 }
 
 pub fn c_bits_runs(n: u32, set: &[u32]) -> Vec<(u32, u32)> {
