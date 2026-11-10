@@ -42,6 +42,8 @@ pub const CAP_DATA_PLANE: u64 = 1;
 pub const CAP_MGMT: u64 = 2;
 /// `ServerInfo.caps` bit: any paired device may read and cancel a transfer and take over a parked upload (SPEC.md §18.5).
 pub const CAP_SHARED_JOBS: u64 = 4;
+/// `ServerInfo.caps` bit: the node understands `JF_READBACK` (SPEC.md §13.5).
+pub const CAP_READBACK: u64 = 8;
 /// RPC `job.copy`: `JobCopy` request, `Status` reply; a copy or move on the node itself (SPEC.md §7.1, §15.5).
 pub const METHOD_JOB_COPY: u16 = 16;
 /// RPC `job.status`: `JobRef` request, `Status` reply (SPEC.md §7.1).
@@ -98,6 +100,8 @@ pub const JF_UNSAFE_READ: u32 = 4;
 pub const JF_MOVE: u32 = 8;
 /// Job flag, `job.copy` only: replace destination files that already exist; unset, an existing destination root is refused with `ERR_EXISTS` (SPEC.md §11.8).
 pub const JF_OVERWRITE: u32 = 16;
+/// Job flag: the receiver reads each large file back from its drive after the final sync and checks it against the root before it counts it done; a mismatch resends the file. Sent only to a node that advertises `CAP_READBACK`, and not part of a job's identity (SPEC.md §11.8, §13.5).
+pub const JF_READBACK: u32 = 32;
 /// `ManifestEntry.kind`: a file (SPEC.md §11.3).
 pub const ENTRY_FILE: u8 = 0;
 /// `ManifestEntry.kind`: a directory (SPEC.md §11.3).

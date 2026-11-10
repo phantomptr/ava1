@@ -1130,6 +1130,8 @@ void ava1_test_set_log_small_flag(const char *path) {
     ava1_log_small_flag_path = g_log_flag_buf;
 }
 static int g_hold_commit;                           /* commits wait at COMMIT_VERIFIED while set */
+static int g_corrupt_n;                             /* commits that find one byte of their part file flipped */
+static uint64_t g_corrupt_at;                       /* ... at this offset */
 static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
@@ -1170,6 +1172,18 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
         char line[64];
         snprintf(line, sizeof line, "hook %d %u\n", point, id);
         ev_add(line, 0);
+    }
+    if ((point == AVA1_HOOK_READBACK || (point == AVA1_HOOK_COMMIT_VERIFIED && !j->readback)) &&
+        __atomic_load_n(&g_corrupt_n, __ATOMIC_SEQ_CST) > 0 && j->lf[id] && j->lf[id]->fd >= 0) {
+        /* The drive's copy goes wrong after every byte was received and checked: flip one byte of
+         * the part file right before the commit reads it back (or, with no read-back, renames it).
+         * The outboard still has the right CVs. */
+        uint8_t b;
+        uint64_t at = __atomic_load_n(&g_corrupt_at, __ATOMIC_SEQ_CST);
+        if (pread(j->lf[id]->fd, &b, 1, (off_t)at) == 1) {
+            b ^= 0x5a;
+            if (pwrite(j->lf[id]->fd, &b, 1, (off_t)at) == 1) __atomic_sub_fetch(&g_corrupt_n, 1, __ATOMIC_SEQ_CST);
+        }
     }
     if (point == AVA1_HOOK_COMMIT_VERIFIED && g_dup && id == g_dup_id) {
         uint8_t *own = g_dup;
@@ -1275,6 +1289,15 @@ uint32_t ava1_test_apply_segments(void) {
     return n;
 }
 void ava1_test_apply_hold_commit(int on) { __atomic_store_n(&g_hold_commit, on, __ATOMIC_SEQ_CST); }
+/* The next `n` commits (at COMMIT_VERIFIED, before any read-back) find the part file's byte at `at` changed
+ * on the drive. */
+void ava1_test_corrupt_at_commit(int n, uint64_t at) {
+    __atomic_store_n(&g_corrupt_at, at, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_corrupt_n, n, __ATOMIC_SEQ_CST);
+}
+int ava1_test_corrupt_left(void) { return __atomic_load_n(&g_corrupt_n, __ATOMIC_SEQ_CST); }
+/* Every pwrite of file data writes at most `n` bytes (0: no cap): short writes, as a drive may return them. */
+void ava1_test_set_pwrite_max(size_t n) { __atomic_store_n(&ava1_test_pwrite_max, n, __ATOMIC_SEQ_CST); }
 void ava1_test_apply_fault_prealloc(uint32_t id) { __atomic_store_n(&g_prealloc_fault, id, __ATOMIC_SEQ_CST); }
 /* ava1_apply_compact's answer now (0 compacted, -1 skipped). */
 int ava1_test_apply_compact(void) { return ava1_apply_compact(g_job); }
@@ -1481,7 +1504,8 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
         return -2;
     }
     g_job->kind = AVA1_JOB_UPLOAD;
-    g_job->flags = flags;
+    g_job->flags = flags & ~(uint32_t)AVA1_JF_READBACK; /* as ava1_recv_open keeps them */
+    g_job->readback = (flags & AVA1_JF_READBACK) != 0;
     snprintf(g_job->root, sizeof g_job->root, "%s", root);
     /* Staging is decided here, once: a root that appears later must not be moved over. */
     g_job->staged = !(flags & AVA1_JF_SINGLE_FILE) && stat(root, &st) != 0;
@@ -1773,6 +1797,11 @@ void ava1_test_reap_and_drop(void) {
     if (g_job) ava1_job_put(g_job);
     g_job = NULL;
 }
+
+/* The JobOpen flags of the next restart or reopen (a resume that asks for something else). */
+void ava1_test_recv_set_flags(uint32_t flags) { g_flags = flags; }
+/* The current job's JF_READBACK setting (-1: no job). */
+int ava1_test_job_readback(void) { return g_job ? __atomic_load_n(&g_job->readback, __ATOMIC_SEQ_CST) : -1; }
 
 int ava1_test_recv_restart(int crash_at) {
     if (g_job) ava1_job_put(g_job);

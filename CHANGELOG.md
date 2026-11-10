@@ -3,6 +3,16 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## Unreleased
+
+C library:
+
+- Read-back (`JF_READBACK`, `CAP_READBACK`, SPEC.md §13.5): on request, the receiver reads each large
+  file back from its drive before it commits it and checks it against what it received. A file whose
+  bytes on the drive differ is sent again; after 3 such tries the job ends with `ERR_VERIFY`. Every
+  mismatch is logged to stderr and the event log, and the end-of-job line reports the files, bytes and
+  time read back. Older receivers do not advertise the bit and never see the flag.
+
 ## 1.0.7
 
 Fixes from a review of both implementations. Nothing changes on the wire format, on disk or in the

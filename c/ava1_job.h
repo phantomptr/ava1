@@ -51,6 +51,7 @@ typedef struct {        /* one large file being assembled */
     int committing;        /* its commit is queued or running on a worker */
     int writers;           /* write_chunk calls that took their own dups and have not yet recorded the range */
     uint8_t held;          /* descriptors counted against the large-file budget (0, 1 or 2) */
+    uint8_t rb_bad;        /* read-backs (JF_READBACK) that found the drive's bytes wrong; the file fails at AVA1_READBACK_TRIES */
 } ava1_lfile_t;
 
 /* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
@@ -201,6 +202,11 @@ struct ava1_job {
     uint32_t prog_limit_ms;
     int prog_armed;
     int log_small;                  /* durable-by-log or per-file, decided once when the job is created */
+    /* JF_READBACK (SPEC.md §13.5): each large file is read back from the drive before its commit. Taken
+     * from the latest JobOpen (not part of the job's identity, never journaled); a job.copy sets it from
+     * its own flags. Totals for the end-of-job line (atomics): files, bytes, microseconds, mismatches. */
+    int readback;
+    uint64_t rb_files, rb_bytes, rb_us, rb_mismatches;
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */

@@ -325,9 +325,12 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
     return 0;
 }
 
+size_t ava1_test_pwrite_max;
+
 static int pwrite_all(int fd, const uint8_t *p, size_t n, uint64_t off) {
     while (n) {
-        ssize_t k = pwrite(fd, p, n, (off_t)off);
+        size_t cap = __atomic_load_n(&ava1_test_pwrite_max, __ATOMIC_RELAXED);
+        ssize_t k = pwrite(fd, p, cap && n > cap ? cap : n, (off_t)off);
         if (k < 0) {
             if (errno == EINTR) continue;
             return -errno;
@@ -471,6 +474,15 @@ size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap) {
                  SHARE(__atomic_load_n(&j->pre_us, __ATOMIC_RELAXED)));
 #undef SHARE
     if (n < 0) return 0;
+    if ((size_t)n < cap && __atomic_load_n(&j->rb_files, __ATOMIC_RELAXED)) {
+        uint64_t us = __atomic_load_n(&j->rb_us, __ATOMIC_RELAXED), by = __atomic_load_n(&j->rb_bytes, __ATOMIC_RELAXED);
+        int m = snprintf(out + n, cap - (size_t)n, "; read back %llu files, %llu MiB in %llu ms (%.0f MiB/s), %llu mismatches",
+                         (unsigned long long)__atomic_load_n(&j->rb_files, __ATOMIC_RELAXED),
+                         (unsigned long long)(by >> 20), (unsigned long long)(us / 1000u),
+                         us ? (double)by / 1048576.0 / ((double)us / 1e6) : 0.0,
+                         (unsigned long long)__atomic_load_n(&j->rb_mismatches, __ATOMIC_RELAXED));
+        if (m > 0) n += m;
+    }
     return (size_t)n < cap ? (size_t)n : (cap ? cap - 1 : 0);
 }
 
@@ -499,7 +511,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     if (!first) return;
     ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
     if (j->start_us) { /* the apply engine ran: where its time went (a download or a move has none) */
-        char line[400];
+        char line[600];
         (void)ava1_apply_summary(j, line, sizeof line);
         fprintf(stderr, "%s\n", line);
     }
@@ -2889,6 +2901,135 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
     return k == (ssize_t)(n * 32u) ? 0 : -EIO;
 }
 
+/* JF_READBACK (SPEC.md §13.5). The commit has just checked that the outboard's group CVs merge to the
+ * sender's root, but those CVs were computed from the bytes as they arrived, not from the drive. This
+ * reads the part file back (every byte is durable by now) and compares each group's CV with the
+ * outboard's, so a write that landed wrong (a short or misplaced write, a filesystem or drive fault,
+ * another process writing the file) is found before the file counts as done. A big file is read in
+ * stripes on a few threads of its own: the last file of a job is read back after its last byte, with
+ * nothing else to overlap, so its read-back is the whole of what the check adds to the job. */
+#define READBACK_GROUPS 4u                 /* groups per read */
+#define READBACK_STRIPES 4u                /* threads for one big file, the worker included */
+#define READBACK_STRIPE_MIN (256ull << 20) /* a file below two of these is read by the worker alone */
+static int pread_full(int fd, uint8_t *p, size_t len, uint64_t off, size_t *have) {
+    *have = 0;
+    while (*have < len) {
+        ssize_t k = pread(fd, p + *have, len - *have, (off_t)(off + *have));
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) return -errno;
+        if (k == 0) break; /* end of file */
+        *have += (size_t)k;
+    }
+    return 0;
+}
+
+typedef struct {
+    ava1_job_t *j;
+    uint64_t from, to; /* [from, to): group-aligned, `to` the file's size for the last stripe */
+    int fd, ob_fd;
+    int *quit;         /* shared: set when a stripe has the answer (a mismatch or an error) */
+    uint64_t bad;
+    int rc;
+} rb_stripe_t;
+
+/* 0 = the stripe matches; 1 = it does not (bad = the first group that differs; a file shorter than its
+ * size counts as wrong); -errno = it could not be read; -EINTR = the job is ending, or another stripe
+ * already has the answer. */
+static int readback_stripe(rb_stripe_t *s) {
+    uint8_t *buf = malloc(READBACK_GROUPS * (size_t)AVA1_GROUP_LEN), cvs[READBACK_GROUPS][32];
+    uint64_t off = s->from;
+    int rc = 0;
+    if (!buf) return -ENOMEM;
+    while (!rc && off < s->to) {
+        uint64_t g0 = off / AVA1_GROUP_LEN;
+        size_t len = s->to - off < READBACK_GROUPS * AVA1_GROUP_LEN ? (size_t)(s->to - off)
+                                                                     : READBACK_GROUPS * (size_t)AVA1_GROUP_LEN;
+        size_t ng = (size_t)groups_of(len), have = 0, ob_have = 0, at;
+        if (__atomic_load_n(s->quit, __ATOMIC_RELAXED) || is_stopping(s->j) ||
+            __atomic_load_n(&s->j->finished, __ATOMIC_RELAXED) || __atomic_load_n(&s->j->final_status, __ATOMIC_RELAXED)) {
+            rc = -EINTR;
+            break;
+        }
+        if ((rc = pread_full(s->ob_fd, &cvs[0][0], ng * 32u, g0 * 32u, &ob_have)) != 0) break;
+        if (ob_have != ng * 32u) {
+            rc = -EIO; /* the outboard was whole a moment ago (read_root) */
+            break;
+        }
+        if ((rc = pread_full(s->fd, buf, len, off, &have)) != 0) break;
+        for (at = 0; at < len; at += AVA1_GROUP_LEN) {
+            size_t glen = len - at < AVA1_GROUP_LEN ? len - at : (size_t)AVA1_GROUP_LEN;
+            uint64_t g = g0 + at / AVA1_GROUP_LEN;
+            uint8_t cv[32];
+            if (at + glen > have) { /* shorter than its size: the groups past here cannot match */
+                s->bad = g;
+                rc = 1;
+                break;
+            }
+            ava1_b3_group_cv(buf + at, glen, g, cv);
+            if (memcmp(cv, cvs[at / AVA1_GROUP_LEN], 32) != 0) {
+                s->bad = g;
+                rc = 1;
+                break;
+            }
+        }
+        off += len;
+    }
+    free(buf);
+    if (rc && rc != -EINTR) __atomic_store_n(s->quit, 1, __ATOMIC_RELAXED);
+    return rc;
+}
+
+static void *readback_stripe_main(void *arg) {
+    rb_stripe_t *s = arg;
+    s->rc = readback_stripe(s);
+    return NULL;
+}
+
+/* 0 = the drive holds what was sent; 1 = it does not (*bad = the first group found wrong); -errno =
+ * it could not be read; -EINTR = the job is ending. */
+static int readback_large(ava1_job_t *j, uint32_t id, int fd, int ob_fd, uint64_t *bad) {
+    uint64_t size = j->m.e[id].size, groups = groups_of(size), per;
+    rb_stripe_t s[READBACK_STRIPES];
+    pthread_t th[READBACK_STRIPES];
+    int started[READBACK_STRIPES] = { 0 }, quit = 0, rc = 0;
+    uint32_t n = 1, k;
+    *bad = 0;
+    if (size >= 2 * READBACK_STRIPE_MIN) {
+        n = (uint32_t)(size / READBACK_STRIPE_MIN);
+        if (n > READBACK_STRIPES) n = READBACK_STRIPES;
+    }
+    per = (groups + n - 1) / n;
+    for (k = 0; k < n; k++) {
+        uint64_t g0 = per * k, g1 = per * (k + 1) < groups ? per * (k + 1) : groups;
+        s[k].j = j;
+        s[k].from = g0 * AVA1_GROUP_LEN;
+        s[k].to = g1 * AVA1_GROUP_LEN < size ? g1 * AVA1_GROUP_LEN : size;
+        s[k].fd = fd;
+        s[k].ob_fd = ob_fd;
+        s[k].quit = &quit;
+        s[k].bad = 0;
+        s[k].rc = 0;
+    }
+    for (k = 1; k < n; k++) started[k] = ava1_thread_start(readback_stripe_main, &s[k], &th[k]) == 0;
+    s[0].rc = readback_stripe(&s[0]);
+    for (k = 1; k < n; k++) {
+        if (started[k]) pthread_join(th[k], NULL);
+        else s[k].rc = readback_stripe(&s[k]); /* no thread: this worker reads that stripe too */
+    }
+    /* A real answer wins over the -EINTR of the stripes it stopped; of mismatches, the lowest group. */
+    for (k = 0; k < n; k++) {
+        if (s[k].rc < 0 && s[k].rc != -EINTR && rc == 0) rc = s[k].rc;
+        if (s[k].rc == 1 && (rc != 1 || s[k].bad < *bad)) {
+            rc = 1;
+            *bad = s[k].bad;
+        }
+    }
+    if (!rc)
+        for (k = 0; k < n; k++)
+            if (s[k].rc == -EINTR) rc = -EINTR;
+    return rc;
+}
+
 /* A commit runs on a worker, and workers never end the job themselves (see worker_fail): the
  * failure is recorded and the job thread ends it, journaling Done when `journal_done`. */
 static void commit_fail(ava1_job_t *j, uint16_t status, const char *what, int err, int journal_done) {
@@ -2943,6 +3084,47 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     if (!part[0] || !fin[0]) {
         commit_fail(j, AVA1_ERR_IO, "path too long", ENAMETOOLONG, 0);
         return;
+    }
+    /* A file of one group was just hashed from the drive by read_root; a larger one is read back here. */
+    if (__atomic_load_n(&j->readback, __ATOMIC_RELAXED) && groups_of(e->size) >= 2) {
+        uint64_t bad = 0, t0 = mono_us();
+        int rb;
+        HOOK(j, AVA1_HOOK_READBACK, id);
+        rb = readback_large(j, id, lf->fd, lf->ob_fd, &bad);
+        __atomic_add_fetch(&j->rb_us, mono_us() - t0, __ATOMIC_RELAXED);
+        if (rb == -EINTR) { /* the job is ending: a resume commits (and reads back) the file again */
+            pthread_mutex_lock(&j->mu);
+            lf->committing = 0;
+            pthread_mutex_unlock(&j->mu);
+            return;
+        }
+        if (rb < 0) {
+            commit_fail(j, AVA1_ERR_IO, "reading the file back failed", -rb, 0);
+            return;
+        }
+        __atomic_add_fetch(&j->rb_files, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&j->rb_bytes, e->size, __ATOMIC_RELAXED);
+        if (rb == 1) {
+            char line[AVA1_EVENTS_LINE_MAX];
+            unsigned tries;
+            pthread_mutex_lock(&j->mu);
+            tries = ++lf->rb_bad;
+            pthread_mutex_unlock(&j->mu);
+            __atomic_add_fetch(&j->rb_mismatches, 1, __ATOMIC_RELAXED);
+            snprintf(line, sizeof line,
+                     "readback-mismatch job=%02x%02x%02x%02x file=%u size=%llu group=%llu (bytes %llu..) try=%u of %u: %s",
+                     j->id[0], j->id[1], j->id[2], j->id[3], id, (unsigned long long)e->size, (unsigned long long)bad,
+                     (unsigned long long)(bad * AVA1_GROUP_LEN), tries, (unsigned)AVA1_READBACK_TRIES, fin);
+            fprintf(stderr, "[ava1] %s\n", line);
+            ava1_log_event(line);
+            if (tries >= AVA1_READBACK_TRIES) {
+                commit_fail(j, AVA1_ERR_VERIFY, "a file reads back from the drive different from what was sent, every try", 0,
+                            0);
+                return;
+            }
+            ava1_apply_reset(j, id, AVA1_RETRY_VERIFY); /* the sender sends the whole file again */
+            return;
+        }
     }
     HOOK(j, AVA1_HOOK_COMMIT_VERIFIED, id);
     /* From here on a late duplicate chunk is dropped (write_chunk checks `committed`), and

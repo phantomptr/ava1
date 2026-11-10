@@ -189,6 +189,9 @@ is derived from them any more.
    client's `Session::has_mgmt()` reads it.
    Bit 2 is `CAP_SHARED_JOBS` (4): any paired device may read and cancel a transfer and take over a
    parked upload (§18.5); only a node with the data plane advertises it.
+   Bit 3 is `CAP_READBACK` (8): the node understands the job flag `JF_READBACK` (§11.8, §13.5); only
+   a node with the data plane advertises it. A client sets the flag only for a node that advertises
+   the bit (a receiver refuses a flag it does not know, §11.8).
 3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (nonce_c (§4.6), name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
@@ -699,6 +702,7 @@ any other frame) sends `JobCancel{ERR_STALLED}` and fails the job; that also bou
 | `JF_UNSAFE_READ` | 4 | a sender may read outside the roots its read policy allows (system files); a client sets it only for a download its user marked unsafe |
 | `JF_MOVE` | 8 | `job.copy`: delete each source file after its destination is durable (§12.6, §15.5) |
 | `JF_OVERWRITE` | 16 | `job.copy`: replace destination files that already exist; unset, an existing destination root is refused with `ERR_EXISTS`. Not valid on `JobOpen` |
+| `JF_READBACK` | 32 | upload `JobOpen` and `job.copy`: the receiver reads each large file back from its drive before it commits it (§13.5). A request for this attempt, not part of the job: a resume or a re-issued copy may turn it on or off, the receiver compares and journals the other flags only, and the latest `JobOpen` decides. Sent only to a node that advertises `CAP_READBACK` |
 
 11.9 Messages. All are data-plane messages (§11.1). "Sender" and "receiver" are the roles of the two
 peers for the job (§11.3), not who opened it.
@@ -863,6 +867,19 @@ mismatch drops those ranges from the map. The C node re-hashes only that batch a
 durable groups to the journal — version 1 never requires re-verifying every durable group of a
 partial file. A receiver may check more: the Rust receiver re-hashes every durable group of
 every partial file and resets a file on any mismatch. The verify policy re-hashes whole files.
+
+13.5 Read-back (`JF_READBACK`). Every check above hashes the bytes as they arrived, so a write that
+landed wrong on the drive (a short or misplaced write, a filesystem or drive fault, another process
+writing the file) commits unnoticed. With `JF_READBACK` the receiver, once every byte of a large file is
+durable and its outboard's root equals the sender's root, reads the part file back from the drive and
+compares each group's CV with the outboard's (a file of one group is already hashed from the drive at
+commit). A mismatch resets the file and sends `FileRetry{RETRY_VERIFY}`, so the sender sends the whole
+file again; the receiver logs it. After 3 mismatches of one file in a job the job ends with
+`ERR_VERIFY` (journal kept). A read that fails ends the job with `ERR_IO`. The read-back runs on the
+commit's worker, before the rename; a big file may be read in stripes on several threads. The read
+goes through the receiver's filesystem, so a page cache may answer for bytes still held in memory;
+what it proves is what any later reader of the file will get. Small files are out of its scope (their
+roots are checked from the log record or the file when they are recovered, §15.7).
 
 ## 14. Journal and resume
 

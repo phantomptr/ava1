@@ -541,14 +541,18 @@ static ava1_job_t *refuse(ava1_job_open_ack_t *ack, uint16_t status, char *msg, 
 
 /* What this receiver understands: anything else in a JobOpen is a protocol error. */
 static int known_open(const ava1_recv_spec_t *s) {
-    const uint32_t flags = AVA1_JF_SINGLE_FILE | AVA1_JF_ORDERED | AVA1_JF_UNSAFE_READ | AVA1_JF_MOVE;
+    const uint32_t flags = AVA1_JF_SINGLE_FILE | AVA1_JF_ORDERED | AVA1_JF_UNSAFE_READ | AVA1_JF_MOVE | AVA1_JF_READBACK;
     return s->kind >= AVA1_JOB_UPLOAD && s->kind <= AVA1_JOB_COPY && s->policy <= AVA1_POLICY_VERIFY &&
            !(s->flags & ~flags);
 }
 
+/* The flags that make a job what it is: JF_READBACK is a request for this attempt only, so a resume
+ * that turned it on or off is the same job (SPEC.md §11.8). */
+static uint32_t ident_flags(uint32_t f) { return f & ~(uint32_t)AVA1_JF_READBACK; }
+
 /* The job a journal's Open describes is this JobOpen's job. */
 static int same_job(const ava1_jnl_open_t *o, const ava1_recv_spec_t *s) {
-    return memcmp(o->job_id, s->id, 16) == 0 && o->kind == s->kind && o->flags == s->flags &&
+    return memcmp(o->job_id, s->id, 16) == 0 && o->kind == s->kind && o->flags == ident_flags(s->flags) &&
            o->root_len == strlen(s->root) && memcmp(o->root, s->root, o->root_len) == 0;
 }
 
@@ -595,7 +599,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
          * journal. One that ended for good stays and answers again. */
         dead = j->stopping || (j->finished && j->final_status != AVA1_STATUS_OK && j->final_status != AVA1_ERR_EXISTS &&
                                j->final_status != AVA1_ERR_CROSS_DEVICE);
-        other = j->kind != s->kind || j->flags != s->flags || strcmp(j->root, s->root) != 0;
+        other = j->kind != s->kind || j->flags != ident_flags(s->flags) || strcmp(j->root, s->root) != 0;
         pthread_mutex_unlock(&j->mu);
         if (other) {
             ava1_job_put(j);
@@ -612,6 +616,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         j->emit = s->emit;
         j->emit_ctx = s->emit_ctx;
         j->policy = s->policy;
+        __atomic_store_n(&j->readback, (s->flags & AVA1_JF_READBACK) != 0, __ATOMIC_RELAXED);
         ava1_mstore_free(&j->m_in);
         if (s->entries) (void)ava1_mstore_reserve(&j->m_in, s->entries);
         j->ev_end = j->ev_resume = 0;
@@ -643,7 +648,8 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
                 ava1_data_log_small_flagged() ? "debug flag" : "config");
     j->kind = s->kind;
     j->policy = s->policy;
-    j->flags = s->flags;
+    j->flags = ident_flags(s->flags); /* what the journal records and a resume compares */
+    j->readback = (s->flags & AVA1_JF_READBACK) != 0;
     j->emit = s->emit;
     j->emit_ctx = s->emit_ctx;
     snprintf(j->root, sizeof j->root, "%s", s->root);
