@@ -875,7 +875,9 @@ durable and its outboard's root equals the sender's root, reads the part file ba
 compares each group's CV with the outboard's (a file of one group is already hashed from the drive at
 commit). A mismatch resets the file and sends `FileRetry{RETRY_VERIFY}`, so the sender sends the whole
 file again; the receiver logs it. After 3 mismatches of one file in a job the job ends with
-`ERR_VERIFY` (journal kept). A read that fails ends the job with `ERR_IO`. The read-back runs on the
+`ERR_VERIFY` (journal kept). A `job.copy` has no sender to resend: there the first mismatch ends the
+copy with `ERR_VERIFY` ("a copied file did not verify", as any copy retry does) and a re-issued copy
+goes on from its journal. A read that fails ends the job with `ERR_IO`. The read-back runs on the
 commit's worker, before the rename; a big file may be read in stripes on several threads. The read
 goes through the receiver's filesystem, so a page cache may answer for bytes still held in memory;
 what it proves is what any later reader of the file will get. Small files are out of its scope (their
