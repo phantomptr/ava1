@@ -1166,7 +1166,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     si.caps = S.cfg.caps;
     /* A server without data hooks cannot serve the data plane, whatever the caller asked
      * for: the caps are what a client is entitled to rely on. */
-    if (!S.cfg.data) si.caps &= ~(AVA1_CAP_DATA_PLANE | AVA1_CAP_SHARED_JOBS);
+    if (!S.cfg.data) si.caps &= ~(AVA1_CAP_DATA_PLANE | AVA1_CAP_SHARED_JOBS | AVA1_CAP_READBACK);
     memcpy(si.session_id, sid, 16);
     /* Commit to the pairing nonce before the client has shown its own (SPEC.md 4.6). */
     ava1_pair_commit(nonce_s, si.pair_commit);

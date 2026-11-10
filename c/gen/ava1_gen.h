@@ -44,6 +44,8 @@
 #define AVA1_CAP_MGMT 2ULL
 /* `ServerInfo.caps` bit: any paired device may read and cancel a transfer and take over a parked upload (SPEC.md §18.5). */
 #define AVA1_CAP_SHARED_JOBS 4ULL
+/* `ServerInfo.caps` bit: the node understands `JF_READBACK` (SPEC.md §13.5). */
+#define AVA1_CAP_READBACK 8ULL
 /* RPC `job.copy`: `JobCopy` request, `Status` reply; a copy or move on the node itself (SPEC.md §7.1, §15.5). */
 #define AVA1_METHOD_JOB_COPY 16ULL
 /* RPC `job.status`: `JobRef` request, `Status` reply (SPEC.md §7.1). */
@@ -100,6 +102,8 @@
 #define AVA1_JF_MOVE 8ULL
 /* Job flag, `job.copy` only: replace destination files that already exist; unset, an existing destination root is refused with `ERR_EXISTS` (SPEC.md §11.8). */
 #define AVA1_JF_OVERWRITE 16ULL
+/* Job flag: the receiver reads each large file back from its drive after the final sync and checks it against the root before it counts it done; a mismatch resends the file. Sent only to a node that advertises `CAP_READBACK`, and not part of a job's identity (SPEC.md §11.8, §13.5). */
+#define AVA1_JF_READBACK 32ULL
 /* `ManifestEntry.kind`: a file (SPEC.md §11.3). */
 #define AVA1_ENTRY_FILE 0ULL
 /* `ManifestEntry.kind`: a directory (SPEC.md §11.3). */

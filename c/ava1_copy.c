@@ -39,7 +39,7 @@ int ava1_copy_walk(const ava1_job_copy_t *c, ava1_mstore_t *out) {
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
     char src[AVA1_MAX_PATH + 1];
     struct stat st;
-    if (c->flags & ~(AVA1_JF_MOVE | AVA1_JF_OVERWRITE | AVA1_JF_SINGLE_FILE)) return AVA1_ERR_PROTOCOL;
+    if (c->flags & ~(AVA1_JF_MOVE | AVA1_JF_OVERWRITE | AVA1_JF_SINGLE_FILE | AVA1_JF_READBACK)) return AVA1_ERR_PROTOCOL;
     if (c->src_len > AVA1_MAX_PATH || !c->src_len || memchr(c->src, 0, c->src_len)) return AVA1_ERR_PATH;
     memcpy(src, c->src, c->src_len);
     src[c->src_len] = 0;
@@ -317,7 +317,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
         snprintf(msg, cap, "the source or destination is not a valid path");
         return NULL;
     }
-    if (in->flags & ~(AVA1_JF_MOVE | AVA1_JF_OVERWRITE | AVA1_JF_SINGLE_FILE)) {
+    if (in->flags & ~(AVA1_JF_MOVE | AVA1_JF_OVERWRITE | AVA1_JF_SINGLE_FILE | AVA1_JF_READBACK)) {
         *status = AVA1_ERR_PROTOCOL;
         snprintf(msg, cap, "unknown copy flags");
         return NULL;
@@ -331,7 +331,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
             return NULL;
         }
         if (j->kind != AVA1_JOB_COPY || strcmp(j->src, src) != 0 || strcmp(j->root, dest) != 0 ||
-            j->copy_flags != in->flags) {
+            j->copy_flags != (in->flags & ~(uint32_t)AVA1_JF_READBACK)) {
             *status = AVA1_ERR_PROTOCOL;
             snprintf(msg, cap, "a copy with this id has different parameters");
             ava1_job_put(j);
@@ -376,7 +376,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
     memcpy(s.owner, owner, 32);
     s.kind = AVA1_JOB_COPY;
     s.policy = AVA1_POLICY_REPLACE;
-    s.flags = S_ISDIR(st.st_mode) ? 0 : AVA1_JF_SINGLE_FILE;
+    s.flags = (S_ISDIR(st.st_mode) ? 0 : AVA1_JF_SINGLE_FILE) | (in->flags & AVA1_JF_READBACK);
     s.root = dest;
     s.emit = ava1_copy_emit;
     s.emit_ctx = NULL;
@@ -441,7 +441,7 @@ ava1_job_t *ava1_copy_open(const ava1_job_copy_t *in, const uint8_t owner[32],
     pthread_mutex_lock(&j->mu);
     j->role = c;
     __atomic_store_n(&j->copy_move, c->move, __ATOMIC_RELEASE);
-    j->copy_flags = in->flags;
+    j->copy_flags = in->flags & ~(uint32_t)AVA1_JF_READBACK; /* a re-issue may turn the read-back on or off */
     __atomic_store_n(&j->copy_delete_done, !c->move, __ATOMIC_RELEASE);
     j->role_free = cp_free;
     j->on_tick = cp_tick;
