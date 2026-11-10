@@ -251,6 +251,7 @@ static int u32cmp(const void *a, const void *b);
 static int stopping_cb(void *a);
 static void run_commit(ava1_job_t *j, uint32_t id);
 static void run_work(ava1_job_t *j, ava1_work_t *w);
+static void rb_live_kick(ava1_job_t *j);
 
 /* A lf with nothing left for a batch, a commit or a snapshot to do. */
 static int lf_idle(const ava1_job_t *j, uint32_t id, const ava1_lfile_t *lf) {
@@ -326,6 +327,7 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
 }
 
 size_t ava1_test_pwrite_max;
+uint32_t ava1_test_chunk_delay_ms;
 
 static int pwrite_all(int fd, const uint8_t *p, size_t n, uint64_t off) {
     while (n) {
@@ -475,13 +477,25 @@ size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap) {
 #undef SHARE
     if (n < 0) return 0;
     if ((size_t)n < cap && __atomic_load_n(&j->rb_files, __ATOMIC_RELAXED)) {
-        uint64_t us = __atomic_load_n(&j->rb_us, __ATOMIC_RELAXED), by = __atomic_load_n(&j->rb_bytes, __ATOMIC_RELAXED);
-        int m = snprintf(out + n, cap - (size_t)n, "; read back %llu files, %llu MiB in %llu ms (%.0f MiB/s; threads spent %llu ms reading, %llu ms hashing), %llu mismatches",
+        /* rb_us is the commits' read-back time, what the job waits for: the rate is of what they read */
+        uint64_t us = __atomic_load_n(&j->rb_us, __ATOMIC_RELAXED), by = __atomic_load_n(&j->rb_bytes, __ATOMIC_RELAXED),
+                 live = __atomic_load_n(&j->rb_live_bytes, __ATOMIC_RELAXED), after = __atomic_load_n(&j->rb_after_bytes, __ATOMIC_RELAXED);
+        int m = snprintf(out + n, cap - (size_t)n,
+                         "; read back %llu files, %llu MiB: %llu MiB while they arrived (%llu ranges handed over, %llu reads, %llu "
+                         "with chunks waiting), %llu MiB after their last byte in %llu ms (%.0f MiB/s; threads spent %llu ms "
+                         "reading, %llu ms hashing; %llu of %llu reads with the cache dropped first, %llu with O_DIRECT), "
+                         "%llu mismatches",
                          (unsigned long long)__atomic_load_n(&j->rb_files, __ATOMIC_RELAXED),
-                         (unsigned long long)(by >> 20), (unsigned long long)(us / 1000u),
-                         us ? (double)by / 1048576.0 / ((double)us / 1e6) : 0.0,
+                         (unsigned long long)(by >> 20), (unsigned long long)(live >> 20),
+                         (unsigned long long)__atomic_load_n(&j->rb_todo_ranges, __ATOMIC_RELAXED),
+                         (unsigned long long)__atomic_load_n(&j->rb_live_reads, __ATOMIC_RELAXED),
+                         (unsigned long long)__atomic_load_n(&j->rb_live_crowded, __ATOMIC_RELAXED), (unsigned long long)(after >> 20),
+                         (unsigned long long)(us / 1000u), us ? (double)after / 1048576.0 / ((double)us / 1e6) : 0.0,
                          (unsigned long long)(__atomic_load_n(&j->rb_read_us, __ATOMIC_RELAXED) / 1000u),
                          (unsigned long long)(__atomic_load_n(&j->rb_hash_us, __ATOMIC_RELAXED) / 1000u),
+                         (unsigned long long)__atomic_load_n(&j->rb_drops_ok, __ATOMIC_RELAXED),
+                         (unsigned long long)__atomic_load_n(&j->rb_drops, __ATOMIC_RELAXED),
+                         (unsigned long long)__atomic_load_n(&j->rb_direct_reads, __ATOMIC_RELAXED),
                          (unsigned long long)__atomic_load_n(&j->rb_mismatches, __ATOMIC_RELAXED));
         if (m > 0) n += m;
     }
@@ -504,6 +518,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
          * the data budget at once, not when the job is finally freed. */
         credit = j->credit;
         j->credit = 0;
+        pthread_cond_broadcast(&j->rb_cv); /* the live read-back threads end */
     }
     /* Commits already queued or running must finish (a queued one starts, sees `finished` and
      * returns) before Done is appended and JobDone sent: nothing may be journaled or acknowledged
@@ -513,7 +528,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     if (!first) return;
     ava1_log_job_event(status == AVA1_STATUS_OK ? "done" : "fail", j, status);
     if (j->start_us) { /* the apply engine ran: where its time went (a download or a move has none) */
-        char line[600];
+        char line[800];
         (void)ava1_apply_summary(j, line, sizeof line);
         fprintf(stderr, "%s\n", line);
     }
@@ -1044,6 +1059,10 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
         if (ob >= 0) close(ob);
         return -err;
     }
+    {
+        uint32_t ms = __atomic_load_n(&ava1_test_chunk_delay_ms, __ATOMIC_RELAXED);
+        if (ms) ava1_platform_sleep_ms(ms); /* tests: a drive slow enough to keep every worker busy */
+    }
     err = pwrite_all(fd, d, len, off);
     if (err == 0 && ob >= 0) {
         for (g = off / AVA1_GROUP_LEN; g * AVA1_GROUP_LEN < off + len; g++) {
@@ -1066,7 +1085,18 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
     }
     pthread_mutex_lock(&j->mu);
     lf->writers--;
-    if (!lf->committed) (void)ava1_rset_add(&lf->written, off, off + len); /* else: a late duplicate */
+    if (!lf->committed) { /* else: a late duplicate */
+        (void)ava1_rset_add(&lf->written, off, off + len);
+        /* Over durable bytes (a duplicate): they are not durable again until their batch, so what was read
+         * back of them no longer counts, and a read-back of the file in flight is void (see "read-back"). */
+        if (ava1_rset_overlaps(&lf->durable, off, off + len)) {
+            if (ava1_rset_remove(&lf->rb_todo, off, off + len) < 0) ava1_rset_clear(&lf->rb_todo);
+            if (ava1_rset_remove(&lf->rb_done, off, off + len) < 0) ava1_rset_clear(&lf->rb_done);
+            if (lf->rb_found && lf->rb_found_g * AVA1_GROUP_LEN >= off && lf->rb_found_g * AVA1_GROUP_LEN < off + len)
+                lf->rb_found = 0; /* the wrong group was written again: it is read back again */
+            lf->rb_gen++;
+        }
+    }
     j->unsynced_bytes += len;
     j->bytes_received += len;
     j->applied_since_tune++;
@@ -2621,7 +2651,12 @@ static void sync_batch(ava1_job_t *j) {
     }
     for (i = 0; i < ng; i++) {
         ava1_lfile_t *lf = j->lf[rg[i].file_id];
-        if (lf) (void)ava1_rset_add(&lf->durable, rg[i].offset, rg[i].offset + rg[i].len);
+        if (!lf) continue;
+        (void)ava1_rset_add(&lf->durable, rg[i].offset, rg[i].offset + rg[i].len);
+        /* JF_READBACK: durable now, so the live read-back may take them (out of memory: the commit does). */
+        if (j->readback && groups_of(j->m.e[rg[i].file_id].size) >= 2 && !lf->committed && !lf->committing &&
+            ava1_rset_add(&lf->rb_todo, rg[i].offset, rg[i].offset + rg[i].len) == 0)
+            __atomic_add_fetch(&j->rb_todo_ranges, 1, __ATOMIC_RELAXED);
     }
     for (i = 0; i < nroots; i++)
         if (j->lf[roots[i].file_id] && memcmp(j->lf[roots[i].file_id]->root, roots[i].root, 32) == 0)
@@ -2865,6 +2900,11 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     j->bytes_durable -= ava1_rset_covered(&lf->durable);
     ava1_rset_clear(&lf->written);
     ava1_rset_clear(&lf->durable);
+    ava1_rset_clear(&lf->rb_todo);
+    ava1_rset_clear(&lf->rb_done);
+    lf->rb_found = 0;
+    lf->rb_found_g = 0;
+    lf->rb_gen++; /* a live read-back of the old bytes in flight counts for nothing */
     lf->has_root = lf->root_journaled = 0;
     lf->committing = 0; /* a commit that found its bytes wrong starts the file over */
     /* Our own descriptor, taken under the lock: from here lf is evictable, and a worker in lf_slots
@@ -2903,16 +2943,38 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
     return k == (ssize_t)(n * 32u) ? 0 : -EIO;
 }
 
-/* JF_READBACK (SPEC.md §13.5). The commit has just checked that the outboard's group CVs merge to the
- * sender's root, but those CVs were computed from the bytes as they arrived, not from the drive. This
- * reads the part file back (every byte is durable by now) and compares each group's CV with the
- * outboard's, so a write that landed wrong (a short or misplaced write, a filesystem or drive fault,
- * another process writing the file) is found before the file counts as done. A big file is read in
- * stripes on a few threads of its own: the last file of a job is read back after its last byte, with
- * nothing else to overlap, so its read-back is the whole of what the check adds to the job. */
-#define READBACK_GROUPS 8u                 /* groups per read (8 MiB; 8 threads: 64 MiB in all) */
-#define READBACK_STRIPES 8u                /* threads for one big file, the worker included */
-#define READBACK_STRIPE_MIN (256ull << 20) /* a file below two of these is read by the worker alone */
+/* JF_READBACK (SPEC.md §13.5). Every check before the commit hashes the bytes as they arrived; this reads
+ * the part file back from the drive and compares each group's CV with the outboard's, so a write that
+ * landed wrong (a short or misplaced write, a filesystem or drive fault, another process writing the
+ * file) is found before the file counts as done.
+ *
+ * It runs in two parts, so that it costs the job little more than the tail of its last file:
+ *
+ * - While a file arrives (the live read-back). Each sync batch hands the large-file ranges it has just
+ *   made durable (fsynced, outboard included, and journaled) to lf->rb_todo and wakes the job's read-back
+ *   threads (AVA1_READBACK_THREADS, each one read of READBACK_GROUPS groups in flight). They take whole
+ *   groups from there, read them back and record them in lf->rb_done. They are threads of their own, not
+ *   the workers', so a steady stream of chunks never keeps them from reading; while chunks wait for a
+ *   worker (the receive path is behind) all but one hold back, so they share the drive with one read in
+ *   flight at most. They can never read more than the batches have written. On a drive that
+ *   reads faster than the network delivers they keep up with the write front. Lanes write out of order:
+ *   rb_todo is a range set, so any order is fine. A write over durable bytes (a late duplicate) takes its
+ *   range out of rb_todo and rb_done and bumps lf->rb_gen, which voids any read-back of the file in flight:
+ *   those bytes are read again once their own batch has made them durable. A reset does the same. A
+ *   mismatch is not acted on there (an old sender does not expect a FileRetry for a file it is still
+ *   sending): it is recorded (rb_found) and the commit acts on it as on its own.
+ *
+ * - At the commit, every group the live part did not read (the last batch's, those it had no time for,
+ *   all of a file made durable before this process started) is read back as before, in stripes on a few
+ *   threads of its own: the last file of a job has nothing left to overlap with.
+ *
+ * So every group is read back once after it was last made durable, and a byte that changes on the drive
+ * before its group is read back is found. One that changes after its group was read back (while the rest
+ * of the file still arrives) is not: the read-back proves what the drive held after the write, not that
+ * nothing touches the file later, which no check before the rename could promise either. */
+#define READBACK_GROUPS 8u                 /* groups per read (8 MiB) */
+#define READBACK_STRIPES 8u                /* buffers (and threads) per job: 64 MiB at most, live reads included */
+#define READBACK_STRIPE_MIN (256ull << 20) /* what is left below two of these is read by the commit's worker alone */
 static int pread_full(int fd, uint8_t *p, size_t len, uint64_t off, size_t *have) {
     *have = 0;
     while (*have < len) {
@@ -2925,60 +2987,315 @@ static int pread_full(int fd, uint8_t *p, size_t len, uint64_t off, size_t *have
     return 0;
 }
 
+void (*ava1_apply_rb_hook)(ava1_job_t *j, uint32_t id, uint64_t off, uint64_t len, int fd, int live);
+
+static int rb_ending(ava1_job_t *j) {
+    return is_stopping(j) || __atomic_load_n(&j->finished, __ATOMIC_RELAXED) || __atomic_load_n(&j->final_status, __ATOMIC_RELAXED);
+}
+
+/* ---- reading from the drive ----
+ * Read right after its batch, a range is still in the page cache, and a read answered from there proves
+ * nothing about the drive (on a console the live reads ran at ~1 GiB/s, the drive's are ~30 MiB/s a
+ * thread). So before each read its pages are dropped from the cache (ava1_platform_drop_cache: they are
+ * clean, the batch synced them), and the read goes through a descriptor of its own opened with O_DIRECT
+ * where the OS has one. Either may be refused (an OS without the call, a filesystem without direct I/O,
+ * a piece O_DIRECT cannot align): the read then goes through the cache as before, and the job's one
+ * "read-back ..." line says which. */
+#define RB_ALIGN 4096u /* O_DIRECT: buffer, offset and length in multiples of this */
+
+/* A read-only descriptor of file `id`'s part file with O_DIRECT, or -1 (the errno is kept for the job's
+ * line: none on this OS, or not on this filesystem). */
+static int rb_open_direct(ava1_job_t *j, uint32_t id) {
+    char p[PATH_CAP];
+    int fd;
+    ava1_apply_path(j, id, 1, p, sizeof p);
+    if (!p[0]) return -1;
+    if ((fd = ava1_platform_open_direct(p)) < 0) __atomic_store_n(&j->rb_direct_err, errno ? errno : EINVAL, __ATOMIC_RELAXED);
+    return fd;
+}
+
+/* An 8 MiB read-back buffer, aligned for O_DIRECT. */
+static uint8_t *rb_buf_alloc(void) {
+    void *p = NULL;
+    return posix_memalign(&p, RB_ALIGN, READBACK_GROUPS * (size_t)AVA1_GROUP_LEN) == 0 ? p : NULL;
+}
+
+/* The job's one line on how its read-back reaches the drive, from its first read. */
+static void rb_say_how(ava1_job_t *j, int drop, const char *how, int direct) {
+    char line[256];
+    const char *nodirect = strerror(__atomic_load_n(&j->rb_direct_err, __ATOMIC_RELAXED));
+    if (__atomic_exchange_n(&j->rb_how_logged, 1, __ATOMIC_RELAXED)) return;
+    if (direct && !drop)
+        snprintf(line, sizeof line, "read-back from the drive: O_DIRECT reads + %s", how);
+    else if (direct)
+        snprintf(line, sizeof line, "read-back from the drive: O_DIRECT reads (%s failed: %s)", how, strerror(drop));
+    else if (!drop)
+        snprintf(line, sizeof line, "read-back from the drive: %s (no O_DIRECT: %s)", how, nodirect);
+    else
+        snprintf(line, sizeof line, "read-back may read cached pages: %s: %s, and no O_DIRECT: %s", how, strerror(drop),
+                 nodirect);
+    fprintf(stderr, "[ava1] job %02x%02x%02x%02x: %s\n", j->id[0], j->id[1], j->id[2], j->id[3], line);
+}
+
+/* Reads groups [from, to) of file `id` (bytes: `from` group-aligned, `to` too or the file's size) back
+ * and compares each group's CV with the outboard's, READBACK_GROUPS at a time into `buf` (rb_buf_alloc).
+ * `rfd` reads (O_DIRECT, or `pfd` itself); `pfd` is the part file's ordinary descriptor: the cache is
+ * dropped through it, and it reads what O_DIRECT will not. 0 = they match; 1 = they do not (*bad = the
+ * first group that differs; a file shorter than its size counts as wrong); -errno = they could not be
+ * read; -EINTR = the job is ending, or `*quit` was set (another stripe already has the answer). */
+static int rb_check(ava1_job_t *j, uint32_t id, int rfd, int pfd, int ob_fd, uint64_t from, uint64_t to, uint8_t *buf,
+                    const int *quit, int live, uint64_t *bad) {
+    uint8_t cvs[READBACK_GROUPS][32];
+    uint64_t off = from;
+    while (off < to) {
+        uint64_t g0 = off / AVA1_GROUP_LEN, t_read, t_hash;
+        size_t len = to - off < READBACK_GROUPS * AVA1_GROUP_LEN ? (size_t)(to - off) : READBACK_GROUPS * (size_t)AVA1_GROUP_LEN;
+        size_t ng = (size_t)groups_of(len), have = 0, ob_have = 0, at;
+        const char *how = "";
+        int rc, drop;
+        if ((quit && __atomic_load_n(quit, __ATOMIC_RELAXED)) || rb_ending(j)) return -EINTR;
+        if ((rc = pread_full(ob_fd, &cvs[0][0], ng * 32u, g0 * 32u, &ob_have)) != 0) return rc;
+        if (ob_have != ng * 32u) return -EIO; /* the outboard is preallocated to every group's CV */
+        if (ava1_apply_rb_hook) ava1_apply_rb_hook(j, id, off, len, pfd, live);
+        t_read = mono_us();
+        drop = ava1_platform_drop_cache(pfd, off, len, &how);
+        __atomic_add_fetch(&j->rb_drops, 1, __ATOMIC_RELAXED);
+        if (!drop) __atomic_add_fetch(&j->rb_drops_ok, 1, __ATOMIC_RELAXED);
+        rb_say_how(j, drop, how, rfd != pfd);
+        rc = -EINVAL;
+        if (rfd != pfd) { /* whole aligned blocks: the file ends inside the last one, so it reads short */
+            size_t alen = (len + RB_ALIGN - 1) / RB_ALIGN * RB_ALIGN;
+            rc = pread_full(rfd, buf, alen, off, &have);
+            if (rc == 0) {
+                if (have > len) have = len;
+                __atomic_add_fetch(&j->rb_direct_reads, 1, __ATOMIC_RELAXED);
+            }
+        }
+        if (rc == -EINVAL && (rc = pread_full(pfd, buf, len, off, &have)) != 0) return rc; /* no O_DIRECT for this one */
+        if (rc) return rc;
+        t_hash = mono_us();
+        __atomic_add_fetch(&j->rb_read_us, t_hash - t_read, __ATOMIC_RELAXED);
+        for (at = 0; at < len; at += AVA1_GROUP_LEN) {
+            size_t glen = len - at < AVA1_GROUP_LEN ? len - at : (size_t)AVA1_GROUP_LEN;
+            uint8_t cv[32];
+            if (at + glen > have) { /* shorter than its size: the groups past here cannot match */
+                *bad = g0 + at / AVA1_GROUP_LEN;
+                rc = 1;
+                break;
+            }
+            ava1_b3_group_cv(buf + at, glen, g0 + at / AVA1_GROUP_LEN, cv);
+            if (memcmp(cv, cvs[at / AVA1_GROUP_LEN], 32) != 0) {
+                *bad = g0 + at / AVA1_GROUP_LEN;
+                rc = 1;
+                break;
+            }
+        }
+        __atomic_add_fetch(&j->rb_hash_us, mono_us() - t_hash, __ATOMIC_RELAXED);
+        if (rc) return rc;
+        off += len;
+    }
+    return 0;
+}
+
+/* ---- the live read-back ---- */
+
+/* Caller holds j->mu. Live read-backs may run: the job takes data, asked for the read-back, and is not
+ * being re-prepared (a changed manifest renumbers the files: ava1_apply_quiesce waits for the live reads
+ * in flight, and no new one starts while the feed is held). */
+static int rb_live_on(const ava1_job_t *j) {
+    return j->readback && j->prepared && !j->feed_hold && !j->finished && !j->final_status && !j->stopping;
+}
+
+/* Caller holds j->mu. A file the live read-back may take groups of now. */
+static int rb_live_file(const ava1_job_t *j, uint32_t id) {
+    const ava1_lfile_t *lf = id < j->m.n ? j->lf[id] : NULL;
+    return lf && lf->rb_todo.n && !lf->rb_found && !lf->committed && !lf->committing && lf->fd >= 0 && lf->ob_fd >= 0 &&
+           !ava1_bits_get(&j->done, id);
+}
+
+/* Caller holds j->mu. The first file with groups to read back live, or UINT32_MAX. */
+static uint32_t rb_live_next(const ava1_job_t *j) {
+    uint32_t k;
+    if (j->lfl_all) {
+        for (k = 0; k < j->m.n; k++)
+            if (rb_live_file(j, k)) return k;
+    } else {
+        for (k = 0; k < j->lfl_n; k++)
+            if (rb_live_file(j, j->lfl[k])) return j->lfl[k];
+    }
+    return UINT32_MAX;
+}
+
+/* Caller holds j->mu. 1 when chunks (or other work) wait in the queue and the free workers cannot take all
+ * of it at once: the receive path is behind, so the live read-back keeps to one read in flight. */
+static int rb_live_crowded(const ava1_job_t *j) {
+    uint32_t idle = j->want_workers > j->busy ? j->want_workers - j->busy : 0;
+    return j->q_len > idle;
+}
+
+/* Caller holds j->mu, held again on return (released for the read). One live read: up to READBACK_GROUPS
+ * durable groups of the first file with any, read back and recorded. 0 = nothing to take now, 1 = one
+ * read done (whatever it found). */
+static int rb_live_one(ava1_job_t *j, int crowded) {
+    uint32_t id, gen;
+    uint64_t from = 0, to = 0, size, bad = 0;
+    int fd = -1, ob = -1, rfd, rc;
+    uint8_t *buf;
+    ava1_lfile_t *lf;
+    for (;;) {
+        uint64_t a, b;
+        if (!rb_live_on(j) || j->rb_bufs >= READBACK_STRIPES || (id = rb_live_next(j)) == UINT32_MAX) return 0;
+        lf = j->lf[id];
+        size = j->m.e[id].size;
+        a = lf->rb_todo.v[0];
+        b = lf->rb_todo.v[1];
+        /* Whole groups only (a range's start is a chunk's, so group-aligned; its end is too, or the
+         * file's): a piece that is not is left to the commit. */
+        from = (a + AVA1_GROUP_LEN - 1) / AVA1_GROUP_LEN * AVA1_GROUP_LEN;
+        to = b >= size ? size : b / AVA1_GROUP_LEN * AVA1_GROUP_LEN;
+        if (from < to && to - from > READBACK_GROUPS * AVA1_GROUP_LEN) to = from + READBACK_GROUPS * AVA1_GROUP_LEN;
+        if (ava1_rset_remove(&lf->rb_todo, a, from < to ? to : b) < 0) ava1_rset_clear(&lf->rb_todo);
+        if (from < to) break;
+    }
+    fd = dup(lf->fd);
+    ob = dup(lf->ob_fd);
+    if (fd < 0 || ob < 0) { /* no descriptor to spare: the commit reads these groups */
+        if (fd >= 0) close(fd);
+        if (ob >= 0) close(ob);
+        return 0;
+    }
+    gen = lf->rb_gen;
+    lf->rb_busy++;
+    j->rb_bufs++;
+    j->rb_live_run++;
+    pthread_mutex_unlock(&j->mu);
+    if ((rfd = rb_open_direct(j, id)) < 0) rfd = fd;
+    if (!(buf = rb_buf_alloc())) rc = -ENOMEM;
+    else rc = rb_check(j, id, rfd, fd, ob, from, to, buf, NULL, 1, &bad);
+    free(buf);
+    if (rfd != fd) close(rfd);
+    close(fd);
+    close(ob);
+    __atomic_add_fetch(&j->rb_live_reads, 1, __ATOMIC_RELAXED);
+    if (crowded) __atomic_add_fetch(&j->rb_live_crowded, 1, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&j->mu);
+    lf->rb_busy--;
+    j->rb_bufs--;
+    j->rb_live_run--;
+    /* lf is still j->lf[id]: a file's lf is freed or moved only with no live read in flight (quiesce waits
+     * for rb_live_run, teardown joins these threads first). */
+    if (lf->rb_gen == gen) { /* else: reset or written over since: what was read says nothing */
+        if (rc == 0) {
+            (void)ava1_rset_add(&lf->rb_done, from, to); /* out of memory: the commit reads them again */
+            __atomic_add_fetch(&j->rb_live_bytes, to - from, __ATOMIC_RELAXED);
+        } else if (rc == 1 && (!lf->rb_found || bad < lf->rb_found_g)) {
+            lf->rb_found = 1;
+            lf->rb_found_g = bad;
+        }
+        /* -errno: left to the commit, which reads them again and reports a failure that lasts */
+    }
+    pthread_cond_broadcast(&j->cv); /* a commit or a quiesce may wait for this read */
+    return 1;
+}
+
 typedef struct {
     ava1_job_t *j;
-    uint64_t from, to; /* [from, to): group-aligned, `to` the file's size for the last stripe */
-    int fd, ob_fd;
-    int *quit;         /* shared: set when a stripe has the answer (a mismatch or an error) */
+    uint32_t idx;
+} rb_thr_t;
+
+/* One live read-back thread. They read while there is durable work, all of them while the workers keep
+ * up with the chunks, only the first (one read in flight) while chunks wait for a worker; they never take
+ * a worker. Idle, they wait for the next batch. */
+static void *rb_live_main(void *arg) {
+    rb_thr_t *t = arg;
+    ava1_job_t *j = t->j;
+    uint32_t idx = t->idx;
+    free(t);
+    pthread_mutex_lock(&j->mu);
+    while (!j->stopping && !j->finished) { /* an ended job reads nothing more: its threads go */
+        int crowded;
+        if (!rb_live_on(j) || rb_live_next(j) == UINT32_MAX) {
+            pthread_cond_wait(&j->rb_cv, &j->mu); /* the next batch, the job's end or its stop wakes us */
+            continue;
+        }
+        crowded = rb_live_crowded(j);
+        if (crowded && idx > 0) { /* the receive path is behind: leave the drive to it but for one read */
+            pthread_mutex_unlock(&j->mu);
+            ava1_platform_sleep_ms(20);
+            pthread_mutex_lock(&j->mu);
+            continue;
+        }
+        if (!rb_live_one(j, crowded) && !j->stopping && !j->finished) pthread_cond_wait(&j->rb_cv, &j->mu);
+    }
+    pthread_mutex_unlock(&j->mu);
+    return NULL;
+}
+
+/* Job thread, after each batch: wakes the live read-back threads, starting them the first time there is
+ * durable work for them. */
+static void rb_live_kick(ava1_job_t *j) {
+    uint32_t k, n = 0;
+    int start;
+    pthread_mutex_lock(&j->mu);
+    start = !j->rb_th_n && rb_live_on(j) && rb_live_next(j) != UINT32_MAX;
+    if (!start) {
+        if (j->rb_th_n) pthread_cond_broadcast(&j->rb_cv);
+        pthread_mutex_unlock(&j->mu);
+        return;
+    }
+    pthread_mutex_unlock(&j->mu);
+    for (k = 0; k < AVA1_READBACK_THREADS; k++) {
+        rb_thr_t *t = malloc(sizeof *t);
+        if (!t) break;
+        t->j = j;
+        t->idx = n;
+        if (ava1_thread_start(rb_live_main, t, &j->rb_th[n]) != 0) {
+            free(t);
+            break;
+        }
+        n++;
+    }
+    pthread_mutex_lock(&j->mu);
+    j->rb_th_n = n; /* written by the job thread only; job_destroy reads it after joining that thread */
+    pthread_cond_broadcast(&j->rb_cv);
+    pthread_mutex_unlock(&j->mu);
+    fprintf(stderr, "[ava1] job %02x%02x%02x%02x: read-back: %u threads read large files back as they arrive\n", j->id[0],
+            j->id[1], j->id[2], j->id[3], n);
+}
+
+/* ---- the commit's read-back ---- */
+
+typedef struct {
+    uint64_t g0, g1; /* groups [g0, g1) */
+} rb_span_t;
+
+typedef struct {
+    ava1_job_t *j;
+    uint32_t id;
+    const rb_span_t *sp; /* the groups to read, in order */
+    uint32_t nsp;
+    uint64_t from, to;   /* this stripe's share: the from-th to the to-th group of those */
+    uint64_t size;
+    int fd, rfd, ob_fd;  /* rfd: what reads (O_DIRECT, or fd); see rb_check */
+    int *quit;           /* shared: set when a stripe has the answer (a mismatch or an error) */
     uint64_t bad;
     int rc;
 } rb_stripe_t;
 
-/* 0 = the stripe matches; 1 = it does not (bad = the first group that differs; a file shorter than its
- * size counts as wrong); -errno = it could not be read; -EINTR = the job is ending, or another stripe
- * already has the answer. */
+/* rb_check over the stripe's share of the spans. */
 static int readback_stripe(rb_stripe_t *s) {
-    uint8_t *buf = malloc(READBACK_GROUPS * (size_t)AVA1_GROUP_LEN), cvs[READBACK_GROUPS][32];
-    uint64_t off = s->from;
+    uint8_t *buf = rb_buf_alloc();
+    uint64_t at = 0; /* groups of the spans before sp[k] */
+    uint32_t k;
     int rc = 0;
-    if (!buf) return -ENOMEM;
-    while (!rc && off < s->to) {
-        uint64_t g0 = off / AVA1_GROUP_LEN;
-        size_t len = s->to - off < READBACK_GROUPS * AVA1_GROUP_LEN ? (size_t)(s->to - off)
-                                                                     : READBACK_GROUPS * (size_t)AVA1_GROUP_LEN;
-        size_t ng = (size_t)groups_of(len), have = 0, ob_have = 0, at;
-        if (__atomic_load_n(s->quit, __ATOMIC_RELAXED) || is_stopping(s->j) ||
-            __atomic_load_n(&s->j->finished, __ATOMIC_RELAXED) || __atomic_load_n(&s->j->final_status, __ATOMIC_RELAXED)) {
-            rc = -EINTR;
-            break;
+    if (!buf) rc = -ENOMEM;
+    for (k = 0; !rc && k < s->nsp && at < s->to; k++) {
+        uint64_t n = s->sp[k].g1 - s->sp[k].g0, lo = s->from > at ? s->from - at : 0, hi = s->to - at < n ? s->to - at : n;
+        if (lo < hi) {
+            uint64_t b0 = (s->sp[k].g0 + lo) * AVA1_GROUP_LEN, b1 = (s->sp[k].g0 + hi) * AVA1_GROUP_LEN;
+            rc = rb_check(s->j, s->id, s->rfd, s->fd, s->ob_fd, b0, b1 < s->size ? b1 : s->size, buf, s->quit, 0, &s->bad);
         }
-        if ((rc = pread_full(s->ob_fd, &cvs[0][0], ng * 32u, g0 * 32u, &ob_have)) != 0) break;
-        if (ob_have != ng * 32u) {
-            rc = -EIO; /* the outboard was whole a moment ago (read_root) */
-            break;
-        }
-        uint64_t t_read = mono_us();
-        if ((rc = pread_full(s->fd, buf, len, off, &have)) != 0) break;
-        uint64_t t_hash = mono_us();
-        __atomic_add_fetch(&s->j->rb_read_us, t_hash - t_read, __ATOMIC_RELAXED);
-        for (at = 0; at < len; at += AVA1_GROUP_LEN) {
-            size_t glen = len - at < AVA1_GROUP_LEN ? len - at : (size_t)AVA1_GROUP_LEN;
-            uint64_t g = g0 + at / AVA1_GROUP_LEN;
-            uint8_t cv[32];
-            if (at + glen > have) { /* shorter than its size: the groups past here cannot match */
-                s->bad = g;
-                rc = 1;
-                break;
-            }
-            ava1_b3_group_cv(buf + at, glen, g, cv);
-            if (memcmp(cv, cvs[at / AVA1_GROUP_LEN], 32) != 0) {
-                s->bad = g;
-                rc = 1;
-                break;
-            }
-        }
-        __atomic_add_fetch(&s->j->rb_hash_us, mono_us() - t_hash, __ATOMIC_RELAXED);
-        off += len;
+        at += n;
     }
     free(buf);
     if (rc && rc != -EINTR) __atomic_store_n(s->quit, 1, __ATOMIC_RELAXED);
@@ -2991,26 +3308,44 @@ static void *readback_stripe_main(void *arg) {
     return NULL;
 }
 
-/* 0 = the drive holds what was sent; 1 = it does not (*bad = the first group found wrong); -errno =
- * it could not be read; -EINTR = the job is ending. */
-static int readback_large(ava1_job_t *j, uint32_t id, int fd, int ob_fd, uint64_t *bad) {
-    uint64_t size = j->m.e[id].size, groups = groups_of(size), per;
+/* Reads back the groups in `sp` (`total` of them), in stripes when they are many. 0 = the drive holds
+ * what was sent; 1 = it does not (*bad = the first group found wrong); -errno = it could not be read;
+ * -EINTR = the job is ending. */
+static int readback_large(ava1_job_t *j, uint32_t id, int fd, int rfd, int ob_fd, const rb_span_t *sp, uint32_t nsp, uint64_t total,
+                          uint64_t *bad) {
+    uint64_t size = j->m.e[id].size, per;
     rb_stripe_t s[READBACK_STRIPES];
     pthread_t th[READBACK_STRIPES];
     int started[READBACK_STRIPES] = { 0 }, quit = 0, rc = 0;
     uint32_t n = 1, k;
     *bad = 0;
-    if (size >= 2 * READBACK_STRIPE_MIN) {
-        n = (uint32_t)(size / READBACK_STRIPE_MIN);
-        if (n > READBACK_STRIPES) n = READBACK_STRIPES;
+    if (!total) return 0;
+    if (total * AVA1_GROUP_LEN >= 2 * READBACK_STRIPE_MIN) {
+        n = (uint32_t)(total * AVA1_GROUP_LEN / READBACK_STRIPE_MIN < READBACK_STRIPES ? total * AVA1_GROUP_LEN / READBACK_STRIPE_MIN
+                                                                                         : READBACK_STRIPES);
     }
-    per = (groups + n - 1) / n;
+    /* A buffer per stripe, shared with the live read-backs and other commits: as many as are free, one at
+     * least (waited for: whoever holds them is reading, and gives them back within one read). */
+    pthread_mutex_lock(&j->mu);
+    while (j->rb_bufs >= READBACK_STRIPES && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+    if (j->stopping) {
+        pthread_mutex_unlock(&j->mu);
+        return -EINTR;
+    }
+    if (n > READBACK_STRIPES - j->rb_bufs) n = READBACK_STRIPES - j->rb_bufs;
+    j->rb_bufs += n;
+    pthread_mutex_unlock(&j->mu);
+    per = (total + n - 1) / n;
     for (k = 0; k < n; k++) {
-        uint64_t g0 = per * k, g1 = per * (k + 1) < groups ? per * (k + 1) : groups;
         s[k].j = j;
-        s[k].from = g0 * AVA1_GROUP_LEN;
-        s[k].to = g1 * AVA1_GROUP_LEN < size ? g1 * AVA1_GROUP_LEN : size;
+        s[k].id = id;
+        s[k].sp = sp;
+        s[k].nsp = nsp;
+        s[k].from = per * k;
+        s[k].to = per * (k + 1) < total ? per * (k + 1) : total;
+        s[k].size = size;
         s[k].fd = fd;
+        s[k].rfd = rfd;
         s[k].ob_fd = ob_fd;
         s[k].quit = &quit;
         s[k].bad = 0;
@@ -3022,6 +3357,10 @@ static int readback_large(ava1_job_t *j, uint32_t id, int fd, int ob_fd, uint64_
         if (started[k]) pthread_join(th[k], NULL);
         else s[k].rc = readback_stripe(&s[k]); /* no thread: this worker reads that stripe too */
     }
+    pthread_mutex_lock(&j->mu);
+    j->rb_bufs -= n;
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
     /* A real answer wins over the -EINTR of the stripes it stopped; of mismatches, the lowest group. */
     for (k = 0; k < n; k++) {
         if (s[k].rc < 0 && s[k].rc != -EINTR && rc == 0) rc = s[k].rc;
@@ -3034,6 +3373,37 @@ static int readback_large(ava1_job_t *j, uint32_t id, int fd, int ob_fd, uint64_
         for (k = 0; k < n; k++)
             if (s[k].rc == -EINTR) rc = -EINTR;
     return rc;
+}
+
+/* Caller holds j->mu. The groups of file `id` not read back while it arrived, as spans (malloc'd; NULL
+ * with *nsp = UINT32_MAX when out of memory); *total = how many groups they hold, *bytes = their bytes. */
+static rb_span_t *rb_left(const ava1_job_t *j, uint32_t id, uint32_t *nsp, uint64_t *total, uint64_t *bytes) {
+    const ava1_lfile_t *lf = j->lf[id];
+    uint64_t size = j->m.e[id].size, groups = groups_of(size), g = 0;
+    rb_span_t *sp = malloc((lf->rb_done.n + 1) * sizeof *sp);
+    size_t r;
+    *nsp = 0;
+    *total = *bytes = 0;
+    if (!sp) {
+        *nsp = UINT32_MAX;
+        return NULL;
+    }
+    for (r = 0; r <= lf->rb_done.n; r++) {
+        /* rb_done holds whole groups (its last one may end at the file's end): [d0, d1) in groups */
+        uint64_t d0 = r < lf->rb_done.n ? lf->rb_done.v[2 * r] / AVA1_GROUP_LEN : groups;
+        uint64_t d1 = r < lf->rb_done.n ? (lf->rb_done.v[2 * r + 1] >= size ? groups : lf->rb_done.v[2 * r + 1] / AVA1_GROUP_LEN)
+                                        : groups;
+        if (d0 > groups) d0 = groups;
+        if (d0 > g) {
+            sp[*nsp].g0 = g;
+            sp[*nsp].g1 = d0;
+            *total += d0 - g;
+            *bytes += (d0 * AVA1_GROUP_LEN < size ? d0 * AVA1_GROUP_LEN : size) - g * AVA1_GROUP_LEN;
+            (*nsp)++;
+        }
+        if (d1 > g) g = d1;
+    }
+    return sp;
 }
 
 /* A commit runs on a worker, and workers never end the job themselves (see worker_fail): the
@@ -3054,7 +3424,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     const ava1_ment_t *e = &j->m.e[id];
     char part[PATH_CAP], fin[PATH_CAP], parent[PATH_CAP], ob[600];
     uint8_t root[32], want[32];
-    int err = 0;
+    int err = 0, found;
     pthread_mutex_lock(&j->mu);
     if (j->finished || j->final_status) { /* the job already ended or a sibling failed: do nothing more */
         lf->committing = 0;
@@ -3091,13 +3461,36 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         commit_fail(j, AVA1_ERR_IO, "path too long", ENAMETOOLONG, 0);
         return;
     }
-    /* A file of one group was just hashed from the drive by read_root; a larger one is read back here. */
-    if (__atomic_load_n(&j->readback, __ATOMIC_RELAXED) && groups_of(e->size) >= 2) {
-        uint64_t bad = 0, t0 = mono_us();
-        int rb;
+    /* A file of one group was just hashed from the drive by read_root; a larger one is read back here: the
+     * groups the live read-back has not (or the mismatch it found, which is acted on even if a resume has
+     * since turned the read-back off: the drive is known to hold something else). */
+    pthread_mutex_lock(&j->mu);
+    found = lf->rb_found;
+    pthread_mutex_unlock(&j->mu);
+    if ((__atomic_load_n(&j->readback, __ATOMIC_RELAXED) || found) && groups_of(e->size) >= 2) {
+        uint64_t bad = 0, t0, total = 0, bytes = 0;
+        uint32_t nsp = 0;
+        rb_span_t *sp = NULL;
+        int rb = 0;
         HOOK(j, AVA1_HOOK_READBACK, id);
-        rb = readback_large(j, id, lf->fd, lf->ob_fd, &bad);
+        t0 = mono_us();
+        pthread_mutex_lock(&j->mu);
+        /* Its live read-backs in flight end first (no new one starts: `committing` is set). */
+        while (lf->rb_busy && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+        found = lf->rb_found;
+        bad = lf->rb_found_g;
+        if (j->stopping) rb = -EINTR;
+        else if (!found && !(sp = rb_left(j, id, &nsp, &total, &bytes)) && nsp == UINT32_MAX) rb = -ENOMEM;
+        pthread_mutex_unlock(&j->mu);
+        if (found) rb = 1;
+        else if (!rb && total) {
+            int rfd = rb_open_direct(j, id); /* one for every stripe: pread shares it */
+            rb = readback_large(j, id, lf->fd, rfd >= 0 ? rfd : lf->fd, lf->ob_fd, sp, nsp, total, &bad);
+            if (rfd >= 0) close(rfd);
+        }
+        free(sp);
         __atomic_add_fetch(&j->rb_us, mono_us() - t0, __ATOMIC_RELAXED);
+        if (!found && (rb == 0 || rb == 1)) __atomic_add_fetch(&j->rb_after_bytes, bytes, __ATOMIC_RELAXED);
         if (rb == -EINTR) { /* the job is ending: a resume commits (and reads back) the file again */
             pthread_mutex_lock(&j->mu);
             lf->committing = 0;
@@ -3143,6 +3536,8 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
     pthread_mutex_lock(&j->mu);
     lf->committed = 1;
     ava1_rset_clear(&lf->written);
+    ava1_rset_clear(&lf->rb_todo);
+    ava1_rset_clear(&lf->rb_done);
     pthread_mutex_unlock(&j->mu);
     /* Truncate (preallocate may have reserved more) before the mtime: on Linux ftruncate
      * itself sets the mtime. The fsync makes all three durable. */
@@ -3360,7 +3755,7 @@ int ava1_apply_quiesce(ava1_job_t *j) {
     uint32_t i;
     int pend, ok, rc = 0;
     pthread_mutex_lock(&j->mu);
-    while ((j->q_len || j->busy) && !j->stopping) {
+    while ((j->q_len || j->busy || j->rb_live_run) && !j->stopping) { /* live reads too: the ids may move */
         /* A worker may be waiting in pend_add for room: make it, or nobody ever will. */
         int sync = j->pend_n != 0, can = j->prepared && !j->finished && !j->final_status;
         if (sync && !can) {
@@ -3577,6 +3972,7 @@ static void *job_main(void *arg) {
             sync_batch(j);
             j->last_batch_ms = now;
             if (!j->stopping) ava1_apply_commit_ready(j);
+            if (!j->stopping) rb_live_kick(j); /* after the commits: a file about to commit is read back there */
         }
         if (j->timing && j->st_batches && now - j->st_log_ms >= 10000) log_stats(j, now);
         if (all_done(j)) finish(j);

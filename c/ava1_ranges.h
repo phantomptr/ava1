@@ -19,6 +19,11 @@ typedef struct {
 int ava1_rset_add(ava1_rset_t *r, uint64_t start, uint64_t end); /* 0, or -1 out of memory */
 uint64_t ava1_rset_covered(const ava1_rset_t *r);
 int ava1_rset_covers(const ava1_rset_t *r, uint64_t start, uint64_t end);
+/* 1 when some byte of [start, end) is in the set (never for an empty range). */
+int ava1_rset_overlaps(const ava1_rset_t *r, uint64_t start, uint64_t end);
+/* Takes [start, end) out of the set: 1 when that removed something, 0 when nothing was there, -1 out of
+ * memory (cutting one range in two needs a pair more; the set is then unchanged). */
+int ava1_rset_remove(ava1_rset_t *r, uint64_t start, uint64_t end);
 void ava1_rset_clear(ava1_rset_t *r); /* frees */
 
 /* A bitset of file ids; ava1_bits_init sets every field, ava1_bits_free releases. */

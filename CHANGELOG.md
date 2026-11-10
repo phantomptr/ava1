@@ -3,6 +3,29 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.9
+
+Read-back while the file arrives. Nothing changes on the wire format.
+
+C library:
+
+- The read-back now runs while a large file arrives: each part is read back as soon as it is safely on
+  the drive, and only what is left (usually the last few MiB) is read after the last byte. It used to
+  read every file again from the start after its last byte, which added about 30% to a large transfer
+  (19.5 s on a 4 GiB file on a PS5 Pro). It runs on 6 threads of its own, so a busy upload does not
+  hold it back, and it backs off to one read at a time while the incoming data waits to be written.
+- The read-back now reads from the drive, not from memory. Read right after it was written, a file is
+  still in the system's cache, and a check against that copy cannot find a fault on the drive. Each
+  part is now dropped from the cache before it is read, and read with direct I/O where the system
+  allows. The log says once per job which method is in use, or that the read may come from the cache
+  (macOS has no way to drop it).
+- A mismatch is still handled when the file is finished, as before. The read after the last byte uses
+  8 threads of 8 MiB reads. The end-of-job line says how much was read back while files arrived (with
+  how many ranges and reads that took), how much after, and how long the threads spent reading and
+  hashing.
+- Measured on a PS5 Pro, 4 GiB to the internal drive: 60.4 s with the check, against 83.5 s for the
+  1.0.8 check and about 62 s with no check at all.
+
 ## 1.0.8
 
 Read-back verification. Nothing changes on the wire format: the receiver advertises a new capability bit, and a sender that sets the new job flag gets the check.

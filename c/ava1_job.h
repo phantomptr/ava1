@@ -17,6 +17,10 @@
 /* JnlOpen.staged: bit 0 = staged under <root>.ava-part; bit 1 = the receiver created the
  * empty <root> as its lock (SPEC.md §11.6), so an empty <root> on resume is its own. */
 #define AVA1_STAGED_HELD 2
+/* JF_READBACK: threads per job that read large files back while they arrive (SPEC.md §13.5). An 8 MiB
+ * read from a PS5's drive (not its cache) runs at ~26-30 MiB/s per thread (8 threads: ~211 MiB/s), so six
+ * give ~150 MiB/s, twice a 65 MiB/s upload, with the drive also taking the writes. */
+#define AVA1_READBACK_THREADS 6
 
 typedef struct ava1_job ava1_job_t;
 /* Where a job's outgoing messages go: a session (network jobs) or a recorder (local, tests).
@@ -52,6 +56,16 @@ typedef struct {        /* one large file being assembled */
     int writers;           /* write_chunk calls that took their own dups and have not yet recorded the range */
     uint8_t held;          /* descriptors counted against the large-file budget (0, 1 or 2) */
     uint8_t rb_bad;        /* read-backs (JF_READBACK) that found the drive's bytes wrong; the file fails at AVA1_READBACK_TRIES */
+    /* JF_READBACK while the file arrives (SPEC.md §13.5; ava1_apply.c, "read-back"), under j->mu.
+     * rb_todo: durable bytes nobody has read back yet (a sync batch adds what it made durable, a write
+     * takes its range out again). rb_done: read back and right since they were last made durable.
+     * rb_gen: bumped by a reset and by a write over durable bytes, so a read-back in flight across
+     * either counts for nothing. rb_busy: read-backs of this file in flight. rb_found: one found the
+     * drive's bytes wrong at group rb_found_g; the commit acts on it (unless that group is written again). */
+    ava1_rset_t rb_todo, rb_done;
+    uint32_t rb_gen;
+    uint8_t rb_busy, rb_found;
+    uint64_t rb_found_g;
 } ava1_lfile_t;
 
 /* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
@@ -208,6 +222,20 @@ struct ava1_job {
     int readback;
     uint64_t rb_files, rb_bytes, rb_us, rb_mismatches;
     uint64_t rb_read_us, rb_hash_us; /* summed over read-back threads: where the time went */
+    uint64_t rb_live_bytes, rb_after_bytes; /* read back while files arrived / after their last byte (rb_us is the latter's wall time) */
+    /* The live read-back's own threads (ava1_apply.c, "read-back"): started by the job thread at the first
+     * durable range of a large file, joined by job_destroy. They wait on rb_cv, which each batch signals. */
+    pthread_t rb_th[AVA1_READBACK_THREADS];
+    uint32_t rb_th_n;
+    pthread_cond_t rb_cv;
+    uint32_t rb_live_run;            /* live reads in flight (under mu): ava1_apply_quiesce waits for none */
+    uint64_t rb_todo_ranges, rb_live_reads, rb_live_crowded; /* atomics, for the end-of-job line: ranges batches handed
+                                                              * over, live reads done, of those with chunks waiting */
+    /* Reading from the drive, not the page cache (atomics): reads whose pages were dropped from the cache
+     * first (asked / done), reads made with O_DIRECT; the one line per job that says how. */
+    uint64_t rb_drops, rb_drops_ok, rb_direct_reads;
+    int rb_how_logged, rb_direct_err; /* ... and why O_DIRECT was refused, the last time it was */
+    uint32_t rb_bufs;                /* read-back buffers in use, live and at commit (under mu; at most READBACK_STRIPES) */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */

@@ -102,15 +102,22 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_HOOK_SWEPT 11          /* a JnlSweep was appended (the files are durable in place) */
 #define AVA1_HOOK_BATCH_ALLOC 13    /* a sync batch is about to allocate its work lists: a nonzero ava1_apply_fault is "out of memory" (tests) */
 #define AVA1_HOOK_PREALLOC 9        /* a part file is about to be preallocated (job mutex NOT held) */
-#define AVA1_HOOK_READBACK 14       /* JF_READBACK: a large file is about to be read back before its commit */
+#define AVA1_HOOK_READBACK 14       /* JF_READBACK: a large file is about to be read back before its commit
+                                     * (what was not already read back while it arrived) */
 /* Read-backs that find a file wrong before the job fails (each one first resends the file). */
 #define AVA1_READBACK_TRIES 3u
 /* Tests: every pwrite of file data writes at most this many bytes (0, the default: no cap). */
 extern size_t ava1_test_pwrite_max;
+/* Tests: every chunk's write first waits this many ms (0, the default: none). */
+extern uint32_t ava1_test_chunk_delay_ms;
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.
  * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename. */
 extern int (*ava1_apply_fault)(ava1_job_t *j, int point, uint32_t id);
+/* Tests only (NULL in the payload): JF_READBACK is about to read bytes [off, off + len) of file `id` back
+ * through `fd` (its own descriptor, opened for writing too), `live` while the file still arrives, else in
+ * the commit's pass. Called with no lock held, from any worker or read-back thread. */
+extern void (*ava1_apply_rb_hook)(ava1_job_t *j, uint32_t id, uint64_t off, uint64_t len, int fd, int live);
 /* Tests only (0 in the payload): while nonzero, the job thread starts no sync batch. */
 extern int ava1_apply_hold_batches;
 

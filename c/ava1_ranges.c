@@ -49,6 +49,43 @@ int ava1_rset_covers(const ava1_rset_t *r, uint64_t start, uint64_t end) {
     return 0;
 }
 
+int ava1_rset_overlaps(const ava1_rset_t *r, uint64_t start, uint64_t end) {
+    size_t i;
+    for (i = 0; start < end && i < r->n; i++)
+        if (r->v[2 * i] < end && start < r->v[2 * i + 1]) return 1;
+    return 0;
+}
+
+int ava1_rset_remove(ava1_rset_t *r, uint64_t start, uint64_t end) {
+    size_t i = 0, j;
+    if (start >= end) return 0;
+    while (i < r->n && r->v[2 * i + 1] <= start) i++; /* the first pair that ends past start */
+    if (i == r->n || r->v[2 * i] >= end) return 0;     /* none overlaps */
+    if (r->v[2 * i] < start && end < r->v[2 * i + 1]) { /* inside one pair: it becomes two */
+        if (r->n == r->cap) {
+            size_t cap = r->cap ? r->cap * 2 : 4;
+            uint64_t *v = realloc(r->v, cap * 2 * sizeof *v);
+            if (!v) return -1;
+            r->v = v;
+            r->cap = cap;
+        }
+        memmove(&r->v[2 * (i + 1)], &r->v[2 * i], (r->n - i) * 2 * sizeof *r->v);
+        r->n++;
+        r->v[2 * i + 1] = start;
+        r->v[2 * (i + 1)] = end;
+        return 1;
+    }
+    if (r->v[2 * i] < start) r->v[2 * i++ + 1] = start; /* keep the head of the first pair */
+    j = i;
+    while (j < r->n && r->v[2 * j + 1] <= end) j++;     /* pairs i..j-1 lie inside: they go */
+    if (j < r->n && r->v[2 * j] < end) r->v[2 * j] = end; /* keep the tail of the last pair */
+    if (j > i) {
+        memmove(&r->v[2 * i], &r->v[2 * j], (r->n - j) * 2 * sizeof *r->v);
+        r->n -= j - i;
+    }
+    return 1;
+}
+
 void ava1_rset_clear(ava1_rset_t *r) {
     free(r->v);
     memset(r, 0, sizeof *r);

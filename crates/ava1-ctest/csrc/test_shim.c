@@ -584,6 +584,31 @@ size_t ava1_test_rset_after(const uint64_t *ops, size_t nops, uint64_t *out, siz
     return n;
 }
 
+/* The same with removals: ops are triples (kind, start, end), kind 0 = add, 1 = remove (ava1_rset_overlaps
+ * is checked against the set before each removal: a mismatch with what the removal reports returns
+ * SIZE_MAX). */
+size_t ava1_test_rset_ops(const uint64_t *ops, size_t nops, uint64_t *out, size_t cap_pairs) {
+    ava1_rset_t r;
+    size_t i, n;
+    memset(&r, 0, sizeof r);
+    for (i = 0; i < nops; i++) {
+        const uint64_t *o = ops + 3 * i;
+        if (o[0] == 0) {
+            (void)ava1_rset_add(&r, o[1], o[2]);
+        } else {
+            int had = ava1_rset_overlaps(&r, o[1], o[2]), rc = ava1_rset_remove(&r, o[1], o[2]);
+            if (rc < 0 || rc != had) {
+                ava1_rset_clear(&r);
+                return SIZE_MAX;
+            }
+        }
+    }
+    n = r.n < cap_pairs ? r.n : cap_pairs;
+    if (n) memcpy(out, r.v, n * 2 * sizeof *out);
+    ava1_rset_clear(&r);
+    return n;
+}
+
 /* FileRun pairs (first, count) for the given set bits; returns pair count. */
 size_t ava1_test_bits_runs(uint32_t n, const uint32_t *set, size_t nset, uint32_t *out, size_t cap_pairs) {
     ava1_bits_t b;
@@ -1296,6 +1321,74 @@ void ava1_test_corrupt_at_commit(int n, uint64_t at) {
     __atomic_store_n(&g_corrupt_n, n, __ATOMIC_SEQ_CST);
 }
 int ava1_test_corrupt_left(void) { return __atomic_load_n(&g_corrupt_n, __ATOMIC_SEQ_CST); }
+
+/* JF_READBACK seen from its reads (ava1_apply_rb_hook): every stretch the read-back is about to read, live
+ * (while its file still arrives) or in the commit's pass. */
+static int g_rbc_n;            /* reads that find the byte at g_rbc_at changed on the drive first */
+static uint64_t g_rbc_at;
+static int g_rb_hold;          /* live reads wait here while set (and the job is not stopping) */
+static uint32_t g_rb_held;     /* live reads waiting there now */
+static uint64_t g_rb_reads[2]; /* reads seen: [0] the commit's, [1] live */
+static void t_rb_hook(ava1_job_t *j, uint32_t id, uint64_t off, uint64_t len, int fd, int live) {
+    uint64_t at = __atomic_load_n(&g_rbc_at, __ATOMIC_SEQ_CST);
+    (void)id;
+    __atomic_add_fetch(&g_rb_reads[live ? 1 : 0], 1, __ATOMIC_SEQ_CST);
+    if (live && __atomic_load_n(&g_rb_hold, __ATOMIC_SEQ_CST)) {
+        __atomic_add_fetch(&g_rb_held, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&g_rb_hold, __ATOMIC_SEQ_CST) && !__atomic_load_n(&j->stopping, __ATOMIC_SEQ_CST))
+            ava1_platform_sleep_ms(2);
+        __atomic_sub_fetch(&g_rb_held, 1, __ATOMIC_SEQ_CST);
+    }
+    /* The drive's copy goes wrong after the byte was received and made durable, before it is read back. */
+    if (at >= off && at < off + len && __atomic_load_n(&g_rbc_n, __ATOMIC_SEQ_CST) > 0) {
+        uint8_t b;
+        if (pread(fd, &b, 1, (off_t)at) == 1) {
+            b ^= 0x5a;
+            if (pwrite(fd, &b, 1, (off_t)at) == 1) __atomic_sub_fetch(&g_rbc_n, 1, __ATOMIC_SEQ_CST);
+        }
+    }
+}
+/* The next `n` read-backs of the byte at `at` find it changed on the drive (it is flipped right before
+ * the read, live or at the commit, whichever reads it). */
+void ava1_test_rb_corrupt(int n, uint64_t at) {
+    __atomic_store_n(&g_rbc_at, at, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rbc_n, n, __ATOMIC_SEQ_CST);
+}
+int ava1_test_rb_corrupt_left(void) { return __atomic_load_n(&g_rbc_n, __ATOMIC_SEQ_CST); }
+void ava1_test_rb_hold(int on) { __atomic_store_n(&g_rb_hold, on, __ATOMIC_SEQ_CST); }
+/* out: [0] bytes read back live, [1] after the last byte (the commits'), [2] files read back, [3] mismatches,
+ * [4] live reads seen, [5] commit reads seen, [6] live reads held now, [7] live reads done, [8] of those while
+ * chunks waited for a worker, [9] ranges batches handed to the live read-back, [10] its threads, [11] reads
+ * that first asked the OS to drop their pages from the cache, [12] of those it did, [13] reads with O_DIRECT. */
+void ava1_test_rb_stats(uint64_t out[14]) {
+    memset(out, 0, 14 * sizeof out[0]);
+    out[4] = __atomic_load_n(&g_rb_reads[1], __ATOMIC_SEQ_CST);
+    out[5] = __atomic_load_n(&g_rb_reads[0], __ATOMIC_SEQ_CST);
+    out[6] = __atomic_load_n(&g_rb_held, __ATOMIC_SEQ_CST);
+    if (!g_job) return;
+    out[0] = __atomic_load_n(&g_job->rb_live_bytes, __ATOMIC_SEQ_CST);
+    out[1] = __atomic_load_n(&g_job->rb_after_bytes, __ATOMIC_SEQ_CST);
+    out[2] = __atomic_load_n(&g_job->rb_files, __ATOMIC_SEQ_CST);
+    out[3] = __atomic_load_n(&g_job->rb_mismatches, __ATOMIC_SEQ_CST);
+    out[7] = __atomic_load_n(&g_job->rb_live_reads, __ATOMIC_SEQ_CST);
+    out[8] = __atomic_load_n(&g_job->rb_live_crowded, __ATOMIC_SEQ_CST);
+    out[9] = __atomic_load_n(&g_job->rb_todo_ranges, __ATOMIC_SEQ_CST);
+    out[11] = __atomic_load_n(&g_job->rb_drops, __ATOMIC_SEQ_CST);
+    out[12] = __atomic_load_n(&g_job->rb_drops_ok, __ATOMIC_SEQ_CST);
+    out[13] = __atomic_load_n(&g_job->rb_direct_reads, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&g_job->mu);
+    out[10] = g_job->rb_th_n;
+    pthread_mutex_unlock(&g_job->mu);
+}
+/* Every chunk's write first waits `ms` (0: none): the workers stay busy, chunks queue behind them. */
+void ava1_test_chunk_delay(uint32_t ms) { __atomic_store_n(&ava1_test_chunk_delay_ms, ms, __ATOMIC_SEQ_CST); }
+static void rb_knobs_reset(void) {
+    __atomic_store_n(&ava1_test_chunk_delay_ms, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rbc_n, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rb_hold, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rb_reads[0], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rb_reads[1], 0, __ATOMIC_SEQ_CST);
+}
 /* Every pwrite of file data writes at most `n` bytes (0: no cap): short writes, as a drive may return them. */
 void ava1_test_set_pwrite_max(size_t n) { __atomic_store_n(&ava1_test_pwrite_max, n, __ATOMIC_SEQ_CST); }
 void ava1_test_apply_fault_prealloc(uint32_t id) { __atomic_store_n(&g_prealloc_fault, id, __ATOMIC_SEQ_CST); }
@@ -1494,6 +1587,8 @@ int ava1_test_apply_begin(const char *jobs_dir, const char *root, uint32_t flags
     g_trace = 0;
     ava1_apply_hook = t_hook;
     ava1_apply_fault = t_fault;
+    ava1_apply_rb_hook = t_rb_hook;
+    rb_knobs_reset();
     pthread_mutex_lock(&g_ev_mu);
     g_ev_len = 0;
     g_ev_done = 0;
@@ -1663,6 +1758,8 @@ void ava1_test_apply_end(void) {
     ava1_data_stop();
     ava1_apply_hook = NULL;
     ava1_apply_fault = NULL;
+    ava1_apply_rb_hook = NULL;
+    rb_knobs_reset();
     ava1_test_apply_fail_dir_sync(UINT32_MAX - 1);
     ava1_test_apply_hold(0);
     __atomic_store_n(&ava1_fsync_test_fail_n, 0, __ATOMIC_SEQ_CST);
@@ -1719,6 +1816,7 @@ static int recv_start(int crash_at) {
     if (ava1_data_start(&g_cfg) != 0) return -100;
     ava1_apply_hook = t_hook;
     ava1_apply_fault = t_fault;
+    ava1_apply_rb_hook = t_rb_hook; /* its knobs stay across a restart: a test aims them at the next run */
     /* The start's recovery pass runs on the recovery thread, and a JobOpen for a job it is recovering is BUSY
      * (a sender retries). The tests that open right after a start mean "after recovery": wait for the pass, so
      * their outcome does not depend on how fast it runs (the order-dependent flake of log_small_fail). */

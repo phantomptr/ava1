@@ -73,6 +73,58 @@ fn c_range_sets_match_rust_at_the_boundaries() {
     }
 }
 
+/// Removal (the read-back's to-do and done sets lose what a late write covers): against a plain bitmap,
+/// with ranges that cut one pair in two, trim either end, swallow several pairs, or miss them all.
+#[test]
+fn c_range_set_removal_matches_a_bitmap() {
+    const N: u64 = 300;
+    let mut rng = SplitMix(14);
+    for _ in 0..500 {
+        let mut bits = [false; N as usize];
+        let ops: Vec<(bool, u64, u64)> = (0..rng.below(30) + 1)
+            .map(|_| {
+                let s = rng.below(N);
+                let e = (s + rng.below(40)).min(N);
+                (rng.below(3) != 0, s, e)
+            })
+            .collect();
+        for &(add, s, e) in &ops {
+            for b in &mut bits[s as usize..e as usize] {
+                *b = add;
+            }
+        }
+        let mut want = Vec::new();
+        let mut i = 0;
+        while i < N as usize {
+            if bits[i] {
+                let s = i;
+                while i < N as usize && bits[i] {
+                    i += 1;
+                }
+                want.push((s as u64, i as u64));
+            } else {
+                i += 1;
+            }
+        }
+        assert_eq!(c_rset_ops(&ops), Some(want), "{ops:?}");
+    }
+    // the edges of the offset space
+    let m = u64::MAX;
+    assert_eq!(
+        c_rset_ops(&[(true, 0, m), (false, 1, m - 1)]),
+        Some(vec![(0, 1), (m - 1, m)])
+    );
+    assert_eq!(c_rset_ops(&[(true, 5, 9), (false, 0, m)]), Some(vec![]));
+    assert_eq!(
+        c_rset_ops(&[(true, 5, 9), (false, 9, 12), (false, 3, 5)]),
+        Some(vec![(5, 9)])
+    );
+    assert_eq!(
+        c_rset_ops(&[(false, 3, 3), (true, 1, 4), (false, 2, 2)]),
+        Some(vec![(1, 4)])
+    );
+}
+
 #[test]
 fn c_file_runs_match_rust() {
     let mut rng = SplitMix(12);
