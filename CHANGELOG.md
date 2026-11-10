@@ -3,7 +3,9 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
-## Unreleased
+## 1.0.8
+
+Read-back verification. Nothing changes on the wire format: the receiver advertises a new capability bit, and a sender that sets the new job flag gets the check.
 
 C library:
 
@@ -12,6 +14,8 @@ C library:
   bytes on the drive differ is sent again; after 3 such tries the job ends with `ERR_VERIFY`. Every
   mismatch is logged to stderr and the event log, and the end-of-job line reports the files, bytes and
   time read back. Older receivers do not advertise the bit and never see the flag.
+- A large file is read back on up to 8 threads in 8 MiB reads, and the end-of-job line says how much of
+  that time went to reading and to hashing (on a PS5 the drive is the limit: 4 GiB in about 20 s).
 
 ## 1.0.7
 
