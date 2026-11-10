@@ -207,6 +207,7 @@ struct ava1_job {
      * its own flags. Totals for the end-of-job line (atomics): files, bytes, microseconds, mismatches. */
     int readback;
     uint64_t rb_files, rb_bytes, rb_us, rb_mismatches;
+    uint64_t rb_read_us, rb_hash_us; /* summed over read-back threads: where the time went */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */
