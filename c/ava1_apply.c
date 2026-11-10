@@ -3111,10 +3111,15 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
             tries = ++lf->rb_bad;
             pthread_mutex_unlock(&j->mu);
             __atomic_add_fetch(&j->rb_mismatches, 1, __ATOMIC_RELAXED);
-            snprintf(line, sizeof line,
-                     "readback-mismatch job=%02x%02x%02x%02x file=%u size=%llu group=%llu (bytes %llu..) try=%u of %u: %s",
-                     j->id[0], j->id[1], j->id[2], j->id[3], id, (unsigned long long)e->size, (unsigned long long)bad,
-                     (unsigned long long)(bad * AVA1_GROUP_LEN), tries, (unsigned)AVA1_READBACK_TRIES, fin);
+            /* The path is the line's last field and may be cut short: say how much room it has (GCC
+             * checks a bare %s against the buffer and rejects a possible truncation). */
+            int head = snprintf(line, sizeof line,
+                                "readback-mismatch job=%02x%02x%02x%02x file=%u size=%llu group=%llu (bytes %llu..) try=%u of %u: ",
+                                j->id[0], j->id[1], j->id[2], j->id[3], id, (unsigned long long)e->size,
+                                (unsigned long long)bad, (unsigned long long)(bad * AVA1_GROUP_LEN), tries,
+                                (unsigned)AVA1_READBACK_TRIES);
+            if (head > 0 && (size_t)head < sizeof line)
+                snprintf(line + head, sizeof line - (size_t)head, "%.*s", (int)(sizeof line - (size_t)head - 1), fin);
             fprintf(stderr, "[ava1] %s\n", line);
             ava1_log_event(line);
             if (tries >= AVA1_READBACK_TRIES) {
