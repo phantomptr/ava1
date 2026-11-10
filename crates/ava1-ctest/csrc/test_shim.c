@@ -1357,9 +1357,10 @@ void ava1_test_rb_corrupt(int n, uint64_t at) {
 int ava1_test_rb_corrupt_left(void) { return __atomic_load_n(&g_rbc_n, __ATOMIC_SEQ_CST); }
 void ava1_test_rb_hold(int on) { __atomic_store_n(&g_rb_hold, on, __ATOMIC_SEQ_CST); }
 /* out: [0] bytes read back live, [1] after the last byte (the commits'), [2] files read back, [3] mismatches,
- * [4] live reads seen, [5] commit reads seen, [6] live reads held now, [7] live items queued or running. */
-void ava1_test_rb_stats(uint64_t out[8]) {
-    memset(out, 0, 8 * sizeof out[0]);
+ * [4] live reads seen, [5] commit reads seen, [6] live reads held now, [7] live reads done, [8] of those while
+ * chunks waited for a worker, [9] ranges batches handed to the live read-back, [10] its threads. */
+void ava1_test_rb_stats(uint64_t out[11]) {
+    memset(out, 0, 11 * sizeof out[0]);
     out[4] = __atomic_load_n(&g_rb_reads[1], __ATOMIC_SEQ_CST);
     out[5] = __atomic_load_n(&g_rb_reads[0], __ATOMIC_SEQ_CST);
     out[6] = __atomic_load_n(&g_rb_held, __ATOMIC_SEQ_CST);
@@ -1368,11 +1369,17 @@ void ava1_test_rb_stats(uint64_t out[8]) {
     out[1] = __atomic_load_n(&g_job->rb_after_bytes, __ATOMIC_SEQ_CST);
     out[2] = __atomic_load_n(&g_job->rb_files, __ATOMIC_SEQ_CST);
     out[3] = __atomic_load_n(&g_job->rb_mismatches, __ATOMIC_SEQ_CST);
+    out[7] = __atomic_load_n(&g_job->rb_live_reads, __ATOMIC_SEQ_CST);
+    out[8] = __atomic_load_n(&g_job->rb_live_crowded, __ATOMIC_SEQ_CST);
+    out[9] = __atomic_load_n(&g_job->rb_todo_ranges, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&g_job->mu);
-    out[7] = g_job->rb_live_items;
+    out[10] = g_job->rb_th_n;
     pthread_mutex_unlock(&g_job->mu);
 }
+/* Every chunk's write first waits `ms` (0: none): the workers stay busy, chunks queue behind them. */
+void ava1_test_chunk_delay(uint32_t ms) { __atomic_store_n(&ava1_test_chunk_delay_ms, ms, __ATOMIC_SEQ_CST); }
 static void rb_knobs_reset(void) {
+    __atomic_store_n(&ava1_test_chunk_delay_ms, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_rbc_n, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_rb_hold, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_rb_reads[0], 0, __ATOMIC_SEQ_CST);

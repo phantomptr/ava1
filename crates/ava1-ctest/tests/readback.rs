@@ -24,15 +24,18 @@ extern "C" {
     fn ava1_test_rb_corrupt_left() -> i32;
     fn ava1_test_rb_hold(on: i32);
     fn ava1_test_rb_stats(out: *mut u64);
+    fn ava1_test_chunk_delay(ms: u32);
     fn ava1_test_apply_summary(out: *mut u8, cap: usize) -> usize;
 }
 
 const G: usize = GROUP as usize;
 
 /// [0] bytes read back while the file arrived, [1] after its last byte, [2] files read back,
-/// [3] mismatches, [4] live reads, [5] commit reads, [6] live reads held now, [7] live items in flight.
-fn rb_stats() -> [u64; 8] {
-    let mut o = [0u64; 8];
+/// [3] mismatches, [4] live reads seen by the hook, [5] commit reads seen, [6] live reads held now,
+/// [7] live reads done, [8] of those while chunks waited for a worker, [9] ranges batches handed to the
+/// live read-back, [10] its threads.
+fn rb_stats() -> [u64; 11] {
+    let mut o = [0u64; 11];
     unsafe { ava1_test_rb_stats(o.as_mut_ptr()) };
     o
 }
@@ -131,6 +134,7 @@ impl Drop for Knobs {
             ava1_test_corrupt_at_commit(0, 0);
             ava1_test_rb_corrupt(0, 0);
             ava1_test_rb_hold(0);
+            ava1_test_chunk_delay(0);
             ava1_test_set_pwrite_max(0);
         }
     }
@@ -342,6 +346,42 @@ fn groups_are_read_back_while_the_file_arrives_in_any_order() {
     assert_eq!((st[2], st[3]), (1, 0), "{st:?}");
     let line = summary();
     assert!(line.contains("while they arrived"), "{line}");
+}
+
+/// The receive workers never idle: every chunk's write takes 20 ms, and chunks keep queueing behind them
+/// for the whole transfer. The read-back has threads of its own, so it still reads most of the file while
+/// it arrives (all but what the last batches make durable), one read in flight while chunks wait.
+#[test]
+fn most_of_a_file_is_read_back_while_every_worker_is_busy_with_chunks() {
+    let _k = Knobs;
+    let t = tmp("busy");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(200 * G + 9, 16);
+    let m = Manifest {
+        entries: vec![file("big.bin", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, gen::JF_READBACK, &m, 0);
+    unsafe { ava1_test_chunk_delay(20) };
+    send_large_paced(&job, 0, &d); // offers each chunk as soon as there is credit for it
+    assert_eq!(job.wait(30_000), 0, "{}", job.events());
+    unsafe { ava1_test_chunk_delay(0) };
+    assert_eq!(std::fs::read(root.join("big.bin")).unwrap(), d);
+    let st = rb_stats();
+    let size = d.len() as u64;
+    assert_eq!(st[0] + st[1], size, "every byte once: {st:?}");
+    assert!(
+        st[8] > 0,
+        "no read while chunks waited: the workers were never all busy: {st:?}"
+    );
+    assert!(
+        st[0] * 2 >= size,
+        "only {} of {size} bytes read back live: {st:?}",
+        st[0]
+    );
+    assert!(st[9] > 0 && st[10] >= 1, "{st:?}");
+    let line = summary();
+    assert!(line.contains("with chunks waiting"), "{line}");
 }
 
 /// A byte that changes on the drive after its batch made it durable and before the live read-back reads

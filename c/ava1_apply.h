@@ -15,7 +15,6 @@
 #define AVA1_W_CALL 3
 #define AVA1_W_SWEEP 5  /* durable-by-log: make logged small files durable in place (SPEC.md §15.7) */
 #define AVA1_W_COMMIT 4 /* commit_large of one file, run by a worker */
-#define AVA1_W_VERIFY 6 /* JF_READBACK: read back one durable stretch of a large file while it still arrives */
 #define AVA1_PEND_MAX 512u          /* small-file fds held open until their batch */
 #define AVA1_CRASH_AFTER_SYNC 1     /* tests: die after fsync, before the journal */
 #define AVA1_CRASH_AFTER_JOURNAL 2  /* tests: die after the journal, before Durable */
@@ -109,6 +108,8 @@ void ava1_apply_finish_landed(ava1_job_t *j);
 #define AVA1_READBACK_TRIES 3u
 /* Tests: every pwrite of file data writes at most this many bytes (0, the default: no cap). */
 extern size_t ava1_test_pwrite_max;
+/* Tests: every chunk's write first waits this many ms (0, the default: none). */
+extern uint32_t ava1_test_chunk_delay_ms;
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.
  * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename. */

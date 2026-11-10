@@ -884,8 +884,9 @@ and sends `FileRetry{RETRY_VERIFY}`, so the sender sends the whole file again; t
 After 3 mismatches of one file in a job the job ends with `ERR_VERIFY` (journal kept). A `job.copy` has
 no sender to resend: there the first mismatch ends the copy with `ERR_VERIFY` ("a copied file did not
 verify", as any copy retry does) and a re-issued copy goes on from its journal. A read that fails ends the
-job with `ERR_IO`. The early reads run on the receiver's own workers, behind the data and never in its
-way (they give their turn up while chunks wait); the commit's run on its worker, before the rename, and a
+job with `ERR_IO`. The early reads run on a few threads of the receiver's own, apart from the ones that
+write the data, and read no more than the batches have made durable; while the data waits for a writer
+the C node keeps one early read in flight. The commit's reads run on its worker, before the rename, and a
 big remainder may be read in stripes on several threads. What the read-back proves is what the drive held
 once each group was durable: a byte that changes after its group was read back, while later groups still
 arrive, is not found (no more than one that changes after the commit). The read goes through the

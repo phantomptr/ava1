@@ -122,6 +122,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
     pthread_mutex_init(&j->jnl_mu, NULL);
     pthread_mutex_init(&j->pack_mu, NULL);
     pthread_cond_init(&j->cv, NULL);
+    pthread_cond_init(&j->rb_cv, NULL);
     pthread_mutex_init(&j->cmu, NULL);
     pthread_cond_init(&j->ccv, NULL);
     pthread_mutex_lock(&T.mu);
@@ -158,6 +159,7 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
         pthread_mutex_destroy(&j->jnl_mu);
         pthread_mutex_destroy(&j->pack_mu);
         pthread_cond_destroy(&j->cv);
+        pthread_cond_destroy(&j->rb_cv);
         pthread_mutex_destroy(&j->cmu);
         pthread_cond_destroy(&j->ccv);
         free(j);
@@ -237,6 +239,7 @@ static void job_destroy(ava1_job_t *j) {
     pthread_mutex_lock(&j->mu);
     j->stopping = 1;
     pthread_cond_broadcast(&j->cv);
+    pthread_cond_broadcast(&j->rb_cv);
     pthread_mutex_unlock(&j->mu);
     if (j->feeder_started) { /* first: it may be handing work to the threads below */
         pthread_mutex_lock(&j->cmu);
@@ -247,6 +250,7 @@ static void job_destroy(ava1_job_t *j) {
     }
     if (j->thread_started) pthread_join(j->thread, NULL);
     for (i = 0; i < j->nworkers; i++) pthread_join(j->workers[i], NULL);
+    for (i = 0; i < j->rb_th_n; i++) pthread_join(j->rb_th[i], NULL); /* the job thread started them: joined above */
     /* The role's reader is the only thread left that can enqueue work (a copy's reader
      * applies what it reads): join it before the queue below is drained, or an
      * enqueue concurrent with the drain would append to a freed item. */
@@ -314,6 +318,7 @@ static void job_destroy(ava1_job_t *j) {
     pthread_mutex_destroy(&j->jnl_mu);
     pthread_mutex_destroy(&j->pack_mu);
     pthread_cond_destroy(&j->cv);
+    pthread_cond_destroy(&j->rb_cv);
     pthread_mutex_destroy(&j->cmu);
     pthread_cond_destroy(&j->ccv);
     free(j);

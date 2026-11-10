@@ -17,6 +17,9 @@
 /* JnlOpen.staged: bit 0 = staged under <root>.ava-part; bit 1 = the receiver created the
  * empty <root> as its lock (SPEC.md §11.6), so an empty <root> on resume is its own. */
 #define AVA1_STAGED_HELD 2
+/* JF_READBACK: threads per job that read large files back while they arrive (SPEC.md §13.5). An 8 MiB
+ * read from a console's drive runs at ~30 MiB/s per thread: four keep up with a gigabit network. */
+#define AVA1_READBACK_THREADS 4
 
 typedef struct ava1_job ava1_job_t;
 /* Where a job's outgoing messages go: a session (network jobs) or a recorder (local, tests).
@@ -219,8 +222,14 @@ struct ava1_job {
     uint64_t rb_files, rb_bytes, rb_us, rb_mismatches;
     uint64_t rb_read_us, rb_hash_us; /* summed over read-back threads: where the time went */
     uint64_t rb_live_bytes, rb_after_bytes; /* read back while files arrived / after their last byte (rb_us is the latter's wall time) */
-    uint32_t rb_live_items;          /* live read-back work items queued or running (under mu) */
-    uint32_t rb_live_run;            /* ... of those, running */
+    /* The live read-back's own threads (ava1_apply.c, "read-back"): started by the job thread at the first
+     * durable range of a large file, joined by job_destroy. They wait on rb_cv, which each batch signals. */
+    pthread_t rb_th[AVA1_READBACK_THREADS];
+    uint32_t rb_th_n;
+    pthread_cond_t rb_cv;
+    uint32_t rb_live_run;            /* live reads in flight (under mu): ava1_apply_quiesce waits for none */
+    uint64_t rb_todo_ranges, rb_live_reads, rb_live_crowded; /* atomics, for the end-of-job line: ranges batches handed
+                                                              * over, live reads done, of those with chunks waiting */
     uint32_t rb_bufs;                /* read-back buffers in use, live and at commit (under mu; at most READBACK_STRIPES) */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
