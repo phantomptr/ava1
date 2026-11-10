@@ -3,7 +3,9 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
-## Unreleased
+## 1.0.9
+
+Read-back while the file arrives. Nothing changes on the wire format.
 
 C library:
 
@@ -17,10 +19,12 @@ C library:
   part is now dropped from the cache before it is read, and read with direct I/O where the system
   allows. The log says once per job which method is in use, or that the read may come from the cache
   (macOS has no way to drop it).
-  A mismatch is still handled when the file is finished, as before. The read after the last byte uses
+- A mismatch is still handled when the file is finished, as before. The read after the last byte uses
   8 threads of 8 MiB reads. The end-of-job line says how much was read back while files arrived (with
   how many ranges and reads that took), how much after, and how long the threads spent reading and
   hashing.
+- Measured on a PS5 Pro, 4 GiB to the internal drive: 60.4 s with the check, against 83.5 s for the
+  1.0.8 check and about 62 s with no check at all.
 
 ## 1.0.8
 
