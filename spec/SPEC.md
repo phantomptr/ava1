@@ -889,9 +889,13 @@ write the data, and read no more than the batches have made durable; while the d
 the C node keeps one early read in flight. The commit's reads run on its worker, before the rename, and a
 big remainder may be read in stripes on several threads. What the read-back proves is what the drive held
 once each group was durable: a byte that changes after its group was read back, while later groups still
-arrive, is not found (no more than one that changes after the commit). The read goes through the
-receiver's filesystem, so a page cache may answer for bytes still held in memory; what it proves is what
-any later reader of the file will get. Small files are out of its scope (their roots are checked from the
+arrive, is not found (no more than one that changes after the commit). Read right after its batch, a
+group is still in the page cache, and a read answered from memory proves nothing about the drive: a
+receiver should read past the cache. The C node drops each range's cached pages first (they are clean:
+`posix_fadvise(POSIX_FADV_DONTNEED)`, and on FreeBSD, where that only deactivates the pages, also
+`msync(MS_INVALIDATE)` over a mapping of the range) and reads through an `O_DIRECT` descriptor where the
+filesystem allows one; it logs which, once per job. Where neither is possible the read goes through the
+cache, and what it proves is what any later reader of the file will get. Small files are out of its scope (their roots are checked from the
 log record or the file when they are recovered, §15.7).
 
 ## 14. Journal and resume

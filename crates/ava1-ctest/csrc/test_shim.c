@@ -1358,9 +1358,10 @@ int ava1_test_rb_corrupt_left(void) { return __atomic_load_n(&g_rbc_n, __ATOMIC_
 void ava1_test_rb_hold(int on) { __atomic_store_n(&g_rb_hold, on, __ATOMIC_SEQ_CST); }
 /* out: [0] bytes read back live, [1] after the last byte (the commits'), [2] files read back, [3] mismatches,
  * [4] live reads seen, [5] commit reads seen, [6] live reads held now, [7] live reads done, [8] of those while
- * chunks waited for a worker, [9] ranges batches handed to the live read-back, [10] its threads. */
-void ava1_test_rb_stats(uint64_t out[11]) {
-    memset(out, 0, 11 * sizeof out[0]);
+ * chunks waited for a worker, [9] ranges batches handed to the live read-back, [10] its threads, [11] reads
+ * that first asked the OS to drop their pages from the cache, [12] of those it did, [13] reads with O_DIRECT. */
+void ava1_test_rb_stats(uint64_t out[14]) {
+    memset(out, 0, 14 * sizeof out[0]);
     out[4] = __atomic_load_n(&g_rb_reads[1], __ATOMIC_SEQ_CST);
     out[5] = __atomic_load_n(&g_rb_reads[0], __ATOMIC_SEQ_CST);
     out[6] = __atomic_load_n(&g_rb_held, __ATOMIC_SEQ_CST);
@@ -1372,6 +1373,9 @@ void ava1_test_rb_stats(uint64_t out[11]) {
     out[7] = __atomic_load_n(&g_job->rb_live_reads, __ATOMIC_SEQ_CST);
     out[8] = __atomic_load_n(&g_job->rb_live_crowded, __ATOMIC_SEQ_CST);
     out[9] = __atomic_load_n(&g_job->rb_todo_ranges, __ATOMIC_SEQ_CST);
+    out[11] = __atomic_load_n(&g_job->rb_drops, __ATOMIC_SEQ_CST);
+    out[12] = __atomic_load_n(&g_job->rb_drops_ok, __ATOMIC_SEQ_CST);
+    out[13] = __atomic_load_n(&g_job->rb_direct_reads, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&g_job->mu);
     out[10] = g_job->rb_th_n;
     pthread_mutex_unlock(&g_job->mu);

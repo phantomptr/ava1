@@ -33,9 +33,10 @@ const G: usize = GROUP as usize;
 /// [0] bytes read back while the file arrived, [1] after its last byte, [2] files read back,
 /// [3] mismatches, [4] live reads seen by the hook, [5] commit reads seen, [6] live reads held now,
 /// [7] live reads done, [8] of those while chunks waited for a worker, [9] ranges batches handed to the
-/// live read-back, [10] its threads.
-fn rb_stats() -> [u64; 11] {
-    let mut o = [0u64; 11];
+/// live read-back, [10] its threads, [11] reads that first asked the OS to drop their pages from the
+/// cache, [12] of those it did, [13] reads with O_DIRECT.
+fn rb_stats() -> [u64; 14] {
+    let mut o = [0u64; 14];
     unsafe { ava1_test_rb_stats(o.as_mut_ptr()) };
     o
 }
@@ -382,6 +383,45 @@ fn most_of_a_file_is_read_back_while_every_worker_is_busy_with_chunks() {
     assert!(st[9] > 0 && st[10] >= 1, "{st:?}");
     let line = summary();
     assert!(line.contains("with chunks waiting"), "{line}");
+}
+
+/// Every read-back read, live or at the commit, first asks the OS to drop its range from the page cache
+/// (a read answered from memory proves nothing about the drive). That the next read then misses the cache
+/// cannot be checked portably; that the call is made for every read can. Linux has the call and must
+/// answer it; macOS has none (the job's "read-back may read cached pages" line says so).
+#[test]
+fn every_read_back_read_first_drops_its_range_from_the_cache() {
+    let _k = Knobs;
+    let t = tmp("evict");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(20 * G + 333, 17);
+    let m = Manifest {
+        entries: vec![file("big.bin", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, gen::JF_READBACK, &m, 0);
+    send_groups(&job, 0, &d, &(0..12).collect::<Vec<_>>());
+    wait_until("the live read-back", 10_000, || rb_stats()[0] == 12 * GROUP);
+    send_groups(&job, 0, &d, &(12..21).collect::<Vec<_>>());
+    job.root(0, *blake3::hash(&d).as_bytes());
+    assert_eq!(job.wait(10_000), 0, "{}", job.events());
+    let st = rb_stats();
+    let reads = st[4] + st[5];
+    assert!(st[4] >= 2 && reads >= 3, "{st:?}");
+    assert_eq!(st[11], reads, "one drop per read: {st:?}");
+    if cfg!(target_os = "linux") {
+        assert_eq!(st[12], st[11], "posix_fadvise answered every drop: {st:?}");
+    }
+    if cfg!(target_os = "macos") {
+        assert_eq!((st[12], st[13]), (0, 0), "{st:?}");
+    }
+    assert!(st[13] <= reads, "{st:?}");
+    let line = summary();
+    assert!(
+        line.contains("reads with the cache dropped first"),
+        "{line}"
+    );
+    assert_eq!(std::fs::read(root.join("big.bin")).unwrap(), d);
 }
 
 /// A byte that changes on the drive after its batch made it durable and before the live read-back reads
