@@ -476,10 +476,12 @@ size_t ava1_apply_summary(const ava1_job_t *j, char *out, size_t cap) {
     if (n < 0) return 0;
     if ((size_t)n < cap && __atomic_load_n(&j->rb_files, __ATOMIC_RELAXED)) {
         uint64_t us = __atomic_load_n(&j->rb_us, __ATOMIC_RELAXED), by = __atomic_load_n(&j->rb_bytes, __ATOMIC_RELAXED);
-        int m = snprintf(out + n, cap - (size_t)n, "; read back %llu files, %llu MiB in %llu ms (%.0f MiB/s), %llu mismatches",
+        int m = snprintf(out + n, cap - (size_t)n, "; read back %llu files, %llu MiB in %llu ms (%.0f MiB/s; threads spent %llu ms reading, %llu ms hashing), %llu mismatches",
                          (unsigned long long)__atomic_load_n(&j->rb_files, __ATOMIC_RELAXED),
                          (unsigned long long)(by >> 20), (unsigned long long)(us / 1000u),
                          us ? (double)by / 1048576.0 / ((double)us / 1e6) : 0.0,
+                         (unsigned long long)(__atomic_load_n(&j->rb_read_us, __ATOMIC_RELAXED) / 1000u),
+                         (unsigned long long)(__atomic_load_n(&j->rb_hash_us, __ATOMIC_RELAXED) / 1000u),
                          (unsigned long long)__atomic_load_n(&j->rb_mismatches, __ATOMIC_RELAXED));
         if (m > 0) n += m;
     }
@@ -2908,8 +2910,8 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
  * another process writing the file) is found before the file counts as done. A big file is read in
  * stripes on a few threads of its own: the last file of a job is read back after its last byte, with
  * nothing else to overlap, so its read-back is the whole of what the check adds to the job. */
-#define READBACK_GROUPS 4u                 /* groups per read */
-#define READBACK_STRIPES 4u                /* threads for one big file, the worker included */
+#define READBACK_GROUPS 8u                 /* groups per read (8 MiB; 8 threads: 64 MiB in all) */
+#define READBACK_STRIPES 8u                /* threads for one big file, the worker included */
 #define READBACK_STRIPE_MIN (256ull << 20) /* a file below two of these is read by the worker alone */
 static int pread_full(int fd, uint8_t *p, size_t len, uint64_t off, size_t *have) {
     *have = 0;
@@ -2955,7 +2957,10 @@ static int readback_stripe(rb_stripe_t *s) {
             rc = -EIO; /* the outboard was whole a moment ago (read_root) */
             break;
         }
+        uint64_t t_read = mono_us();
         if ((rc = pread_full(s->fd, buf, len, off, &have)) != 0) break;
+        uint64_t t_hash = mono_us();
+        __atomic_add_fetch(&s->j->rb_read_us, t_hash - t_read, __ATOMIC_RELAXED);
         for (at = 0; at < len; at += AVA1_GROUP_LEN) {
             size_t glen = len - at < AVA1_GROUP_LEN ? len - at : (size_t)AVA1_GROUP_LEN;
             uint64_t g = g0 + at / AVA1_GROUP_LEN;
@@ -2972,6 +2977,7 @@ static int readback_stripe(rb_stripe_t *s) {
                 break;
             }
         }
+        __atomic_add_fetch(&s->j->rb_hash_us, mono_us() - t_hash, __ATOMIC_RELAXED);
         off += len;
     }
     free(buf);
