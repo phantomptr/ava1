@@ -2652,6 +2652,14 @@ static void sync_batch(ava1_job_t *j) {
     for (i = 0; i < ng; i++) {
         ava1_lfile_t *lf = j->lf[rg[i].file_id];
         if (!lf) continue;
+        /* Durable before and written again: a duplicate whose write was recorded while the batch that first
+         * made these bytes durable was still running (write_chunk saw nothing durable there yet, so it voided
+         * nothing). What was read back of them since read the duplicate's bytes before this batch synced
+         * them: it counts for nothing, nor does a read-back of the file in flight (see "read-back"). */
+        if (ava1_rset_overlaps(&lf->durable, rg[i].offset, rg[i].offset + rg[i].len)) {
+            if (ava1_rset_remove(&lf->rb_done, rg[i].offset, rg[i].offset + rg[i].len) < 0) ava1_rset_clear(&lf->rb_done);
+            lf->rb_gen++;
+        }
         (void)ava1_rset_add(&lf->durable, rg[i].offset, rg[i].offset + rg[i].len);
         /* JF_READBACK: durable now, so the live read-back may take them (out of memory: the commit does). */
         if (j->readback && groups_of(j->m.e[rg[i].file_id].size) >= 2 && !lf->committed && !lf->committing &&
@@ -2960,7 +2968,9 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
  *   reads faster than the network delivers they keep up with the write front. Lanes write out of order:
  *   rb_todo is a range set, so any order is fine. A write over durable bytes (a late duplicate) takes its
  *   range out of rb_todo and rb_done and bumps lf->rb_gen, which voids any read-back of the file in flight:
- *   those bytes are read again once their own batch has made them durable. A reset does the same. A
+ *   those bytes are read again once their own batch has made them durable (a batch that makes bytes
+ *   durable a second time voids the same, for the duplicate recorded while their first batch ran). A
+ *   reset does the same. A
  *   mismatch is not acted on there (an old sender does not expect a FileRetry for a file it is still
  *   sending): it is recorded (rb_found) and the commit acts on it as on its own.
  *

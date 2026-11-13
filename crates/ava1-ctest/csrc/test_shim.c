@@ -1158,6 +1158,8 @@ static int g_hold_commit;                           /* commits wait at COMMIT_VE
 static int g_corrupt_n;                             /* commits that find one byte of their part file flipped */
 static uint64_t g_corrupt_at;                       /* ... at this offset */
 static uint32_t g_prealloc_fault = UINT32_MAX - 1;  /* a file whose preallocation answers ENOSPC */
+static int g_hold_synced;                           /* batches wait at BATCH_SYNCED (data fsynced, nothing recorded yet) while set */
+static uint32_t g_synced_held;                      /* batches waiting there now */
 static void t_hook(ava1_job_t *j, int point, uint32_t id) {
     if (point == __atomic_load_n(&g_arm_point, __ATOMIC_SEQ_CST)) { /* fsync fault, armed for this point */
         ava1_fsync_test_errno = g_arm_errno;
@@ -1184,6 +1186,12 @@ static void t_hook(ava1_job_t *j, int point, uint32_t id) {
                 free(w);
             }
         }
+    }
+    if (point == AVA1_HOOK_BATCH_SYNCED && __atomic_load_n(&g_hold_synced, __ATOMIC_SEQ_CST)) {
+        __atomic_add_fetch(&g_synced_held, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&g_hold_synced, __ATOMIC_SEQ_CST) && !__atomic_load_n(&j->stopping, __ATOMIC_SEQ_CST))
+            ava1_platform_sleep_ms(2);
+        __atomic_sub_fetch(&g_synced_held, 1, __ATOMIC_SEQ_CST);
     }
     if (point == AVA1_HOOK_BATCH_DIR_SYNCED) dir_hook_note(j, 0);
     if (point == AVA1_HOOK_PREP_DIR_SYNCED) dir_hook_note(j, 1);
@@ -1311,6 +1319,17 @@ uint32_t ava1_test_apply_segments(void) {
     while ((de = readdir(dp)) != NULL)
         if (strncmp(de->d_name, "pack.", 5) == 0) n++;
     closedir(dp);
+    return n;
+}
+void ava1_test_hold_batch_synced(int on) { __atomic_store_n(&g_hold_synced, on, __ATOMIC_SEQ_CST); }
+uint32_t ava1_test_batch_synced_held(void) { return __atomic_load_n(&g_synced_held, __ATOMIC_SEQ_CST); }
+/* File data the job has written so far (duplicates included). */
+uint64_t ava1_test_apply_bytes_received(void) {
+    uint64_t n;
+    if (!g_job) return 0;
+    pthread_mutex_lock(&g_job->mu);
+    n = g_job->bytes_received;
+    pthread_mutex_unlock(&g_job->mu);
     return n;
 }
 void ava1_test_apply_hold_commit(int on) { __atomic_store_n(&g_hold_commit, on, __ATOMIC_SEQ_CST); }

@@ -26,6 +26,10 @@ extern "C" {
     fn ava1_test_rb_stats(out: *mut u64);
     fn ava1_test_chunk_delay(ms: u32);
     fn ava1_test_apply_summary(out: *mut u8, cap: usize) -> usize;
+    fn ava1_test_hold_batch_synced(on: i32);
+    fn ava1_test_batch_synced_held() -> u32;
+    fn ava1_test_apply_bytes_received() -> u64;
+    fn ava1_test_apply_hold(on: i32);
 }
 
 const G: usize = GROUP as usize;
@@ -137,6 +141,8 @@ impl Drop for Knobs {
             ava1_test_rb_hold(0);
             ava1_test_chunk_delay(0);
             ava1_test_set_pwrite_max(0);
+            ava1_test_hold_batch_synced(0);
+            ava1_test_apply_hold(0);
         }
     }
 }
@@ -509,6 +515,47 @@ fn a_group_written_again_is_read_back_again() {
     assert_eq!(std::fs::read(root.join("big.bin")).unwrap(), d);
     let st = rb_stats();
     assert_eq!(st[0] + st[1], d.len() as u64 + GROUP, "{st:?}");
+}
+
+/// A duplicate written while the batch that first makes its group durable is still running: the batch
+/// ends, the group is read back (the duplicate's bytes, not yet synced), and only the next batch makes
+/// the duplicate durable. The group is read back again after that batch, here by the commit, which
+/// finds the byte that changed on the drive in between.
+#[test]
+fn a_group_written_again_during_its_first_batch_is_read_back_again() {
+    let _k = Knobs;
+    let t = tmp("live-dup-batch");
+    let root = t.join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = data(8 * G + 5, 21);
+    let m = Manifest {
+        entries: vec![file("big.bin", d.len() as u64)],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, gen::JF_READBACK, &m, 0);
+    unsafe { ava1_test_hold_batch_synced(1) };
+    send_groups(&job, 0, &d, &(0..4).collect::<Vec<_>>());
+    wait_until("the first batch synced", 10_000, || unsafe {
+        ava1_test_batch_synced_held() == 1 && ava1_test_apply_bytes_received() == 4 * GROUP
+    });
+    send_groups(&job, 0, &d, &[1]); // the duplicate: written and recorded while that batch waits
+    wait_until("the duplicate written", 10_000, || unsafe {
+        ava1_test_apply_bytes_received() == 5 * GROUP
+    });
+    unsafe {
+        ava1_test_apply_hold(1); // no second batch yet
+        ava1_test_hold_batch_synced(0);
+    }
+    wait_until("the live read-back", 10_000, || rb_stats()[0] == 4 * GROUP);
+    unsafe { ava1_test_corrupt_at_commit(1, GROUP + 7) }; // flipped as the commit's read-back begins
+    send_groups(&job, 0, &d, &(4..9).collect::<Vec<_>>());
+    job.root(0, *blake3::hash(&d).as_bytes());
+    unsafe { ava1_test_apply_hold(0) };
+    job.wait_event("retry 0 1", 10_000);
+    assert_eq!(rb_stats()[3], 1);
+    assert!(!root.join("big.bin").exists(), "nothing was committed");
+    send_large(&job, 0, &d);
+    assert_eq!(job.wait(10_000), 0, "{}", job.events());
+    assert_eq!(std::fs::read(root.join("big.bin")).unwrap(), d);
 }
 
 /// A group found wrong while the file arrives and then written again (a duplicate the sender had in

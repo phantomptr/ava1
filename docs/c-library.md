@@ -51,7 +51,9 @@ these.
 4. **The data plane.** Fill an `ava1_data_cfg_t`: the jobs folder (journals live there), and
    `may_write` / `may_read` / `same_device` callbacks that decide which absolute paths clients may
    touch. `ava1_data_start(&dc)`, then `cfg.data = ava1_data_hooks()` and add
-   `AVA1_CAP_DATA_PLANE` to `cfg.caps`.
+   `AVA1_CAP_DATA_PLANE` to `cfg.caps`. Add `AVA1_CAP_READBACK` too to let clients ask for
+   read-back verification (`JF_READBACK`, SPEC.md §13.5): the node then reads each large file back
+   from its drive before it commits it.
 5. **RPC.** `cfg.rpc` runs on a worker thread for every request. Call `ava1_data_rpc` first (it
    answers the protocol's own methods and returns -1 for anything else), then answer `node.info`
    and your application's methods, or return `AVA1_ERR_UNKNOWN_METHOD`.

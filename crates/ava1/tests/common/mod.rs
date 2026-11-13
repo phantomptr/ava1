@@ -191,7 +191,36 @@ pub fn temp_dir(tag: &str) -> std::path::PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
+    sweep::add(&d);
     d
+}
+
+/// The folders `temp_dir` made are removed when the test binary exits (a full run used to
+/// leave about 1 GB of them in the system's temp folder).
+mod sweep {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub fn add(d: &Path) {
+        let mut dirs = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(unix)]
+        if dirs.is_empty() {
+            // SAFETY: `at_exit` is an `extern "C"` function that does not unwind.
+            unsafe { libc::atexit(at_exit) };
+        }
+        dirs.push(d.to_path_buf());
+    }
+
+    #[cfg(unix)]
+    extern "C" fn at_exit() {
+        if let Ok(dirs) = DIRS.try_lock() {
+            for d in dirs.iter() {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
 }
 
 /// The code the console shows for the session of `key` (its screen: the one place the code

@@ -3,6 +3,30 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.10
+
+Fixes from a review of the read-back added in 1.0.8 and 1.0.9. Nothing changes on the wire format, on
+disk or in the public API.
+
+C library:
+
+- Read-back: a block of a large file that was sent twice (a duplicate chunk),
+  with the second copy written while the first was still being made durable, was read back before
+  the second copy was on the drive and not again. It is now read back again once the second copy is
+  durable, as §13.5 says, so a fault in that second write is found.
+
+Rust receiver:
+
+- A `JobOpen` with a flag the receiver does not know is refused with `ERR_PROTOCOL`, as §11.8 says
+  and the C node does. It used to be accepted and the flag ignored, so a client that asked a Rust
+  node for read-back (`JF_READBACK`) was not told it would not get it.
+
+Other:
+
+- `docs/c-library.md` says how a node offers read-back (`AVA1_CAP_READBACK`).
+- The Rust tests remove their temp folders when they finish (a full run left about 1 GB behind).
+- `toml` 1.2.1 and `cc` 1.11.1 (build and code-generation dependencies).
+
 ## 1.0.9
 
 Read-back while the file arrives. Nothing changes on the wire format.
