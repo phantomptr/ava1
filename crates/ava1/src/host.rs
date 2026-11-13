@@ -70,6 +70,9 @@ impl JobHost for FolderHost {
                     .await;
                 return;
             };
+            if crate::recv::refuse_unknown_flags(&mut link, &open).await {
+                return;
+            }
             match open.kind {
                 gen::JOB_UPLOAD => {
                     let single = open.flags & gen::JF_SINGLE_FILE != 0;

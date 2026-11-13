@@ -55,7 +55,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "ava1"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "ava1-chaos",
  "blake2 0.11.0",
@@ -74,14 +74,14 @@ dependencies = [
 
 [[package]]
 name = "ava1-chaos"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "ava1-ctest"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "ava1",
  "ava1-chaos",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "ava1-gen"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "serde",
  "toml",

@@ -1151,15 +1151,47 @@ pub async fn download_job(
     download_run(link, m, None, sink, o).await
 }
 
+/// The `JobOpen` flags this implementation knows (SPEC.md §11.8). `JF_OVERWRITE` is a `job.copy`
+/// flag and `JF_READBACK` needs `CAP_READBACK`, which this receiver does not advertise.
+pub(crate) const KNOWN_OPEN_FLAGS: u32 =
+    gen::JF_SINGLE_FILE | gen::JF_ORDERED | gen::JF_UNSAFE_READ | gen::JF_MOVE;
+
+/// Answers a `JobOpen` that carries a flag this receiver does not know with
+/// `JobOpenAck{ERR_PROTOCOL}` (SPEC.md §11.8). `true` when it refused.
+pub(crate) async fn refuse_unknown_flags(link: &mut JobLink, open: &JobOpen) -> bool {
+    if open.flags & !KNOWN_OPEN_FLAGS == 0 {
+        return false;
+    }
+    let _ = link
+        .control
+        .send(&JobOpenAck {
+            job_id: open.job_id,
+            status: gen::ERR_PROTOCOL,
+            credit: 0,
+            staged: 0,
+            workers: 0,
+            message: Some("unknown job flags".into()),
+        })
+        .await;
+    true
+}
+
 /// The responder side of an upload (a host for uploads): the JobOpen already arrived.
 /// The ack carries the job's absolute grant (the extra credit note: `Credit` frames are
 /// incremental; only the ack sets the sender's window).
+/// A `JobOpen` with a flag this receiver does not know is refused with `ERR_PROTOCOL` (§11.8).
 pub async fn receive_job(
     link: &mut JobLink,
     open: JobOpen,
     sink: Arc<dyn Sink>,
     mut o: RecvOptions,
 ) -> Result<RecvReport, SendError> {
+    if refuse_unknown_flags(link, &open).await {
+        return Err(SendError::Refused {
+            status: gen::ERR_PROTOCOL,
+            message: "unknown job flags".into(),
+        });
+    }
     o.flags = open.flags; // The journal's Open records the job's flags
     link.control
         .send(&JobOpenAck {

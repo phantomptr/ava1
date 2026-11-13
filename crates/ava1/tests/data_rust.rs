@@ -364,6 +364,49 @@ async fn a_download_of_a_path_outside_the_share_is_refused_too() {
     );
 }
 
+/// SPEC.md §11.8: a receiver answers `ERR_PROTOCOL` to a job flag it does not know, upload or
+/// download. `JF_READBACK` is one here: this receiver does not advertise `CAP_READBACK`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_refuses_job_flags_it_does_not_know() {
+    let d = common::temp_dir("rr-flags");
+    std::fs::create_dir_all(d.join("share")).unwrap();
+    let host = Arc::new(FolderHost {
+        root: d.join("share"),
+        jobs_dir: d.join("hjobs"),
+    });
+    let (addr, _ctx, id, peers) =
+        common::paired_ctx(|c| c.with_jobs(host).with_timing(common::transfer())).await;
+    let s = connect(&addr.to_string(), id, peers, "client", common::transfer())
+        .await
+        .unwrap();
+    for (n, (kind, flags)) in [
+        (gen::JOB_UPLOAD, gen::JF_READBACK),
+        (gen::JOB_UPLOAD, 1 << 20),
+        (gen::JOB_DOWNLOAD, gen::JF_READBACK),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let job = [0x50 + n as u8; 16];
+        let mut link = s.job(job);
+        link.control
+            .send(&JobOpen {
+                job_id: job,
+                kind,
+                policy: 0,
+                flags,
+                root: "x".into(),
+                src: None,
+                credit: Some(1 << 20),
+            })
+            .await
+            .unwrap();
+        let ack: JobOpenAck = next_control(&mut link).await.decode().unwrap();
+        assert_eq!(ack.status, gen::ERR_PROTOCOL, "kind {kind} flags {flags}");
+    }
+    assert!(!d.join("share/x").exists());
+}
+
 /// SPEC.md §12.4: a frame larger than the credit still outstanding is refused with the
 /// sealed Error(ERR_CREDIT) on the offending lane, and only that lane ends: the session and
 /// the job stay, and a second lane still delivers (Received). Nothing of the refused frame
