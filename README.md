@@ -12,7 +12,7 @@
   <a href="https://crates.io/crates/ava1"><img alt="crates.io" src="https://img.shields.io/crates/v/ava1" /></a>
   <a href="https://docs.rs/ava1"><img alt="docs.rs" src="https://img.shields.io/docsrs/ava1" /></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" /></a>
-  <a href="https://discord.gg/fzK3xddtrM"><img alt="discord" src="https://img.shields.io/badge/discord-join-5865F2" /></a>
+  <a href="https://discord.gg/fzK3xddtrM"><img alt="discord" src="https://img.shields.io/badge/discord-UndefinedLab-5865F2" /></a>
 </p>
 
 **AVA1 (Adaptive Verified Assembly, version 1)** is a protocol for moving large files and folders
@@ -147,7 +147,7 @@ Created and maintained by **PhantomPtr**.
 
 If you find AVA1 useful, consider buying me a coffee!
 
-* Discord server: [https://discord.gg/fzK3xddtrM](https://discord.gg/fzK3xddtrM)
+* Discord server: [UndefinedLab](https://discord.gg/fzK3xddtrM)
 * Support me on Ko-fi: [https://ko-fi.com/B0B81S0WUA](https://ko-fi.com/B0B81S0WUA)
 
 [![Support me on Ko-fi](https://storage.ko-fi.com/cdn/kofi3.png?v=3)](https://ko-fi.com/B0B81S0WUA)

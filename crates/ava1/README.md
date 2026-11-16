@@ -61,7 +61,7 @@ See the [API documentation](https://docs.rs/ava1), the
 ## Support
 
 AVA1 is made by [PhantomPtr](https://x.com/phantomptr). Questions are welcome on
-[Discord](https://discord.gg/fzK3xddtrM), and if AVA1 is useful to you, you can
+the [UndefinedLab Discord](https://discord.gg/fzK3xddtrM), and if AVA1 is useful to you, you can
 [buy me a coffee on Ko-fi](https://ko-fi.com/B0B81S0WUA).
 
 ## License
