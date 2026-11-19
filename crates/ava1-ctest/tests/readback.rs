@@ -667,6 +667,93 @@ fn a_stop_during_a_live_read_back_is_prompt_and_the_resume_reads_back_the_rest()
     assert_eq!(st[3], 0);
 }
 
+/// Writes groups `0..half` of `d` with the read-back on, waits until they are durable (read back live),
+/// and restarts the payload: the resumed job holds them durable from its journal, read back by nobody
+/// in this process.
+fn interrupted_half_way(t: &TempDir, d: &[u8], m: &Manifest, half: usize) -> CRecv {
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &t.join("dest"),
+        gen::JF_READBACK,
+        gen::POLICY_REPLACE,
+        0,
+    );
+    r.manifest(m);
+    r.wait_event("map status=0", 5000);
+    send_groups(&r, 0, d, &(0..half).collect::<Vec<_>>());
+    wait_until("the first half read back", 10_000, || {
+        rb_stats()[0] == (half * G) as u64
+    });
+    let r = r.restart(0);
+    assert_eq!(unsafe { ava1_test_job_readback() }, 1);
+    r.manifest(m);
+    let ev = r.wait_event("map status=0", 5000);
+    assert!(ev.contains("partial=1"), "the durable half was kept: {ev}");
+    r
+}
+
+/// A file interrupted half way and resumed: what it held durable before is read back while the rest
+/// arrives, not after its last byte. Before 1.0.11 the commit read all of it once the last byte was in
+/// (on a console, minutes of "finalizing" for a large file).
+#[test]
+fn a_resumed_file_is_read_back_while_the_rest_arrives() {
+    let _k = Knobs;
+    let t = tmp("resumed");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(40 * G + 123, 18);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let r = interrupted_half_way(&t, &d, &m, 20);
+    send_groups(&r, 0, &d, &(20..30).collect::<Vec<_>>());
+    // no root yet, so nothing commits: the live read-back alone reads the first half and the new groups
+    wait_until("the resumed half read back live", 10_000, || {
+        rb_stats()[0] == (30 * G) as u64
+    });
+    send_groups(&r, 0, &d, &(30..41).collect::<Vec<_>>());
+    r.root(0, *blake3::hash(&d).as_bytes());
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+    let st = rb_stats();
+    assert_eq!(st[0] + st[1], d.len() as u64, "every byte once: {st:?}");
+    assert!(
+        st[1] <= (11 * G) as u64,
+        "{} bytes read back after the last byte; the resumed part is {}: {st:?}",
+        st[1],
+        20 * G
+    );
+    assert_eq!(st[3], 0, "{st:?}");
+}
+
+/// A byte of the part written before the interruption that changed on the drive is found by the live
+/// read-back of the resumed job, before the last byte arrives, and the file is sent again as for any
+/// group found wrong while the file arrives.
+#[test]
+fn a_byte_changed_before_the_interruption_is_found_while_the_resumed_file_arrives() {
+    let _k = Knobs;
+    let t = tmp("resumed-bad");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(12 * G + 41, 19);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let r = interrupted_half_way(&t, &d, &m, 6);
+    unsafe { ava1_test_rb_corrupt(1, 2 * GROUP + 9) };
+    send_groups(&r, 0, &d, &(6..9).collect::<Vec<_>>());
+    wait_until("the changed byte read back live", 10_000, || unsafe {
+        ava1_test_rb_corrupt_left() == 0
+    });
+    assert!(!r.events().contains("retry"), "{}", r.events());
+    send_groups(&r, 0, &d, &(9..13).collect::<Vec<_>>());
+    r.root(0, *blake3::hash(&d).as_bytes());
+    r.wait_event("retry 0 1", 10_000);
+    assert_eq!(rb_stats()[3], 1);
+    assert!(!t.join("dest/big").exists(), "nothing was committed");
+    send_large(&r, 0, &d);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+}
+
 /// Ending a job (a cancel) while a live read-back is reading does not wait for it either.
 #[test]
 fn ending_a_job_during_a_live_read_back_is_prompt() {

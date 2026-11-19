@@ -874,9 +874,10 @@ writing the file) commits unnoticed. With `JF_READBACK` the receiver reads every
 back from the drive and compares its CV with the outboard's before the file is committed (a file of one
 group is already hashed from the drive at commit). A group is read back only once it is durable: the
 sync batch that wrote it has fsynced the part file and the outboard and journaled the range. It may be
-read then, while the rest of the file still arrives, in any order; the commit, once every byte is durable
-and the outboard's root equals the sender's root, reads back the groups that were not (the last batch's,
-those the early reads had no time for, and those made durable before a restart of the receiver). A group
+read then, while the rest of the file still arrives, in any order; the groups a resumed job holds durable
+from before (its journal's ranges) may be read the same way once the job's map is answered. The commit,
+once every byte is durable and the outboard's root equals the sender's root, reads back the groups that
+were not (the last batch's and those the early reads had no time for). A group
 written again after it was read back (a duplicate chunk) is read back again once that write is durable,
 so each group is read back once after it was last made durable. A mismatch found while the file arrives
 is acted on at the commit, not before (the sender is still sending the file). A mismatch resets the file

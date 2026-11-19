@@ -1293,6 +1293,9 @@ static void answer(ava1_job_t *j) {
     /* Files every byte and root of which are durable commit now: no sync batch may come to
      * trigger it (nothing is left to send). */
     ava1_apply_commit_ready(j);
+    /* JF_READBACK: what the other files hold durable from before (the journal's ranges of a job taken up
+     * again) is read back while the rest of them arrives, not all of it after their last byte. */
+    ava1_apply_readback_resumed(j);
 }
 
 /* A new or changed manifest becomes the job's: written, then journaled. */

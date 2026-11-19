@@ -57,8 +57,8 @@ typedef struct {        /* one large file being assembled */
     uint8_t held;          /* descriptors counted against the large-file budget (0, 1 or 2) */
     uint8_t rb_bad;        /* read-backs (JF_READBACK) that found the drive's bytes wrong; the file fails at AVA1_READBACK_TRIES */
     /* JF_READBACK while the file arrives (SPEC.md §13.5; ava1_apply.c, "read-back"), under j->mu.
-     * rb_todo: durable bytes nobody has read back yet (a sync batch adds what it made durable, a write
-     * takes its range out again). rb_done: read back and right since they were last made durable.
+     * rb_todo: durable bytes nobody has read back yet (a sync batch adds what it made durable, a resumed
+     * job's map adds what the journal holds durable, a write takes its range out again). rb_done: read back and right since they were last made durable.
      * rb_gen: bumped by a reset and by a write over durable bytes, so a read-back in flight across
      * either counts for nothing. rb_busy: read-backs of this file in flight. rb_found: one found the
      * drive's bytes wrong at group rb_found_g; the commit acts on it (unless that group is written again). */
@@ -229,8 +229,8 @@ struct ava1_job {
     uint32_t rb_th_n;
     pthread_cond_t rb_cv;
     uint32_t rb_live_run;            /* live reads in flight (under mu): ava1_apply_quiesce waits for none */
-    uint64_t rb_todo_ranges, rb_live_reads, rb_live_crowded; /* atomics, for the end-of-job line: ranges batches handed
-                                                              * over, live reads done, of those with chunks waiting */
+    uint64_t rb_todo_ranges, rb_live_reads, rb_live_crowded; /* atomics, for the end-of-job line: ranges batches (and a
+                                                              * resume) handed over, live reads done, of those with chunks waiting */
     /* Reading from the drive, not the page cache (atomics): reads whose pages were dropped from the cache
      * first (asked / done), reads made with O_DIRECT; the one line per job that says how. */
     uint64_t rb_drops, rb_drops_ok, rb_direct_reads;

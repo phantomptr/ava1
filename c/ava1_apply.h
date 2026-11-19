@@ -69,6 +69,9 @@ int ava1_apply_quiesce(ava1_job_t *j); /* 0, or an errno when the unswept files 
 /* Queues the commit of every large file whose ranges and root are all durable onto the
  * workers and returns at once (a commit is four fsyncs; it must not stop the job thread). */
 void ava1_apply_commit_ready(ava1_job_t *j);
+/* JF_READBACK: hands the durable ranges nobody has read back (those a job found in its journal) to the
+ * live read-back. Job thread, once the job is prepared; does nothing without the read-back. */
+void ava1_apply_readback_resumed(ava1_job_t *j);
 /* One line: where the job's time went, as a share of its wall time (scan, data fsync, directory
  * fsyncs, journal on the job thread; commit and preallocate summed over workers, so they can pass
  * 100% together). Printed once when the job ends, always. Returns the length written. */
