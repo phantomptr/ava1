@@ -2974,9 +2974,13 @@ static int read_root(ava1_job_t *j, uint32_t id, uint8_t root[32]) {
  *   mismatch is not acted on there (an old sender does not expect a FileRetry for a file it is still
  *   sending): it is recorded (rb_found) and the commit acts on it as on its own.
  *
- * - At the commit, every group the live part did not read (the last batch's, those it had no time for,
- *   all of a file made durable before this process started) is read back as before, in stripes on a few
- *   threads of its own: the last file of a job has nothing left to overlap with.
+ *   What a file held durable before this process took the job up (a resume from the journal) is handed
+ *   over the same way when the job is prepared (ava1_apply_readback_resumed), so it is read while the rest
+ *   of the file arrives.
+ *
+ * - At the commit, every group the live part did not read (the last batch's, those it had no time for) is
+ *   read back as before, in stripes on a few threads of its own: the last file of a job has nothing left
+ *   to overlap with.
  *
  * So every group is read back once after it was last made durable, and a byte that changes on the drive
  * before its group is read back is found. One that changes after its group was read back (while the rest
@@ -3271,6 +3275,73 @@ static void rb_live_kick(ava1_job_t *j) {
     pthread_mutex_unlock(&j->mu);
     fprintf(stderr, "[ava1] job %02x%02x%02x%02x: read-back: %u threads read large files back as they arrive\n", j->id[0],
             j->id[1], j->id[2], j->id[3], n);
+}
+
+/* Caller holds j->mu. Hands what file `id` holds durable and nobody has read back (nor is to: rb_todo) to the
+ * live read-back; returns those bytes. */
+static uint64_t rb_hand_over(ava1_job_t *j, uint32_t id) {
+    ava1_lfile_t *lf = id < j->m.n ? j->lf[id] : NULL;
+    uint64_t bytes = 0;
+    size_t r, d = 0;
+    /* rb_busy: a read of this file is in flight, its groups in neither set. They would be handed over a
+     * second time, so the file is left as it is (whatever is not read live, the commit reads). */
+    if (!lf || !lf->durable.n || lf->rb_busy || lf->committed || lf->committing || ava1_bits_get(&j->done, id) ||
+        groups_of(j->m.e[id].size) < 2)
+        return 0;
+    for (r = 0; r < lf->durable.n; r++) {
+        uint64_t a = lf->durable.v[2 * r], b = lf->durable.v[2 * r + 1];
+        while (a < b) { /* the pieces of [a, b) that are not in rb_done (sorted and disjoint, as durable is) */
+            uint64_t e = b;
+            while (d < lf->rb_done.n && lf->rb_done.v[2 * d + 1] <= a) d++;
+            if (d < lf->rb_done.n && lf->rb_done.v[2 * d] <= a) {
+                a = lf->rb_done.v[2 * d + 1];
+                continue;
+            }
+            if (d < lf->rb_done.n && lf->rb_done.v[2 * d] < b) e = lf->rb_done.v[2 * d];
+            /* out of memory: the commit reads them */
+            if (!ava1_rset_covers(&lf->rb_todo, a, e) && ava1_rset_add(&lf->rb_todo, a, e) == 0) {
+                __atomic_add_fetch(&j->rb_todo_ranges, 1, __ATOMIC_RELAXED);
+                bytes += e - a;
+            }
+            a = e;
+        }
+    }
+    return bytes;
+}
+
+/* JF_READBACK, job thread, each time the job's map is answered. What a large file holds durable without
+ * having been read back by this process is handed to the live read-back:
+ *
+ * - A job taken up again from its journal (a Stop then a resume, a node that was restarted, a job parked past
+ *   its age): its durable bytes were written by an earlier run. Left to the commit, all of them were read
+ *   after the file's last byte, while the sender had nothing left to send (a 60 GiB file resumed at half:
+ *   30 GiB read back with the upload showing as finished). Now they are read while the rest of the file
+ *   arrives, like the bytes of this run.
+ * - A job still in memory whose new JobOpen turns the read-back on: the bytes it made durable without it.
+ *
+ * It only queues: the reads start with the file's next batch (rb_live_kick), once a chunk has opened its
+ * part file, they stop with the job as any live read does, and a mismatch is acted on at the commit as any
+ * found live is. Nothing is reported to the sender (no Durable goes out for these ranges). It may run any
+ * number of times: a range read back, waiting to be, or being read is not handed over again. A job taken up
+ * a second time starts from nothing read back (the journal records what is durable, not what was read). */
+void ava1_apply_readback_resumed(ava1_job_t *j) {
+    uint64_t bytes = 0;
+    uint32_t k, files = 0;
+    pthread_mutex_lock(&j->mu);
+    if (j->readback && j->lf && j->prepared && !j->finished && !j->final_status && !j->stopping) {
+        uint32_t n = j->lfl_all ? j->m.n : j->lfl_n;
+        for (k = 0; k < n; k++) {
+            uint64_t got = rb_hand_over(j, j->lfl_all ? k : j->lfl[k]);
+            bytes += got;
+            if (got) files++;
+        }
+    }
+    pthread_mutex_unlock(&j->mu);
+    if (bytes)
+        fprintf(stderr,
+                "[ava1] job %02x%02x%02x%02x: read-back: %llu MiB of %u files, durable before, are read back while the rest "
+                "arrives\n",
+                j->id[0], j->id[1], j->id[2], j->id[3], (unsigned long long)(bytes >> 20), files);
 }
 
 /* ---- the commit's read-back ---- */

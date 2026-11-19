@@ -1641,9 +1641,26 @@ pub async fn run_upload(
     // already has is credited (design 015/02), the rest must fit.
     if let Some(gate) = opts.space_gate.clone() {
         let figures = SpaceFigures::of(&manifest, &need, opts.cutoff)?;
-        let verdict = tokio::task::spawn_blocking(move || gate(&figures))
-            .await
-            .map_err(|e| SendError::Protocol(format!("the space check failed: {e}")))?;
+        let mut check = tokio::task::spawn_blocking(move || gate(&figures));
+        // A slow check (a drive that answers late) does not hold up a cancel: the flag is
+        // polled while it runs, as the data loop does. The check's thread ends on its own and
+        // its answer is dropped.
+        let verdict = loop {
+            if opts.cancel.load(Ordering::Relaxed) {
+                let _ = link
+                    .control
+                    .send(&gen::JobCancel {
+                        job_id,
+                        reason: gen::ERR_CANCELLED,
+                    })
+                    .await;
+                return Err(SendError::Cancelled);
+            }
+            if let Ok(r) = tokio::time::timeout(Duration::from_millis(100), &mut check).await {
+                break r
+                    .map_err(|e| SendError::Protocol(format!("the space check failed: {e}")))?;
+            }
+        };
         if let Err(why) = verdict {
             let _ = link
                 .control
@@ -4328,6 +4345,69 @@ mod tests {
         // ...and no reader thread is still inside the source (parked on the read-ahead
         // budget or otherwise).
         assert_eq!(active.load(Ordering::Relaxed), 0, "a reader thread leaked");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_during_a_slow_space_check_ends_the_job_at_once() {
+        // The space check runs before any byte is sent and may take long (a slow drive). A
+        // cancel then ends the job within the poll, and the receiver is told; before, the
+        // sender waited for the check's answer first.
+        let rcv = FakeReceiver {
+            credit: 4 << 20,
+            ..Default::default()
+        };
+        let cancel_seen = rcv.cancel_seen.clone();
+        let (mut link, _lane_seen, _keep) = fake_link(rcv, None);
+        let size = 8usize << 20;
+        let src: Arc<dyn Source> = Arc::new(MemSource(vec![0x5a; size]));
+        let m = Arc::new(Manifest {
+            entries: vec![Entry {
+                kind: gen::ENTRY_FILE,
+                mode: 0o644,
+                size: size as u64,
+                mtime: 1,
+                path: "big".into(),
+                root: None,
+            }],
+        });
+        let (entered, release) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (e2, r2) = (entered.clone(), release.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut opts = SendOptions::upload("dest");
+        opts.cancel = cancel.clone();
+        opts.space_gate = Some(Arc::new(move |_: &SpaceFigures| {
+            e2.store(true, Ordering::SeqCst);
+            let t0 = Instant::now();
+            while !r2.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }));
+        let job_task = tokio::spawn(async move { send_job(&mut link, m, src, opts).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the space check ran");
+        cancel.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(3), job_task).await;
+        release.store(true, Ordering::SeqCst); // let the check's thread end either way
+        let result = result
+            .expect("the cancel did not wait for the space check")
+            .expect("the sender task did not panic");
+        assert!(matches!(result, Err(SendError::Cancelled)), "{result:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cancel_seen.load(Ordering::SeqCst) != gen::ERR_CANCELLED as u32 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the receiver was told");
     }
 
     /// A source whose reads park on something outside the disk (a relay waiting for

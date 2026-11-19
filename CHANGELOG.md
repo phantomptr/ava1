@@ -3,6 +3,24 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.11
+
+Read-back of a resumed file while it arrives. Nothing changes on the wire format, on disk or in the
+public API.
+
+C library:
+
+- Read-back: a large file resumed from the journal (a stop and a resume, a restarted node) had what it
+  held durable from before read back only after its last byte, while the sender had nothing left to
+  send; for a big file that was minutes of finishing with the upload done. Those bytes are now read
+  back while the rest of the file arrives, like the bytes of this run, and one that reads back wrong
+  still has the file sent again (§13.5).
+
+Rust sender:
+
+- A cancel while the up-front free-space check runs ends the job at once and tells the receiver. It
+  used to wait for the check's answer first.
+
 ## 1.0.10
 
 Fixes from a review of the read-back added in 1.0.8 and 1.0.9. Nothing changes on the wire format, on
