@@ -3,6 +3,31 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## 1.0.12
+
+Read-back progress, and no second read-back of a resumed file in the same process. The wire format gains one
+optional field (old peers skip it); nothing changes on disk.
+
+C library:
+
+- Read-back: a job taken up again from its journal in the same process (a Stop then a resume, a failed job
+  resumed, a job parked past its age) no longer reads back what its earlier run already read back. The
+  process keeps each unfinished large file's read-back ranges when a job is destroyed, with the identity of its
+  part file and outboard (device, inode, size, modify and change times), and the next run counts those ranges
+  as read back when they are still durable by the journal and both files are unchanged. A file written in
+  between, one whose read-back found it wrong, and any job after a restart are read back whole as before
+  (§13.5). Before, a 156 GB part file resumed after a stop was read back again, mostly after its last byte:
+  minutes of "finishing" with the upload done.
+- `Status` carries ext `readback_left` (tag 6) for a job with `JF_READBACK`: the bytes of its unfinished
+  large files not read back yet, counting the commit's read-back as it goes, so a sender can show the
+  read-back after the last byte as progress.
+- A write of file data that failed part way over bytes already read back takes them out of what was read
+  back, as a write that succeeds does.
+
+Rust sender:
+
+- `Progress::readback_left` holds the receiver's last `readback_left` (0 when it sends none).
+
 ## 1.0.11
 
 Read-back of a resumed file while it arrives. Nothing changes on the wire format, on disk or in the

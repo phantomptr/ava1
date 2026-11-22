@@ -171,6 +171,7 @@ fn status_with_result() -> Status {
         result: Some(b"cause".to_vec()),
         code: Some(ERR_IO),
         unswept: None,
+        readback_left: None,
     }
 }
 
@@ -202,6 +203,22 @@ fn management_structs_round_trip() {
     assert_eq!(JobListResult::decode(&jl.to_bytes().unwrap()).unwrap(), jl);
     let sr = status_with_result();
     assert_eq!(Status::decode(&sr.to_bytes().unwrap()).unwrap(), sr);
+}
+
+/// `Status.readback_left` (1.0.12) is an extension: it round-trips, a Status without it (an older
+/// receiver's) decodes with `None`. A decoder that predates it skips the unknown tag.
+#[test]
+fn status_readback_left_is_an_optional_extension() {
+    use ava1::wire::Message;
+    let with = Status {
+        readback_left: Some(156_412_936_192),
+        ..status_with_result()
+    };
+    let bytes = with.to_bytes().unwrap();
+    assert_eq!(Status::decode(&bytes).unwrap(), with);
+    let without = status_with_result();
+    let old = without.to_bytes().unwrap();
+    assert_eq!(Status::decode(&old).unwrap().readback_left, None);
 }
 
 #[test]

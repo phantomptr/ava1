@@ -432,6 +432,7 @@ void ava1_data_stop(void) {
     pthread_join(D.house, NULL);
     pthread_join(D.recover, NULL);
     ava1_job_free_all();
+    ava1_apply_rb_keep_clear(); /* a restart reads everything back again */
 }
 
 /* ---- messages ---------------------------------------------------------------------- */

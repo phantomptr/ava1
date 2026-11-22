@@ -731,6 +731,7 @@ ext = [
   { tag = 3, name = "result", ty = "bytes", doc = "`job.run`: the finished operation's reply body, at most 128 KiB (SPEC.md §7.1.1)." },
   { tag = 4, name = "code", ty = "u16", doc = "A failed job's `ERR_*` code." },
   { tag = 5, name = "unswept", ty = "u32", doc = "Durable-by-log: done files not yet durable in place; absent means 0 (SPEC.md §15.7)." },
+  { tag = 6, name = "readback_left", ty = "u64", doc = "JF_READBACK: bytes of the job's unfinished large files not yet read back from the drive; absent when the receiver does not say (SPEC.md §13.5)." },
 ]
 
 [[message]]

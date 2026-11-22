@@ -1062,6 +1062,7 @@ static size_t g_ev_len;
 static int g_ev_done; /* the recorder has seen JOB_DONE */
 static int g_same_device = 1;
 static ava1_job_t *g_job;
+static uint64_t g_status_rb_left = UINT64_MAX; /* the last Status's readback_left (UINT64_MAX: absent) */
 static uint8_t TEST_JOB[16] = { 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 };
 static const uint8_t TEST_OWNER[32] = { 1 };
 static int g_trace;           /* record hook points as events */
@@ -1548,6 +1549,7 @@ static void rec_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *
         ava1_status_t st;
         static uint16_t last_code;
         if (ava1_status_decode(body, len, &st) != 0) return;
+        __atomic_store_n(&g_status_rb_left, st.has_readback_left ? st.readback_left : UINT64_MAX, __ATOMIC_SEQ_CST);
         if (st.has_code && st.code && st.code != last_code) { /* a receiver-side failure the sender must see */
             snprintf(line, sizeof line, "status code=%u unswept=%u\n", st.code, st.has_unswept ? st.unswept : 0);
             ev_add(line, 0);
@@ -1974,6 +1976,19 @@ void ava1_test_recv_args(uint8_t kind) { g_kind = kind; }
 
 /* Another JobOpen in the same process. drop_old releases the current session's reference
  * first; when the open is refused the current job (if kept) stays current. */
+/* A Stop: the job is cancelled (JobCancel) and unlisted, its journal kept; the caller's reference stays
+ * until a reopen drops it. */
+void ava1_test_recv_cancel(void) {
+    if (g_job) ava1_recv_cancel(g_job);
+}
+
+/* A Status of the current job now: its readback_left, or UINT64_MAX when it carries none. */
+uint64_t ava1_test_status_readback_left(void) {
+    __atomic_store_n(&g_status_rb_left, UINT64_MAX, __ATOMIC_SEQ_CST);
+    if (g_job) ava1_apply_status(g_job);
+    return __atomic_load_n(&g_status_rb_left, __ATOMIC_SEQ_CST);
+}
+
 int ava1_test_recv_reopen(int drop_old) {
     ava1_job_t *old = g_job;
     int rc;

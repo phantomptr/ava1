@@ -2889,6 +2889,7 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     if (m->has_result) ext_n++;
     if (m->has_code) ext_n++;
     if (m->has_unswept) ext_n++;
+    if (m->has_readback_left) ext_n++;
     ava1_w_u16(w, ext_n);
     if (m->has_current) {
         size_t at = ava1_w_ext_begin(w, 1);
@@ -2913,6 +2914,11 @@ int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w) {
     if (m->has_unswept) {
         size_t at = ava1_w_ext_begin(w, 5);
         ava1_w_u32(w, m->unswept);
+        ava1_w_ext_end(w, at);
+    }
+    if (m->has_readback_left) {
+        size_t at = ava1_w_ext_begin(w, 6);
+        ava1_w_u64(w, m->readback_left);
         ava1_w_ext_end(w, at);
     }
     return w->err;
@@ -2967,6 +2973,11 @@ int ava1_status_decode(const uint8_t *buf, size_t len, ava1_status_t *m) {
             if (m->has_unswept) return AVA1_E_DUP_EXT;
             m->has_unswept = 1;
             m->unswept = ava1_r_u32(&vr);
+            break;
+        case 6:
+            if (m->has_readback_left) return AVA1_E_DUP_EXT;
+            m->has_readback_left = 1;
+            m->readback_left = ava1_r_u64(&vr);
             break;
         default:
             continue;

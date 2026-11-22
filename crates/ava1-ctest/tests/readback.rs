@@ -30,6 +30,8 @@ extern "C" {
     fn ava1_test_batch_synced_held() -> u32;
     fn ava1_test_apply_bytes_received() -> u64;
     fn ava1_test_apply_hold(on: i32);
+    fn ava1_test_recv_cancel();
+    fn ava1_test_status_readback_left() -> u64;
 }
 
 const G: usize = GROUP as usize;
@@ -778,6 +780,155 @@ fn ending_a_job_during_a_live_read_back_is_prompt() {
     );
     assert_eq!(rb_stats()[6], 0, "the held read-back let go");
     assert!(!root.join("big.bin").exists());
+}
+
+/// The part file of `dest`'s one large file (a merge: `<name>.ava-part` beside the final name).
+fn part_file(dest: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dest)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".ava-part"))
+        .expect("a part file")
+}
+
+/// A file stopped half way and resumed in the same process (the job cancelled, then taken up again
+/// from its journal): what the first run read back is not read again, live or after the last byte.
+/// Before 1.0.12 the second run read back all the first run's bytes again (#873: on a console, up to a
+/// quarter of an hour after the last byte for a large game). The Status reports what is left to read.
+#[test]
+fn a_file_resumed_in_the_same_process_is_not_read_back_again() {
+    let _k = Knobs;
+    let t = tmp("kept");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(40 * G + 123, 21);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &t.join("dest"),
+        gen::JF_READBACK,
+        gen::POLICY_REPLACE,
+        0,
+    );
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    send_groups(&r, 0, &d, &(0..20).collect::<Vec<_>>());
+    wait_until("the first half read back", 10_000, || {
+        rb_stats()[0] == (20 * G) as u64
+    });
+    assert_eq!(
+        unsafe { ava1_test_status_readback_left() },
+        (d.len() - 20 * G) as u64,
+        "the Status says what is left to read back"
+    );
+    unsafe { ava1_test_recv_cancel() };
+    assert_eq!(r.reopen(true), 0);
+    r.manifest(&m);
+    wait_count(&r, "map status=0", 2);
+    assert!(r.events().contains("partial=1"), "{}", r.events());
+    assert_eq!(
+        unsafe { ava1_test_status_readback_left() },
+        (d.len() - 20 * G) as u64,
+        "the first run's read-back still counts"
+    );
+    send_groups(&r, 0, &d, &(20..30).collect::<Vec<_>>());
+    wait_until("the new groups read back live", 10_000, || {
+        rb_stats()[0] == (10 * G) as u64
+    });
+    assert_eq!(
+        unsafe { ava1_test_status_readback_left() },
+        (d.len() - 30 * G) as u64
+    );
+    send_groups(&r, 0, &d, &(30..41).collect::<Vec<_>>());
+    r.root(0, *blake3::hash(&d).as_bytes());
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+    let st = rb_stats();
+    assert_eq!(
+        st[0] + st[1],
+        (d.len() - 20 * G) as u64,
+        "only what the first run did not read back: {st:?}"
+    );
+    assert_eq!(st[3], 0, "{st:?}");
+}
+
+/// The same, but the part file was written between the two runs (by anything but the job): nothing
+/// the first run read back counts, the whole file is read back again, and the changed byte is found
+/// and the file sent again.
+#[test]
+fn a_file_written_between_two_runs_is_read_back_whole() {
+    let _k = Knobs;
+    let t = tmp("kept-touched");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(12 * G + 41, 22);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let r = CRecv::open(
+        &t.join("jobs"),
+        &t.join("dest"),
+        gen::JF_READBACK,
+        gen::POLICY_REPLACE,
+        0,
+    );
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    // two batches: the resume re-hashes the last one (§13.4), so the byte changed below is in the first
+    send_groups(&r, 0, &d, &(0..3).collect::<Vec<_>>());
+    wait_until("the first groups read back", 10_000, || {
+        rb_stats()[0] == (3 * G) as u64
+    });
+    send_groups(&r, 0, &d, &(3..6).collect::<Vec<_>>());
+    wait_until("the first half read back", 10_000, || {
+        rb_stats()[0] == (6 * G) as u64
+    });
+    unsafe { ava1_test_recv_cancel() };
+    assert_eq!(r.reopen(true), 0);
+    {
+        use std::os::unix::fs::FileExt;
+        std::thread::sleep(std::time::Duration::from_millis(20)); // a later modify time
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(part_file(&t.join("dest")))
+            .unwrap();
+        let at = G + 9;
+        f.write_all_at(&[!d[at]], at as u64).unwrap();
+    }
+    r.manifest(&m);
+    wait_count(&r, "map status=0", 2);
+    assert_eq!(
+        unsafe { ava1_test_status_readback_left() },
+        d.len() as u64,
+        "nothing of the first run counts"
+    );
+    send_groups(&r, 0, &d, &(6..13).collect::<Vec<_>>());
+    r.root(0, *blake3::hash(&d).as_bytes());
+    r.wait_event("retry 0 1", 10_000);
+    assert_eq!(rb_stats()[3], 1, "the changed byte was found");
+    assert!(!t.join("dest/big").exists(), "nothing was committed");
+    send_large(&r, 0, &d);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
+    assert_eq!(std::fs::read(t.join("dest/big")).unwrap(), d);
+}
+
+/// A job without the read-back says nothing about it in its Status (an older sender sees the frame it
+/// always did).
+#[test]
+fn a_job_without_the_read_back_reports_no_readback_left() {
+    let _k = Knobs;
+    let t = tmp("no-rb-status");
+    std::fs::create_dir_all(t.join("dest")).unwrap();
+    let d = data(4 * G + 5, 23);
+    let m = Manifest {
+        entries: vec![file("big", d.len() as u64)],
+    };
+    let r = CRecv::open(&t.join("jobs"), &t.join("dest"), 0, gen::POLICY_REPLACE, 0);
+    r.manifest(&m);
+    r.wait_event("map status=0", 5000);
+    assert_eq!(unsafe { ava1_test_status_readback_left() }, u64::MAX);
+    send_large(&r, 0, &d);
+    assert_eq!(r.wait(10_000), 0, "{}", r.events());
 }
 
 mod common;

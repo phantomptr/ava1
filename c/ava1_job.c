@@ -291,6 +291,7 @@ static void job_destroy(ava1_job_t *j) {
             (void)unlink(ob);
         }
     }
+    ava1_apply_rb_keep_save(j); /* every thread is joined: what was read back stays for a later run */
     if (j->lf) {
         for (i = 0; i < j->m.n; i++)
             if (j->lf[i]) {

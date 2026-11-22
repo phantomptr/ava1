@@ -875,7 +875,11 @@ back from the drive and compares its CV with the outboard's before the file is c
 group is already hashed from the drive at commit). A group is read back only once it is durable: the
 sync batch that wrote it has fsynced the part file and the outboard and journaled the range. It may be
 read then, while the rest of the file still arrives, in any order; the groups a resumed job holds durable
-from before (its journal's ranges) may be read the same way once the job's map is answered. The commit,
+from before (its journal's ranges) may be read the same way once the job's map is answered. A receiver may
+also count as read back what an earlier run of the job in the same process read back, of ranges still durable by
+the journal, when the part file and the outboard have not changed since (the C node keeps it in memory with each
+file's device, inode, size and modify and change times, and forgets it all when its data layer stops): a Stop
+and a resume then do not read the first run's bytes again. Nothing is carried across a restart. The commit,
 once every byte is durable and the outboard's root equals the sender's root, reads back the groups that
 were not (the last batch's and those the early reads had no time for). A group
 written again after it was read back (a duplicate chunk) is read back again once that write is durable,
@@ -896,7 +900,11 @@ receiver should read past the cache. The C node drops each range's cached pages 
 `posix_fadvise(POSIX_FADV_DONTNEED)`, and on FreeBSD, where that only deactivates the pages, also
 `msync(MS_INVALIDATE)` over a mapping of the range) and reads through an `O_DIRECT` descriptor where the
 filesystem allows one; it logs which, once per job. Where neither is possible the read goes through the
-cache, and what it proves is what any later reader of the file will get. Small files are out of its scope (their roots are checked from the
+cache, and what it proves is what any later reader of the file will get. While the job runs, the C node's
+`Status` carries ext `readback_left`: the bytes of its unfinished large files (those it has opened) not read
+back yet, so a sender can show the read-back after the last byte, which on a large file takes minutes, as
+progress. It is absent from a job without the flag and from a receiver that does not send it; a sender must not
+rely on it. Small files are out of its scope (their roots are checked from the
 log record or the file when they are recovered, §15.7).
 
 ## 14. Journal and resume

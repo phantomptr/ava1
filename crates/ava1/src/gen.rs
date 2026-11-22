@@ -1455,6 +1455,8 @@ pub struct Status {
     pub code: Option<u16>,
     /// Durable-by-log: done files not yet durable in place; absent means 0 (SPEC.md §15.7).
     pub unswept: Option<u32>,
+    /// JF_READBACK: bytes of the job's unfinished large files not yet read back from the drive; absent when the receiver does not say (SPEC.md §13.5).
+    pub readback_left: Option<u64>,
 }
 
 impl Message for Status {
@@ -1477,12 +1479,14 @@ impl Message for Status {
         if self.result.is_some() { ext_n += 1; }
         if self.code.is_some() { ext_n += 1; }
         if self.unswept.is_some() { ext_n += 1; }
+        if self.readback_left.is_some() { ext_n += 1; }
         w.u16(ext_n);
         if let Some(v) = &self.current { w.ext(1, |w| { w.str(v) })?; }
         if let Some(v) = &self.state { w.ext(2, |w| { w.u8(*v); Ok(()) })?; }
         if let Some(v) = &self.result { w.ext(3, |w| { w.bytes(v) })?; }
         if let Some(v) = &self.code { w.ext(4, |w| { w.u16(*v); Ok(()) })?; }
         if let Some(v) = &self.unswept { w.ext(5, |w| { w.u32(*v); Ok(()) })?; }
+        if let Some(v) = &self.readback_left { w.ext(6, |w| { w.u64(*v); Ok(()) })?; }
         Ok(())
     }
 
@@ -1533,6 +1537,12 @@ impl Message for Status {
                     if m.unswept.is_some() { return Err(DecodeError::DupExt(5)); }
                     let mut vr = Reader::new(v);
                     m.unswept = Some(vr.u32()?);
+                    vr.finish()?;
+                }
+                6 => {
+                    if m.readback_left.is_some() { return Err(DecodeError::DupExt(6)); }
+                    let mut vr = Reader::new(v);
+                    m.readback_left = Some(vr.u64()?);
                     vr.finish()?;
                 }
                 _ => {}
@@ -3109,7 +3119,7 @@ pub fn sample(name: &str, rng: &mut SplitMix) -> Option<Vec<u8>> {
         "Durable" => Durable { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files: vec![FileRun::default(); rng.below(3) as usize], ranges: vec![FileRange::default(); rng.below(3) as usize], }.to_bytes().ok(),
         "FileRoot" => FileRoot { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, root: { let mut a = [0u8; 32]; rng.fill(&mut a); a }, }.to_bytes().ok(),
         "FileRetry" => FileRetry { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, file_id: rng.next_u64() as u32, reason: rng.next_u64() as u16, }.to_bytes().ok(),
-        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, result: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, code: if rng.below(2) == 1 { Some(rng.next_u64() as u16) } else { None }, unswept: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, }.to_bytes().ok(),
+        "Status" => Status { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, files_done: rng.next_u64() as u32, files_total: rng.next_u64() as u32, bytes_received: rng.next_u64(), bytes_durable: rng.next_u64(), bytes_total: rng.next_u64(), bottleneck: rng.next_u64() as u8, workers: rng.next_u64() as u8, lanes: rng.next_u64() as u8, sequential: rng.next_u64() as u8, current: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, state: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, result: if rng.below(2) == 1 { Some({ let n = rng.below(41) as usize; let mut v = vec![0u8; n]; rng.fill(&mut v); v }) } else { None }, code: if rng.below(2) == 1 { Some(rng.next_u64() as u16) } else { None }, unswept: if rng.below(2) == 1 { Some(rng.next_u64() as u32) } else { None }, readback_left: if rng.below(2) == 1 { Some(rng.next_u64()) } else { None }, }.to_bytes().ok(),
         "JobDone" => JobDone { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, status: rng.next_u64() as u16, files: rng.next_u64() as u32, bytes: rng.next_u64(), message: if rng.below(2) == 1 { Some(rng.ascii(20)) } else { None }, settling: if rng.below(2) == 1 { Some(rng.next_u64() as u8) } else { None }, }.to_bytes().ok(),
         "JobCancel" => JobCancel { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, reason: rng.next_u64() as u16, }.to_bytes().ok(),
         "SkipProgress" => SkipProgress { job_id: { let mut a = [0u8; 16]; rng.fill(&mut a); a }, bytes_skipped: rng.next_u64(), }.to_bytes().ok(),
