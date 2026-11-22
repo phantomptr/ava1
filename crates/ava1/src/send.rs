@@ -215,6 +215,10 @@ pub struct Progress {
     pub settling: AtomicBool,
     /// The receiver's last reported `unswept` count while the sender waits for it to settle.
     pub unswept: AtomicU32,
+    /// With `JF_READBACK`: the bytes of the job's unfinished large files the receiver has not
+    /// read back yet, from its last `Status` (`readback_left`, SPEC.md §13.5). 0 until a
+    /// receiver reports it; a receiver that does not (an older one) leaves it 0.
+    pub readback_left: AtomicU64,
     /// Times the sender ran for this job (more than one: it reconnected and resumed).
     pub attempts: AtomicU32,
     /// The most files the receiver reported unswept while the sender waited for it to settle.
@@ -2129,6 +2133,9 @@ pub async fn run_upload(
                         Ok(st) => {
                             receiver_bn = st.bottleneck;
                             sh.sched.lock().unwrap().floor = st.workers.max(1) as usize;
+                            if let Some(left) = st.readback_left {
+                                pg.readback_left.store(left, Ordering::Relaxed);
+                            }
                         }
                         // M6: like every other control frame, a malformed Status is a
                         // protocol error, not something to shrug off.

@@ -72,6 +72,11 @@ void ava1_apply_commit_ready(ava1_job_t *j);
 /* JF_READBACK: hands the durable ranges nobody has read back (those a job found in its journal) to the
  * live read-back. Job thread, once the job is prepared; does nothing without the read-back. */
 void ava1_apply_readback_resumed(ava1_job_t *j);
+/* JF_READBACK: what a destroyed job's unfinished large files had read back is kept in this process, so a later
+ * run of the job taken up from its journal does not read it again (ava1_apply.c, "what was read back, kept").
+ * Save: job_destroy, its threads joined. Clear: when the data layer stops (nothing is kept across a restart). */
+void ava1_apply_rb_keep_save(ava1_job_t *j);
+void ava1_apply_rb_keep_clear(void);
 /* One line: where the job's time went, as a share of its wall time (scan, data fsync, directory
  * fsyncs, journal on the job thread; commit and preallocate summed over workers, so they can pass
  * 100% together). Printed once when the job ends, always. Returns the length written. */

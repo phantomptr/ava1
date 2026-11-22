@@ -66,6 +66,9 @@ typedef struct {        /* one large file being assembled */
     uint32_t rb_gen;
     uint8_t rb_busy, rb_found;
     uint64_t rb_found_g;
+    /* JF_READBACK: bytes the commit's read-back of this file has read and found right so far (atomic; 0
+     * outside a commit), for the job's Status `readback_left`. */
+    uint64_t rb_cread;
 } ava1_lfile_t;
 
 /* Durable-by-log (SPEC.md §15.7). A small file's bytes go to `pack.<n>` in the job directory and
@@ -236,6 +239,7 @@ struct ava1_job {
     uint64_t rb_drops, rb_drops_ok, rb_direct_reads;
     int rb_how_logged, rb_direct_err; /* ... and why O_DIRECT was refused, the last time it was */
     uint32_t rb_bufs;                /* read-back buffers in use, live and at commit (under mu; at most READBACK_STRIPES) */
+    int rb_keep_looked;              /* the read-back this process kept of the job's files was looked up (job thread) */
     int resumed;                    /* decided at open (journal replay) or at an attach that finds durable work; never per re-arm */
     uint64_t prog_gen;              /* the attach generation `resumed` was last decided under */
     uint32_t tune_ticks, tune_busy; /* queue occupancy since the last tuning step */

@@ -1194,6 +1194,9 @@ typedef struct {
     /* Durable-by-log: done files not yet durable in place; absent means 0 (SPEC.md §15.7). */
     int has_unswept;
     uint32_t unswept;
+    /* JF_READBACK: bytes of the job's unfinished large files not yet read back from the drive; absent when the receiver does not say (SPEC.md §13.5). */
+    int has_readback_left;
+    uint64_t readback_left;
 } ava1_status_t;
 
 int ava1_status_encode(const ava1_status_t *m, ava1_w_t *w);

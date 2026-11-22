@@ -423,10 +423,12 @@ done:
     free(out);
 }
 
+static uint64_t rb_bytes_left(const ava1_job_t *j);
+
 void ava1_apply_status(ava1_job_t *j) {
     ava1_status_t st;
     char sm[96];
-    uint8_t b[192];
+    uint8_t b[256];
     ava1_w_t w;
     uint8_t bn;
     const ava1_data_cfg_t *cfg = ava1_data_cfg();
@@ -448,6 +450,10 @@ void ava1_apply_status(ava1_job_t *j) {
     if (j->unswept_n) {
         st.has_unswept = 1;
         st.unswept = j->unswept_n;
+    }
+    if (j->readback) { /* how much the read-back has left: a sender shows it after the last byte (§13.5) */
+        st.has_readback_left = 1;
+        st.readback_left = rb_bytes_left(j);
     }
     if (j->sweep_err) { /* files cannot be made durable: the sender must hear it (SPEC.md §15.7) */
         st.has_code = 1;
@@ -1077,26 +1083,24 @@ static int write_chunk(ava1_job_t *j, uint32_t id, uint64_t off, const uint8_t *
     if (err == 0 && __atomic_load_n(&j->perchunk, __ATOMIC_RELAXED)) err = chunk_sync(j, fd, d, len, off);
     close(fd);
     if (ob >= 0) close(ob);
+    pthread_mutex_lock(&j->mu);
+    lf->writers--;
+    /* Over durable bytes (a duplicate): they are not durable again until their batch, so what was read back
+     * of them no longer counts, and a read-back of the file in flight is void (see "read-back"). A write
+     * that failed may have changed some of them too: what was read back of them counts for nothing either
+     * (the job fails, and a later run of it in this process must not take them as read, rb_keep_save). */
+    if (!lf->committed && ava1_rset_overlaps(&lf->durable, off, off + len)) {
+        if (ava1_rset_remove(&lf->rb_todo, off, off + len) < 0) ava1_rset_clear(&lf->rb_todo);
+        if (ava1_rset_remove(&lf->rb_done, off, off + len) < 0) ava1_rset_clear(&lf->rb_done);
+        if (!err && lf->rb_found && lf->rb_found_g * AVA1_GROUP_LEN >= off && lf->rb_found_g * AVA1_GROUP_LEN < off + len)
+            lf->rb_found = 0; /* the wrong group was written again: it is read back again */
+        lf->rb_gen++;
+    }
     if (err) {
-        pthread_mutex_lock(&j->mu);
-        lf->writers--;
         pthread_mutex_unlock(&j->mu);
         return err;
     }
-    pthread_mutex_lock(&j->mu);
-    lf->writers--;
-    if (!lf->committed) { /* else: a late duplicate */
-        (void)ava1_rset_add(&lf->written, off, off + len);
-        /* Over durable bytes (a duplicate): they are not durable again until their batch, so what was read
-         * back of them no longer counts, and a read-back of the file in flight is void (see "read-back"). */
-        if (ava1_rset_overlaps(&lf->durable, off, off + len)) {
-            if (ava1_rset_remove(&lf->rb_todo, off, off + len) < 0) ava1_rset_clear(&lf->rb_todo);
-            if (ava1_rset_remove(&lf->rb_done, off, off + len) < 0) ava1_rset_clear(&lf->rb_done);
-            if (lf->rb_found && lf->rb_found_g * AVA1_GROUP_LEN >= off && lf->rb_found_g * AVA1_GROUP_LEN < off + len)
-                lf->rb_found = 0; /* the wrong group was written again: it is read back again */
-            lf->rb_gen++;
-        }
-    }
+    if (!lf->committed) (void)ava1_rset_add(&lf->written, off, off + len); /* else: a late duplicate */
     j->unsynced_bytes += len;
     j->bytes_received += len;
     j->applied_since_tune++;
@@ -2910,6 +2914,7 @@ void ava1_apply_reset(ava1_job_t *j, uint32_t id, uint16_t reason) {
     ava1_rset_clear(&lf->durable);
     ava1_rset_clear(&lf->rb_todo);
     ava1_rset_clear(&lf->rb_done);
+    __atomic_store_n(&lf->rb_cread, 0, __ATOMIC_RELAXED);
     lf->rb_found = 0;
     lf->rb_found_g = 0;
     lf->rb_gen++; /* a live read-back of the old bytes in flight counts for nothing */
@@ -3058,7 +3063,7 @@ static void rb_say_how(ava1_job_t *j, int drop, const char *how, int direct) {
  * first group that differs; a file shorter than its size counts as wrong); -errno = they could not be
  * read; -EINTR = the job is ending, or `*quit` was set (another stripe already has the answer). */
 static int rb_check(ava1_job_t *j, uint32_t id, int rfd, int pfd, int ob_fd, uint64_t from, uint64_t to, uint8_t *buf,
-                    const int *quit, int live, uint64_t *bad) {
+                    const int *quit, int live, uint64_t *bad, uint64_t *count) {
     uint8_t cvs[READBACK_GROUPS][32];
     uint64_t off = from;
     while (off < to) {
@@ -3106,6 +3111,7 @@ static int rb_check(ava1_job_t *j, uint32_t id, int rfd, int pfd, int ob_fd, uin
         }
         __atomic_add_fetch(&j->rb_hash_us, mono_us() - t_hash, __ATOMIC_RELAXED);
         if (rc) return rc;
+        if (count) __atomic_add_fetch(count, len, __ATOMIC_RELAXED); /* the commit's progress, for Status */
         off += len;
     }
     return 0;
@@ -3185,7 +3191,7 @@ static int rb_live_one(ava1_job_t *j, int crowded) {
     pthread_mutex_unlock(&j->mu);
     if ((rfd = rb_open_direct(j, id)) < 0) rfd = fd;
     if (!(buf = rb_buf_alloc())) rc = -ENOMEM;
-    else rc = rb_check(j, id, rfd, fd, ob, from, to, buf, NULL, 1, &bad);
+    else rc = rb_check(j, id, rfd, fd, ob, from, to, buf, NULL, 1, &bad, NULL);
     free(buf);
     if (rfd != fd) close(rfd);
     close(fd);
@@ -3277,6 +3283,187 @@ static void rb_live_kick(ava1_job_t *j) {
             j->id[1], j->id[2], j->id[3], n);
 }
 
+/* ---- what was read back, kept for a later run of the same job in this process ----
+ * A job taken up again from its journal (a Stop then a resume, a failure the sender resumes, a job parked past
+ * its age) used to start from nothing read back: all its files held durable was read back again, and on a
+ * drive that cannot read back as fast as the data arrives, most of it after the last byte. The journal records
+ * what is durable, not what was read back, so the process keeps that itself: when a job is destroyed, each
+ * unfinished large file's rb_done moves here with the identity of its part file and outboard (device, inode,
+ * size, modify and change times), and when the job is taken up again in this process, what of it is still
+ * durable by the journal, of files that are still the same, counts as read back. Everything else is read
+ * again: a file reset or written since (its ranges or its times changed), one whose read-back found it wrong
+ * before, a job taken up after a restart (nothing is kept across one: ava1_data_stop forgets it all). As within
+ * one run (SPEC.md §13.5), a byte that changes on the drive after its group was read back, without its file
+ * being written, is not found. */
+#define RB_KEEP_MAX 16u
+
+typedef struct {
+    uint64_t dev, ino, size;
+    int64_t mt_s, mt_ns, ct_s, ct_ns;
+} rb_ident_t;
+
+typedef struct {
+    uint8_t job[16];
+    uint32_t file_id;
+    uint64_t size; /* the manifest entry's */
+    rb_ident_t part, ob;
+    ava1_rset_t done;
+    uint64_t seq; /* the oldest goes first when the table is full */
+} rb_keep_t;
+
+static pthread_mutex_t rb_keep_mu = PTHREAD_MUTEX_INITIALIZER;
+static rb_keep_t rb_keep[RB_KEEP_MAX];
+static uint32_t rb_keep_n;
+static uint64_t rb_keep_seq;
+
+static void rb_ident_of(const struct stat *st, rb_ident_t *o) {
+    memset(o, 0, sizeof *o);
+    o->dev = (uint64_t)st->st_dev;
+    o->ino = (uint64_t)st->st_ino;
+    o->size = (uint64_t)st->st_size;
+#if defined(__APPLE__)
+    o->mt_s = (int64_t)st->st_mtimespec.tv_sec;
+    o->mt_ns = (int64_t)st->st_mtimespec.tv_nsec;
+    o->ct_s = (int64_t)st->st_ctimespec.tv_sec;
+    o->ct_ns = (int64_t)st->st_ctimespec.tv_nsec;
+#else
+    o->mt_s = (int64_t)st->st_mtim.tv_sec;
+    o->mt_ns = (int64_t)st->st_mtim.tv_nsec;
+    o->ct_s = (int64_t)st->st_ctim.tv_sec;
+    o->ct_ns = (int64_t)st->st_ctim.tv_nsec;
+#endif
+}
+
+/* The identity of file `id`'s part file and outboard, as they are on the drive now. 0, or -1. */
+static int rb_idents(const ava1_job_t *j, uint32_t id, rb_ident_t *part, rb_ident_t *ob) {
+    char p[PATH_CAP], o[600];
+    struct stat st;
+    ava1_apply_path(j, id, 1, p, sizeof p);
+    snprintf(o, sizeof o, "%s/%u.ob", j->dir, id);
+    if (!p[0] || stat(p, &st) != 0) return -1;
+    rb_ident_of(&st, part);
+    if (stat(o, &st) != 0) return -1;
+    rb_ident_of(&st, ob);
+    return 0;
+}
+
+/* Caller holds rb_keep_mu. Takes entry k out of the table; *out gets it (or it is freed when NULL). */
+static void rb_keep_remove_locked(uint32_t k, rb_keep_t *out) {
+    if (out) *out = rb_keep[k];
+    else ava1_rset_clear(&rb_keep[k].done);
+    rb_keep[k] = rb_keep[--rb_keep_n];
+    memset(&rb_keep[rb_keep_n], 0, sizeof rb_keep[rb_keep_n]);
+}
+
+/* Caller holds rb_keep_mu. The entry of (job, file `id`), or UINT32_MAX. */
+static uint32_t rb_keep_find_locked(const uint8_t job[16], uint32_t id) {
+    uint32_t k;
+    for (k = 0; k < rb_keep_n; k++)
+        if (rb_keep[k].file_id == id && memcmp(rb_keep[k].job, job, 16) == 0) return k;
+    return UINT32_MAX;
+}
+
+/* job_destroy, every thread of the job joined: what each unfinished large file has read back moves to the
+ * table (see above). */
+void ava1_apply_rb_keep_save(ava1_job_t *j) {
+    uint32_t id;
+    if (!j->lf || j->discard_parts) return;
+    for (id = 0; id < j->m.n; id++) {
+        ava1_lfile_t *lf = j->lf[id];
+        rb_keep_t e;
+        uint32_t k;
+        if (!lf || !lf->rb_done.n || lf->committed || lf->rb_bad || lf->rb_found || ava1_bits_get(&j->done, id) ||
+            groups_of(j->m.e[id].size) < 2)
+            continue;
+        memset(&e, 0, sizeof e);
+        if (rb_idents(j, id, &e.part, &e.ob) != 0) continue;
+        memcpy(e.job, j->id, 16);
+        e.file_id = id;
+        e.size = j->m.e[id].size;
+        e.done = lf->rb_done; /* moved: the job is going */
+        memset(&lf->rb_done, 0, sizeof lf->rb_done);
+        pthread_mutex_lock(&rb_keep_mu);
+        if ((k = rb_keep_find_locked(j->id, id)) != UINT32_MAX) rb_keep_remove_locked(k, NULL); /* this run is newer */
+        if (rb_keep_n == RB_KEEP_MAX) {
+            uint32_t old = 0;
+            for (k = 1; k < rb_keep_n; k++)
+                if (rb_keep[k].seq < rb_keep[old].seq) old = k;
+            rb_keep_remove_locked(old, NULL);
+        }
+        e.seq = ++rb_keep_seq;
+        rb_keep[rb_keep_n++] = e;
+        pthread_mutex_unlock(&rb_keep_mu);
+    }
+}
+
+void ava1_apply_rb_keep_clear(void) {
+    pthread_mutex_lock(&rb_keep_mu);
+    while (rb_keep_n) rb_keep_remove_locked(rb_keep_n - 1, NULL);
+    pthread_mutex_unlock(&rb_keep_mu);
+}
+
+/* Caller holds j->mu; job thread, when the job's map is answered (only the first time does anything): what
+ * this process kept of the job's files (see above) and is still theirs counts as read back. Returns those
+ * bytes. */
+static uint64_t rb_keep_restore(ava1_job_t *j) {
+    uint64_t bytes = 0;
+    uint32_t k, n;
+    if (j->rb_keep_looked || !j->lf) return 0;
+    j->rb_keep_looked = 1;
+    n = j->lfl_all ? j->m.n : j->lfl_n;
+    for (k = 0; k < n; k++) {
+        uint32_t id = j->lfl_all ? k : j->lfl[k], at;
+        ava1_lfile_t *lf = j->lf[id];
+        uint64_t size = j->m.e[id].size;
+        rb_ident_t part, ob;
+        rb_keep_t e;
+        size_t a = 0, b = 0;
+        pthread_mutex_lock(&rb_keep_mu);
+        at = rb_keep_find_locked(j->id, id);
+        if (at != UINT32_MAX) rb_keep_remove_locked(at, &e);
+        pthread_mutex_unlock(&rb_keep_mu);
+        if (at == UINT32_MAX) continue;
+        if (!lf || e.size != size || lf->rb_done.n || lf->committed || lf->committing || lf->rb_busy ||
+            ava1_bits_get(&j->done, id) || rb_idents(j, id, &part, &ob) != 0 || memcmp(&part, &e.part, sizeof part) != 0 ||
+            memcmp(&ob, &e.ob, sizeof ob) != 0) {
+            ava1_rset_clear(&e.done);
+            continue;
+        }
+        /* rb_done = kept ∩ durable, in whole groups (the last one may end at the file's end) */
+        while (a < e.done.n && b < lf->durable.n) {
+            uint64_t ea = e.done.v[2 * a], eb = e.done.v[2 * a + 1], da = lf->durable.v[2 * b], db = lf->durable.v[2 * b + 1];
+            uint64_t lo = ea > da ? ea : da, hi = eb < db ? eb : db;
+            lo = (lo + AVA1_GROUP_LEN - 1) / AVA1_GROUP_LEN * AVA1_GROUP_LEN;
+            if (hi > size) hi = size;
+            if (hi < size) hi = hi / AVA1_GROUP_LEN * AVA1_GROUP_LEN;
+            if (lo < hi && ava1_rset_add(&lf->rb_done, lo, hi) == 0) bytes += hi - lo; /* out of memory: read again */
+            if (eb < db) a++;
+            else b++;
+        }
+        ava1_rset_clear(&e.done);
+    }
+    return bytes;
+}
+
+/* Caller holds j->mu. JF_READBACK: bytes of the job's unfinished large files not yet read back (live, kept
+ * from an earlier run, or by the commit's read-back so far): Status `readback_left` (SPEC.md §13.5). A file of
+ * one group is not read back; a file no chunk has reached yet is not counted. */
+static uint64_t rb_bytes_left(const ava1_job_t *j) {
+    uint64_t left = 0;
+    uint32_t k, n;
+    if (!j->lf || !j->prepared) return 0;
+    n = j->lfl_all ? j->m.n : j->lfl_n;
+    for (k = 0; k < n; k++) {
+        uint32_t id = j->lfl_all ? k : j->lfl[k];
+        const ava1_lfile_t *lf = j->lf[id];
+        uint64_t size = j->m.e[id].size, have;
+        if (!lf || lf->committed || ava1_bits_get(&j->done, id) || groups_of(size) < 2) continue;
+        have = ava1_rset_covered(&lf->rb_done) + __atomic_load_n(&lf->rb_cread, __ATOMIC_RELAXED);
+        if (have < size) left += size - have;
+    }
+    return left;
+}
+
 /* Caller holds j->mu. Hands what file `id` holds durable and nobody has read back (nor is to: rb_todo) to the
  * live read-back; returns those bytes. */
 static uint64_t rb_hand_over(ava1_job_t *j, uint32_t id) {
@@ -3325,11 +3512,12 @@ static uint64_t rb_hand_over(ava1_job_t *j, uint32_t id) {
  * number of times: a range read back, waiting to be, or being read is not handed over again. A job taken up
  * a second time starts from nothing read back (the journal records what is durable, not what was read). */
 void ava1_apply_readback_resumed(ava1_job_t *j) {
-    uint64_t bytes = 0;
+    uint64_t bytes = 0, kept = 0;
     uint32_t k, files = 0;
     pthread_mutex_lock(&j->mu);
     if (j->readback && j->lf && j->prepared && !j->finished && !j->final_status && !j->stopping) {
         uint32_t n = j->lfl_all ? j->m.n : j->lfl_n;
+        kept = rb_keep_restore(j);
         for (k = 0; k < n; k++) {
             uint64_t got = rb_hand_over(j, j->lfl_all ? k : j->lfl[k]);
             bytes += got;
@@ -3337,6 +3525,9 @@ void ava1_apply_readback_resumed(ava1_job_t *j) {
         }
     }
     pthread_mutex_unlock(&j->mu);
+    if (kept)
+        fprintf(stderr, "[ava1] job %02x%02x%02x%02x: read-back: %llu MiB read back by an earlier run are not read again\n",
+                j->id[0], j->id[1], j->id[2], j->id[3], (unsigned long long)(kept >> 20));
     if (bytes)
         fprintf(stderr,
                 "[ava1] job %02x%02x%02x%02x: read-back: %llu MiB of %u files, durable before, are read back while the rest "
@@ -3359,6 +3550,7 @@ typedef struct {
     uint64_t size;
     int fd, rfd, ob_fd;  /* rfd: what reads (O_DIRECT, or fd); see rb_check */
     int *quit;           /* shared: set when a stripe has the answer (a mismatch or an error) */
+    uint64_t *count;     /* shared: bytes read and found right (the file's rb_cread) */
     uint64_t bad;
     int rc;
 } rb_stripe_t;
@@ -3374,7 +3566,8 @@ static int readback_stripe(rb_stripe_t *s) {
         uint64_t n = s->sp[k].g1 - s->sp[k].g0, lo = s->from > at ? s->from - at : 0, hi = s->to - at < n ? s->to - at : n;
         if (lo < hi) {
             uint64_t b0 = (s->sp[k].g0 + lo) * AVA1_GROUP_LEN, b1 = (s->sp[k].g0 + hi) * AVA1_GROUP_LEN;
-            rc = rb_check(s->j, s->id, s->rfd, s->fd, s->ob_fd, b0, b1 < s->size ? b1 : s->size, buf, s->quit, 0, &s->bad);
+            rc = rb_check(s->j, s->id, s->rfd, s->fd, s->ob_fd, b0, b1 < s->size ? b1 : s->size, buf, s->quit, 0, &s->bad,
+                          s->count);
         }
         at += n;
     }
@@ -3393,7 +3586,7 @@ static void *readback_stripe_main(void *arg) {
  * what was sent; 1 = it does not (*bad = the first group found wrong); -errno = it could not be read;
  * -EINTR = the job is ending. */
 static int readback_large(ava1_job_t *j, uint32_t id, int fd, int rfd, int ob_fd, const rb_span_t *sp, uint32_t nsp, uint64_t total,
-                          uint64_t *bad) {
+                          uint64_t *count, uint64_t *bad) {
     uint64_t size = j->m.e[id].size, per;
     rb_stripe_t s[READBACK_STRIPES];
     pthread_t th[READBACK_STRIPES];
@@ -3429,6 +3622,7 @@ static int readback_large(ava1_job_t *j, uint32_t id, int fd, int rfd, int ob_fd
         s[k].rfd = rfd;
         s[k].ob_fd = ob_fd;
         s[k].quit = &quit;
+        s[k].count = count;
         s[k].bad = 0;
         s[k].rc = 0;
     }
@@ -3558,6 +3752,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         pthread_mutex_lock(&j->mu);
         /* Its live read-backs in flight end first (no new one starts: `committing` is set). */
         while (lf->rb_busy && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+        __atomic_store_n(&lf->rb_cread, 0, __ATOMIC_RELAXED);
         found = lf->rb_found;
         bad = lf->rb_found_g;
         if (j->stopping) rb = -EINTR;
@@ -3566,7 +3761,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         if (found) rb = 1;
         else if (!rb && total) {
             int rfd = rb_open_direct(j, id); /* one for every stripe: pread shares it */
-            rb = readback_large(j, id, lf->fd, rfd >= 0 ? rfd : lf->fd, lf->ob_fd, sp, nsp, total, &bad);
+            rb = readback_large(j, id, lf->fd, rfd >= 0 ? rfd : lf->fd, lf->ob_fd, sp, nsp, total, &lf->rb_cread, &bad);
             if (rfd >= 0) close(rfd);
         }
         free(sp);
@@ -3575,6 +3770,7 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
         if (rb == -EINTR) { /* the job is ending: a resume commits (and reads back) the file again */
             pthread_mutex_lock(&j->mu);
             lf->committing = 0;
+            __atomic_store_n(&lf->rb_cread, 0, __ATOMIC_RELAXED);
             pthread_mutex_unlock(&j->mu);
             return;
         }
