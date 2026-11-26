@@ -3,6 +3,38 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
+## Unreleased
+
+Fixes from an audit of what a peer can make a node do. The wire format and what is written on disk do
+not change; a correct peer sees no difference.
+
+C library:
+
+- A FileRoot that arrives while a new manifest of the same job is being taken up waits for it. Before,
+  it could be written into a large-file state the job thread had just freed (a use-after-free).
+- A download `JobOpen` starts over only a download of its id, and only this device's or one no session
+  drives. Before, it freed whatever job had the id: another device's upload, a copy, a send to another
+  console. Another kind of job under the id is refused with `ERR_PROTOCOL`, another device's running
+  download with `ERR_UNKNOWN_JOB`.
+- An upload whose commit or end failed on an I/O error (a rename, a folder sync) resumes from its
+  journal. Before, the journaled `Done(ERR_IO)` answered every later `JobOpen` with "all done" and the
+  same failure. Only `OK`, `ERR_EXISTS` and `ERR_CROSS_DEVICE` end a job for good, as for a job still in
+  memory; journals written by older versions resume the same way.
+- A sender's `JobMap` is read against the manifest: each done file once, durable ranges inside a file
+  and no more of them than it has groups. A map that names more ends the job with `ERR_PROTOCOL`
+  (before, the pages were stored as they came).
+- A FileRoot, ManifestEnd or Resume waiting in a job's inbox is kept at its own size, not as the 64 KiB
+  frame it may come in.
+- The download sender uses at most 64 MiB of window, whatever it is granted (its frames in flight stay
+  in memory until their `Received`).
+- A device blocked by the `refused` hook stays blocked when its ClientInfo carries a token: only a
+  ticket this node holds for the key skips the device rules.
+
+Rust sender:
+
+- `Need::add_page_bounded` reads a map against the job's manifest, and the sender uses it; a `Durable`
+  naming files past the manifest ends the job with a protocol error. `RangeSet::len` and `is_empty`.
+
 ## 1.0.12
 
 Read-back progress, and no second read-back of a resumed file in the same process. The wire format gains one

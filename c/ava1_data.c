@@ -826,7 +826,7 @@ static void *feed_main(void *arg) {
     return NULL;
 }
 
-/* A FileRoot, ManifestEnd or Resume has a fixed size, but a frame may carry up to 16 MiB: what
+/* A FileRoot, ManifestEnd or Resume has a fixed size, but its control frame may be 64 KiB: what
  * waits in an inbox is the message re-encoded (unknown ext fields dropped, as the decoder drops
  * them), not the frame. One that does not decode is kept empty: it fails to decode again where
  * it is taken, as before. Other frames are kept as they came. */
