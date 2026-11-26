@@ -120,7 +120,8 @@ extern size_t ava1_test_pwrite_max;
 extern uint32_t ava1_test_chunk_delay_ms;
 extern void (*ava1_apply_hook)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): an errno to inject at a point instead of doing the work.
- * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename. */
+ * Consulted at AVA1_HOOK_DIR_SYNCED of the staged tree's rename and at AVA1_HOOK_RENAMED of a large
+ * file's rename into place (before it). */
 extern int (*ava1_apply_fault)(ava1_job_t *j, int point, uint32_t id);
 /* Tests only (NULL in the payload): JF_READBACK is about to read bytes [off, off + len) of file `id` back
  * through `fd` (its own descriptor, opened for writing too), `live` while the file still arrives, else in

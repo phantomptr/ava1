@@ -301,6 +301,13 @@ static void drop_state(ava1_job_t *j) {
     j->have_manifest = j->replay_done = j->staged = j->dest_held = 0;
 }
 
+/* The statuses that end a job for good, as for one still in memory (ava1_recv_open): done, or a
+ * destination the job must not touch. Any other (an I/O failure at a commit or at the end) is
+ * where its last run stopped, and a JobOpen takes it up again from its journal. */
+static int done_is_final(uint16_t status) {
+    return status == AVA1_STATUS_OK || status == AVA1_ERR_EXISTS || status == AVA1_ERR_CROSS_DEVICE;
+}
+
 /* Loads <dir>/manifest and replays <dir>/journal. 0 when a usable earlier job was found:
  * the journal opens for this job and root, and was written for exactly this manifest. */
 static int load_from_disk(ava1_job_t *j) {
@@ -327,6 +334,10 @@ static int load_from_disk(ava1_job_t *j) {
         return -1;
     }
     j->have_manifest = 1;
+    /* A journaled Done(ERR_IO) is not an answer: the map is the replayed state, and the commit or
+     * rename that failed runs again (reconcile finds a file whose rename went through). Before, a
+     * resume was told every file was done and got the same failure, every time. */
+    if (j->replay_done && !done_is_final(j->replay_status)) j->replay_done = 0;
     /* Durable-by-log recovery (§4): the files the journal calls done but not yet swept are made again from
      * the pack log where a crash lost them, and swept, before anything is counted or answered. */
     refs_prune(&r);

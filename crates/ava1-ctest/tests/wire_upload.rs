@@ -888,6 +888,76 @@ async fn a_download_open_never_ends_another_job_under_its_id() {
     }
 }
 
+/// Every byte of file 0 (`big`) on `tx`, then its FileRoot.
+async fn send_big(link: &JobLink, tx: &ava1::router::ConnTx, job: [u8; 16], seq0: u32, big: &[u8]) {
+    let mut seq = seq0;
+    let mut off = 0;
+    while off < big.len() {
+        let end = (off + (1 << 20)).min(big.len());
+        tx.send_raw(Chunk::TYPE, 0, seq, chunk(job, 0, off, &big[off..end]))
+            .await
+            .unwrap();
+        seq += 1;
+        off = end;
+    }
+    link.control
+        .send(&FileRoot {
+            job_id: job,
+            file_id: 0,
+            root: *blake3::hash(big).as_bytes(),
+        })
+        .await
+        .unwrap();
+}
+
+/// S3: a commit that fails on a transient I/O error (here its rename into place) ends the job
+/// with ERR_IO, and a JobOpen of the same job takes it up again: the commit runs again and the
+/// job finishes. Pre-fix the journaled Done(ERR_IO) answered every resume with "all done" and the
+/// same failure, so the upload could never finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_that_failed_on_io_is_taken_up_again_by_a_reopen() {
+    let d = dir("wire-commit-io");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let job = [0x59u8; 16];
+    let big = big_data((2 << 20) + 3);
+    let m = Manifest {
+        entries: vec![file("big", big.len() as u64)],
+    };
+    let root = d.join("dest");
+    std::fs::create_dir_all(&root).unwrap(); // a merge: each large file is renamed into place
+    srv.knob("rename_fail", 1); // file 0's next rename into place answers EBUSY
+    {
+        let s = session(&srv, &ids).await;
+        let mut link = s.job(job);
+        assert_eq!(open(&mut link, job, &root).await.status, 0);
+        send_manifest(&link, job, &m).await;
+        let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+        assert_eq!(map.status, 0);
+        let lane = link.opener().unwrap().open().await.unwrap();
+        let tx = link.lane(lane).unwrap().tx;
+        send_big(&link, &tx, job, 1, &big).await;
+        let (_, done) = until_done(&mut link).await;
+        assert_eq!(done.status, gen::ERR_IO, "{:?}", done.message);
+    }
+    // The device tries again: the same job, a new session.
+    let s = session(&srv, &ids).await;
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &root).await.status, 0);
+    send_manifest(&link, job, &m).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    if map.done.is_empty() {
+        send_big(&link, &tx, job, 10, &big).await; // whatever the map still asks for, and the root again
+    }
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

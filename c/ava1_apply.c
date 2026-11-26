@@ -3857,8 +3857,8 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
                 return;
             }
         }
-        if (rename(part, fin) != 0) {
-            int e = errno;
+        if ((err = ava1_apply_fault ? ava1_apply_fault(j, AVA1_HOOK_RENAMED, id) : 0) != 0 || rename(part, fin) != 0) {
+            int e = err ? err : errno;
             if (in_the_way(e)) commit_fail(j, AVA1_ERR_EXISTS, "something is already where the file goes", e, 1);
             else commit_fail(j, AVA1_ERR_IO, "rename into place failed", e, 1);
             return;
