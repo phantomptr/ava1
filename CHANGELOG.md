@@ -3,7 +3,7 @@
 All notable changes to the AVA1 crates and C library. The wire format is version 1 throughout;
 see [README](README.md#versions).
 
-## Unreleased
+## 1.0.13
 
 Fixes from an audit of what a peer can make a node do. The wire format and what is written on disk do
 not change; a correct peer sees no difference.
