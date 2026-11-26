@@ -1010,6 +1010,56 @@ async fn a_map_past_the_manifest_ends_the_download() {
     .expect("the test hung");
 }
 
+/// A merge download writes a file `x` through `x.ava-part` beside it, so a source tree holding both
+/// `x` and `x.ava-part` would have the two share a file (the corruption of `x`). The Rust receiver
+/// refuses such a manifest with ERR_PATH, before its journal and stored manifest are written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_download_of_a_tree_naming_a_files_part_name_is_refused_and_writes_nothing() {
+    ava1_ctest::c_set_read_allowed(true);
+    let d = dir("dl-part-clash");
+    let src = d.join("console/tree");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("x"), vec![0x11u8; (2 << 20) + 5]).unwrap();
+    std::fs::write(src.join("x.ava-part"), b"mine").unwrap();
+    let got = d.join("got");
+    std::fs::create_dir_all(&got).unwrap(); // a merge into an existing folder
+    let (me, mine) = paired_client(&d.join("peers"));
+    let srv = CServer::start_data(
+        SECRET,
+        &d.join("peers"),
+        &d.join("jobs"),
+        200,
+        2000,
+        2000,
+        0,
+    );
+    let s = connect(&srv.addr(), me, mine, "rust", calm())
+        .await
+        .unwrap();
+    let job = [0x6e; 16];
+    let mut link = s.job(job);
+    let sink = Arc::new(LocalSink::new(got.clone(), false));
+    let r = download(
+        &mut link,
+        src.to_str().unwrap(),
+        0,
+        sink,
+        ro(&d.join("ejobs"), false),
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(ava1::send::SendError::Refused { status, .. }) if *status == gen::ERR_PATH),
+        "{r:?}"
+    );
+    let jdir = ava1::journal::job_dir(&d.join("ejobs"), &job);
+    assert!(!jdir.join("manifest").exists(), "the manifest was stored");
+    assert!(!jdir.join("journal").exists(), "the journal was written");
+    assert!(
+        std::fs::read_dir(&got).unwrap().next().is_none(),
+        "something was written"
+    );
+}
+
 /// A read policy is a prefix check on the path it is given, so a source with a `..` component
 /// (or a relative one) could name a folder the policy never allowed. Downloads and
 /// console-to-console sends take the upload's rule: an absolute path with no `.`, `..` or empty

@@ -43,6 +43,38 @@ pub enum PathError {
     TooMany,
 }
 
+/// What a merge receiver appends to a file's path for its part file (SPEC.md §11.6).
+pub const PART_SUFFIX: &str = ".ava-part";
+
+/// In a merge (SPEC.md §11.6) a file `P` is written as `P.ava-part` beside it, so a manifest that
+/// also names `P.ava-part` (in any letter case: a drive may fold it) would have the two share a
+/// name: one's bytes would land in the other. Returns the first such pair as (the file, the entry
+/// at its part name), or `None`. Costs one pass, and a set only as large as the entries whose name
+/// ends in the suffix.
+pub fn part_name_clash(m: &Manifest) -> Option<(u32, u32)> {
+    let n = PART_SUFFIX.len();
+    let parts: std::collections::HashMap<String, u32> = m
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.path.len() > n
+                && e.path.is_char_boundary(e.path.len() - n)
+                && e.path[e.path.len() - n..].eq_ignore_ascii_case(PART_SUFFIX)
+        })
+        .map(|(i, e)| (e.path[..e.path.len() - n].to_ascii_lowercase(), i as u32))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    m.entries.iter().enumerate().find_map(|(i, e)| {
+        (e.kind == ENTRY_FILE)
+            .then(|| parts.get(&e.path.to_ascii_lowercase()))
+            .flatten()
+            .map(|&q| (i as u32, q))
+    })
+}
+
 /// Checks `p` against the manifest path rules of SPEC.md §11.2; a receiver runs it on
 /// every path before touching the filesystem.
 pub fn check_path(p: &str) -> Result<(), PathError> {
@@ -286,6 +318,42 @@ pub fn single(src: &dyn Source, rel: &str) -> io::Result<Manifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_files_part_name_in_the_same_manifest_is_found_in_any_case() {
+        let e = |kind, path: &str| Entry {
+            kind,
+            mode: 0o644,
+            size: 1,
+            mtime: 1,
+            path: path.into(),
+            root: None,
+        };
+        let m = |es: Vec<Entry>| Manifest { entries: es };
+        assert_eq!(
+            part_name_clash(&m(vec![e(ENTRY_FILE, "a"), e(ENTRY_FILE, "b")])),
+            None
+        );
+        assert_eq!(
+            part_name_clash(&m(vec![
+                e(ENTRY_FILE, "d/x.ava-part"),
+                e(ENTRY_FILE, "d/x")
+            ])),
+            Some((1, 0))
+        );
+        assert_eq!(
+            part_name_clash(&m(vec![e(ENTRY_FILE, "x"), e(ENTRY_DIR, "X.AVA-PART")])),
+            Some((0, 1))
+        );
+        // A folder has no part file; a bare ".ava-part" names no file's part.
+        assert_eq!(
+            part_name_clash(&m(vec![e(ENTRY_DIR, "x"), e(ENTRY_FILE, "x.ava-part")])),
+            None
+        );
+        assert_eq!(part_name_clash(&m(vec![e(ENTRY_FILE, ".ava-part")])), None);
+        // Not UTF-8 safe to slice blindly: a multi-byte name ending just short of the suffix.
+        assert_eq!(part_name_clash(&m(vec![e(ENTRY_FILE, "éava-part")])), None);
+    }
     use crate::source::LocalSource;
 
     fn e(path: &str, size: u64) -> Entry {

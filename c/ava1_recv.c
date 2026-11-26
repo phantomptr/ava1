@@ -1446,6 +1446,24 @@ static void recv_events_take(ava1_job_t *j) {
         emit_map(j, AVA1_ERR_PROTOCOL, "the manifest does not match its end");
         return;
     }
+    /* A merge writes each file through `<path>.ava-part` beside it: an entry of that name would share
+     * it with the file's part, and either one's bytes would land in the other. Refused before the
+     * manifest is stored or journaled (and for one an earlier version stored: it is checked again). */
+    if (!j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
+        uint32_t pf, pe;
+        int c = ava1_mstore_part_clash(&in, &pf, &pe);
+        if (c != 0) {
+            if (c > 0)
+                snprintf(msg, sizeof msg, "%.60s is the name %.60s is written under until it is complete",
+                         ava1_mstore_path(&in, pe), ava1_mstore_path(&in, pf));
+            else snprintf(msg, sizeof msg, "out of memory");
+            ava1_mstore_free(&in);
+            st = c > 0 ? AVA1_ERR_PATH : AVA1_ERR_INTERNAL;
+            emit_map(j, st, msg);
+            ava1_apply_fail(j, st, msg, 0, 0);
+            return;
+        }
+    }
     if (j->have_manifest && memcmp(hash, j->manifest_hash, 32) == 0) {
         ava1_mstore_free(&in); /* the same manifest: the replayed state stands */
     } else {

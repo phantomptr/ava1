@@ -669,7 +669,10 @@ grant; the sender's window is exactly that number either way. Tests: `crates/ava
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
 checked; a device that cannot be read is refused with `ERR_IO`, never taken as the same). When the root exists, files are written in place; large files through
-`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. A staging
+`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. So a
+merge refuses, with `ERR_PATH`, a manifest that names both a file `P` and `P.ava-part` (in any letter
+case: a drive may fold it), since the two would share one name; it refuses it before the manifest is
+stored or journaled. A staged job, which writes each file under its own name, takes it. A staging
 receiver takes `<root>` with `mkdir` before it journals the job (an existing `<root>` then
 refuses it, `ERR_EXISTS`) and records that in `JnlOpen.staged` bit 1, so on resume the empty
 `<root>` is its own; the final rename replaces only that empty folder (not empty: `ERR_EXISTS`).

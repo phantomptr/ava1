@@ -1017,6 +1017,54 @@ async fn file_roots_with_huge_extensions_waiting_for_the_map_are_kept_small() {
     assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
 }
 
+/// A merge writes a file `x` through `x.ava-part` beside it: a manifest that also names `x.ava-part`
+/// (in any case) is refused with ERR_PATH before it is stored or journaled. Pre-fix it was taken,
+/// and `x`'s part file and the entry `x.ava-part` were one file. A staged upload has no such
+/// names and takes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_manifest_naming_a_files_part_name_is_refused_before_it_is_stored() {
+    let d = dir("wire-part-clash");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let root = d.join("dest");
+    std::fs::create_dir_all(&root).unwrap(); // a merge
+    for (k, part) in ["x.ava-part", "X.AVA-Part"].into_iter().enumerate() {
+        let job = [0x50 + k as u8; 16];
+        let m = Manifest {
+            entries: vec![file("x", 2 << 20), file(part, 2)],
+        };
+        let mut link = s.job(job);
+        assert_eq!(open(&mut link, job, &root).await.status, 0);
+        send_manifest(&link, job, &m).await;
+        let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+        assert_eq!(map.status, gen::ERR_PATH, "{part}: {:?}", map.message);
+        let jdir = d.join("jobs").join(ava1::hex::encode(&job));
+        assert!(
+            !jdir.join("manifest").exists(),
+            "{part}: the manifest was stored"
+        );
+        assert!(
+            !root.join("x.ava-part").exists(),
+            "{part}: a part file was made"
+        );
+    }
+    // Staged (a new destination): the part file is the file's own path in the staging tree.
+    let job = [0x4f; 16];
+    let m = Manifest {
+        entries: vec![file("x", 2 << 20), file("x.ava-part", 2)],
+    };
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &d.join("fresh")).await.status, 0);
+    send_manifest(&link, job, &m).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    // (and the job directory checked above is where a manifest is stored)
+    let jdir = d.join("jobs").join(ava1::hex::encode(&job));
+    assert!(jdir.join("manifest").exists());
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

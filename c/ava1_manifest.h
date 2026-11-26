@@ -59,5 +59,9 @@ int ava1_mstore_walk_deny(ava1_mstore_t *m, const char *root, unsigned flags, in
 int ava1_open_read_safe(const char *path, int (*deny)(const char *abs));
 int ava1_mstore_single(ava1_mstore_t *m, const char *file); /* JF_SINGLE_FILE */
 void ava1_mstore_free(ava1_mstore_t *m);
+/* In a merge (SPEC.md §11.6) a file `P` is written as `P.ava-part` beside it, so a manifest that
+ * also names `P.ava-part` (in any letter case: a drive may fold it) would have the two share a name.
+ * 1 with the file's id and the clashing entry's id, 0 when there is none, -1 out of memory. */
+int ava1_mstore_part_clash(const ava1_mstore_t *m, uint32_t *file, uint32_t *entry);
 
 #endif

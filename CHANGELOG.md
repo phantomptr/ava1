@@ -29,9 +29,16 @@ C library:
   in memory until their `Received`).
 - A device blocked by the `refused` hook stays blocked when its ClientInfo carries a token: only a
   ticket this node holds for the key skips the device rules.
+- A merge refuses (`ERR_PATH`) a manifest that names both a file `P` and `P.ava-part` in any letter
+  case: `P` is written through `P.ava-part`, so the two shared one file. Refused before the manifest is
+  stored or journaled. `ava1_mstore_part_clash`.
 
 Rust sender:
 
+- The receiver (`LocalSink`) refuses the same `P` + `P.ava-part` manifest in a merge, and runs the
+  manifest checks that need no disk (`Sink::check`, new, default none) before it writes the job's
+  journal and stored manifest. Before, a merge download of such a tree reported success with the two
+  files mixed, and a refused manifest was journaled first. `manifest::part_name_clash`, `PART_SUFFIX`.
 - `Need::add_page_bounded` reads a map against the job's manifest, and the sender uses it; a `Durable`
   naming files past the manifest ends the job with a protocol error. `RangeSet::len` and `is_empty`.
 
