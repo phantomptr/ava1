@@ -145,6 +145,25 @@ size_t ava1_test_sizeof_pairlimit(void) { return sizeof(ava1_pairlimit_t); }
 
 size_t ava1_test_sizeof_opts(void) { return sizeof(ava1_test_opts_t); }
 
+/* The key the server's `refused` hook blocks (ava1_test_refuse_key; all zero: none, which no
+ * peer's public key is). */
+static uint8_t g_refused_key[32];
+static pthread_mutex_t g_refused_mu = PTHREAD_MUTEX_INITIALIZER;
+static int t_refused(const uint8_t key[32]) {
+    static const uint8_t zero[32];
+    int r;
+    pthread_mutex_lock(&g_refused_mu);
+    r = memcmp(g_refused_key, zero, 32) != 0 && memcmp(g_refused_key, key, 32) == 0;
+    pthread_mutex_unlock(&g_refused_mu);
+    return r;
+}
+void ava1_test_refuse_key(const uint8_t *key) {
+    pthread_mutex_lock(&g_refused_mu);
+    if (key) memcpy(g_refused_key, key, 32);
+    else memset(g_refused_key, 0, 32);
+    pthread_mutex_unlock(&g_refused_mu);
+}
+
 int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, const ava1_test_opts_t *o) {
     ava1_server_cfg_t cfg;
     int rc;
@@ -181,6 +200,8 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
     cfg.on_pair_request = on_pair;
     cfg.log = on_log;
     cfg.rpc = rpc;
+    cfg.refused = t_refused;
+    ava1_test_refuse_key(NULL);
     __atomic_store_n(&g_logs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_pair_requests, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_last_code, 0, __ATOMIC_SEQ_CST);

@@ -1200,9 +1200,25 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
         (void)send_error(&k->io, AVA1_ERR_BUSY, "too many sessions");
         goto out;
     }
+    /* Another console with a ticket for one job (SPEC.md §18). Only a ticket this console holds for
+     * this key counts: a token that is none is a device like any other, under the rules below (a
+     * blocked device must not get past `refused` by sending one). The ticket decides even for a
+     * key that is also paired: a console that dials with a ticket gets the ticket's session (its
+     * one job, as the ticket's owner), never a full paired one. */
+    if (ci.has_token) {
+        pthread_mutex_lock(&mu);
+        ticket = ticket_take_locked(ns.rs, ci.token);
+        if (ticket >= 0) {
+            terms.restricted = 1;
+            memcpy(terms.r_job, tickets[ticket].job, 16);
+            memcpy(terms.r_owner, tickets[ticket].owner, 32);
+            snprintf(terms.r_root, sizeof terms.r_root, "%s", tickets[ticket].root);
+        }
+        pthread_mutex_unlock(&mu);
+    }
     /* The owner's rules for devices (admit_new / refused) decide before the pairing rules. A
-     * console with a ticket is not a device joining: its ticket decides below. */
-    if (!ci.has_token && (S.cfg.admit_new || S.cfg.refused)) {
+     * console with a ticket is not a device joining: its ticket decided above. */
+    if (ticket < 0 && (S.cfg.admit_new || S.cfg.refused)) {
         int trusted, verdict = 0;
         pthread_mutex_lock(&mu);
         trusted = ava1_peers_contains(&S.peers, ns.rs);
@@ -1220,17 +1236,9 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     pthread_mutex_lock(&mu);
     known = ava1_peers_contains(&S.peers, ns.rs);
     open = now_ms() < S.pairing_until_ms;
-    /* Another console with a ticket for one job (SPEC.md §18). The ticket decides even for a key
-     * that is also paired: a console that dials with a ticket gets the ticket's session (its one
-     * job, as the ticket's owner), never a full paired one. */
-    if (ci.has_token) ticket = ticket_take_locked(ns.rs, ci.token);
     if (ticket >= 0) {
         known = 1;
         open = 0;
-        terms.restricted = 1;
-        memcpy(terms.r_job, tickets[ticket].job, 16);
-        memcpy(terms.r_owner, tickets[ticket].owner, 32);
-        snprintf(terms.r_root, sizeof terms.r_root, "%s", tickets[ticket].root);
     }
     /* Message 3 has just proved the client holds ns.rs: any session that key still has
      * is replaced, before the limits below. */
