@@ -1454,7 +1454,7 @@ static void recv_events_take(ava1_job_t *j) {
         int c = ava1_mstore_part_clash(&in, &pf, &pe);
         if (c != 0) {
             if (c > 0)
-                snprintf(msg, sizeof msg, "%.60s is the name %.60s is written under until it is complete",
+                snprintf(msg, sizeof msg, "%.48s is the name %.48s is written under until it is complete",
                          ava1_mstore_path(&in, pe), ava1_mstore_path(&in, pf));
             else snprintf(msg, sizeof msg, "out of memory");
             ava1_mstore_free(&in);
