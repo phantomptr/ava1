@@ -301,6 +301,13 @@ static void drop_state(ava1_job_t *j) {
     j->have_manifest = j->replay_done = j->staged = j->dest_held = 0;
 }
 
+/* The statuses that end a job for good, as for one still in memory (ava1_recv_open): done, or a
+ * destination the job must not touch. Any other (an I/O failure at a commit or at the end) is
+ * where its last run stopped, and a JobOpen takes it up again from its journal. */
+static int done_is_final(uint16_t status) {
+    return status == AVA1_STATUS_OK || status == AVA1_ERR_EXISTS || status == AVA1_ERR_CROSS_DEVICE;
+}
+
 /* Loads <dir>/manifest and replays <dir>/journal. 0 when a usable earlier job was found:
  * the journal opens for this job and root, and was written for exactly this manifest. */
 static int load_from_disk(ava1_job_t *j) {
@@ -327,6 +334,10 @@ static int load_from_disk(ava1_job_t *j) {
         return -1;
     }
     j->have_manifest = 1;
+    /* A journaled Done(ERR_IO) is not an answer: the map is the replayed state, and the commit or
+     * rename that failed runs again (reconcile finds a file whose rename went through). Before, a
+     * resume was told every file was done and got the same failure, every time. */
+    if (j->replay_done && !done_is_final(j->replay_status)) j->replay_done = 0;
     /* Durable-by-log recovery (§4): the files the journal calls done but not yet swept are made again from
      * the pack log where a crash lost them, and swept, before anything is counted or answered. */
     refs_prune(&r);
@@ -624,6 +635,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         ava1_mstore_free(&j->m_in);
         if (s->entries) (void)ava1_mstore_reserve(&j->m_in, s->entries);
         j->ev_end = j->ev_resume = 0;
+        pthread_cond_broadcast(&j->cv); /* a FileRoot waiting for that ManifestEnd (ava1_apply_root) */
         /* The new sender starts from what is free now. Credit freed while detached is
          * already counted here, so it must not also be flushed as a Credit message. */
         ack->credit = j->credit > j->outstanding ? j->credit - j->outstanding : 0;
@@ -832,12 +844,17 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
             drop_path(p, 1, d, &nd);
         }
     }
-    /* Second step of the outboard renames; drop the outboards nobody carried. */
+    /* Second step of the outboard renames; drop the outboards nobody carried. The states freed
+     * here are only safe to free because nothing else touches j->lf while the job thread
+     * re-prepares: the feeder hands no lane frame over (feed_hold) and a FileRoot waits for the
+     * new manifest (ava1_apply_root). */
     for (i = 0; i < j->m.n; i++) {
         snprintf(a, sizeof a, "%s/%u.ob", j->dir, i);
         (void)unlink(a);
         free_lf(j, i, j->lf[i]);
+        j->lf[i] = NULL;
     }
+    if (ava1_data_test_remap_delay_ms) ava1_platform_sleep_ms(ava1_data_test_remap_delay_ms);
     for (i = 0; i < in->n; i++)
         if (nlf[i]) {
             snprintf(a, sizeof a, "%s/%u.ob.m", j->dir, i);
@@ -1378,7 +1395,19 @@ static uint16_t adopt(ava1_job_t *j, ava1_mstore_t *in, const uint8_t hash[32], 
     return AVA1_STATUS_OK;
 }
 
+static void recv_events_take(ava1_job_t *j);
+
+/* `adopting` covers a ManifestEnd from the moment it is taken until its map is out: a FileRoot
+ * that follows it names the new manifest's ids, and remap frees the old large-file states. */
 static void recv_events(ava1_job_t *j) {
+    recv_events_take(j);
+    pthread_mutex_lock(&j->mu);
+    j->adopting = 0;
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void recv_events_take(ava1_job_t *j) {
     int end, res;
     ava1_mstore_t in;
     uint32_t efiles;
@@ -1390,6 +1419,7 @@ static void recv_events(ava1_job_t *j) {
     end = j->ev_end;
     res = j->ev_resume;
     j->ev_end = j->ev_resume = 0;
+    if (end) j->adopting = 1;
     in = j->m_in;
     memset(&j->m_in, 0, sizeof j->m_in);
     efiles = j->end_files;
@@ -1415,6 +1445,24 @@ static void recv_events(ava1_job_t *j) {
         ava1_mstore_free(&in);
         emit_map(j, AVA1_ERR_PROTOCOL, "the manifest does not match its end");
         return;
+    }
+    /* A merge writes each file through `<path>.ava-part` beside it: an entry of that name would share
+     * it with the file's part, and either one's bytes would land in the other. Refused before the
+     * manifest is stored or journaled (and for one an earlier version stored: it is checked again). */
+    if (!j->staged && !(j->flags & AVA1_JF_SINGLE_FILE)) {
+        uint32_t pf, pe;
+        int c = ava1_mstore_part_clash(&in, &pf, &pe);
+        if (c != 0) {
+            if (c > 0)
+                snprintf(msg, sizeof msg, "%.48s is the name %.48s is written under until it is complete",
+                         ava1_mstore_path(&in, pe), ava1_mstore_path(&in, pf));
+            else snprintf(msg, sizeof msg, "out of memory");
+            ava1_mstore_free(&in);
+            st = c > 0 ? AVA1_ERR_PATH : AVA1_ERR_INTERNAL;
+            emit_map(j, st, msg);
+            ava1_apply_fail(j, st, msg, 0, 0);
+            return;
+        }
     }
     if (j->have_manifest && memcmp(hash, j->manifest_hash, 32) == 0) {
         ava1_mstore_free(&in); /* the same manifest: the replayed state stands */

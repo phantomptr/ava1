@@ -31,6 +31,12 @@ use crate::wire::FrameMessage;
 pub trait Sink: Send + Sync {
     /// Called once with the manifest, before any data (create directories, decide staging).
     fn prepare(&self, m: &Manifest) -> io::Result<()>;
+    /// The checks of `m` that need nothing from the disk, run before anything of the job is
+    /// written (its journal and stored manifest included): a manifest this sink refuses leaves
+    /// no trace. `prepare` runs them again. The default refuses nothing.
+    fn check(&self, _m: &Manifest) -> io::Result<()> {
+        Ok(())
+    }
     /// Bytes of a large file at `off` (group-aligned, whole groups unless it ends the file).
     fn write_at(&self, id: u32, off: u64, data: &[u8]) -> io::Result<()>;
     /// A whole small file (its root was checked when it arrived).
@@ -624,18 +630,36 @@ fn sync_dirs(_dirs: &BTreeSet<PathBuf>) -> io::Result<()> {
 }
 
 impl Sink for LocalSink {
+    fn check(&self, m: &Manifest) -> io::Result<()> {
+        if self.single {
+            return Ok(());
+        }
+        for e in &m.entries {
+            if !plain_relative(&e.path) {
+                return Err(path_refused(format!(
+                    "{:.100} is not a plain relative path here",
+                    e.path
+                )));
+            }
+        }
+        // A merge writes each file through `<path>.ava-part` beside it (`path`): an entry of that
+        // name would share it with the file's part, and either one's bytes would land in the other.
+        if self.merging() {
+            if let Some((f, q)) = manifest::part_name_clash(m) {
+                return Err(path_refused(format!(
+                    "{:.100} is the name {:.100} is written under until it is complete",
+                    m.entries[q as usize].path, m.entries[f as usize].path
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare(&self, m: &Manifest) -> io::Result<()> {
+        self.check(m)?;
         let mut st = self.st.lock().unwrap();
         st.m = Some(Arc::new(m.clone()));
         if !self.single {
-            for e in &m.entries {
-                if !plain_relative(&e.path) {
-                    return Err(path_refused(format!(
-                        "{:.100} is not a plain relative path here",
-                        e.path
-                    )));
-                }
-            }
             let base = self.base();
             // A merge into an existing folder (SPEC.md §15.5): a manifest folder, or a file's
             // parent folder, that already exists as a symlink or as something other than a
@@ -1727,6 +1751,9 @@ async fn run_loop(
         staged: u8::from(staged),
         root: dest_root.clone(),
     };
+    // What the sink refuses of the manifest is refused before its journal and its stored copy
+    // are written: a refused job leaves nothing on disk.
+    sink.check(&m)?;
     let mut st = State::default();
     // A fresh job (no journal to replay, no relay hint) needs nothing from the sender's
     // map, so the (empty) map goes out BEFORE the journal and the sink's directories are

@@ -724,6 +724,347 @@ async fn a_lane_frame_checked_before_a_new_manifest_is_queued_before_it_replaces
     }
 }
 
+/// S1: a FileRoot that arrives while a new manifest is being adopted waits for it. Pre-fix the
+/// feeder applied it at once, into the large-file state remap had just freed (a use-after-free
+/// ASan reports; without it the root was lost and the file never committed).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_root_during_a_new_manifest_waits_for_it_and_lands_on_the_new_file() {
+    let d = dir("wire-remanifest-root");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x5du8; 16];
+    let old = big_data(2 << 20);
+    let a = Manifest {
+        entries: vec![file("a", old.len() as u64)],
+    };
+    let root = d.join("dest");
+    let mut link = s.job(job);
+    let ack = open(&mut link, job, &root).await;
+    assert_eq!(ack.status, 0);
+    send_manifest(&link, job, &a).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    // Half of "a": the job holds a large-file state for it.
+    tx.send_raw(Chunk::TYPE, 0, 1, chunk(job, 0, 0, &old[..1 << 20]))
+        .await
+        .unwrap();
+    let t = Instant::now();
+    loop {
+        if srv.job_counts(job).0 >= 1 << 20 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "the chunk never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A manifest without "a": remap frees its state, then takes its time.
+    let new = big_data((2 << 20) + 3);
+    let b = Manifest {
+        entries: vec![file("b", new.len() as u64)],
+    };
+    srv.knob("remap_delay_ms", 1000);
+    send_manifest(&link, job, &b).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    link.control
+        .send(&FileRoot {
+            job_id: job,
+            file_id: 0,
+            root: *blake3::hash(&new).as_bytes(),
+        })
+        .await
+        .unwrap();
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    srv.knob("remap_delay_ms", 0);
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    // The root was kept for "b" (file 0 of the new manifest): its bytes alone finish the job.
+    tx.send_raw(Chunk::TYPE, 0, 2, chunk(job, 0, 0, &new[..1 << 20]))
+        .await
+        .unwrap();
+    tx.send_raw(Chunk::TYPE, 0, 3, chunk(job, 0, 1 << 20, &new[1 << 20..]))
+        .await
+        .unwrap();
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("b")).unwrap(), new);
+}
+
+fn download_msg(job: [u8; 16], src: &Path) -> JobOpen {
+    JobOpen {
+        job_id: job,
+        kind: gen::JOB_DOWNLOAD,
+        root: src.to_str().unwrap().into(),
+        ..Default::default()
+    }
+}
+
+/// S2: a download JobOpen starts over only a download of its id, and only the device's own or
+/// one no session drives. Pre-fix it freed whatever job had the id: another device's upload or
+/// running download.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_open_never_ends_another_job_under_its_id() {
+    ava1_ctest::c_set_read_allowed(true);
+    let d = dir("wire-dl-id");
+    let peers = d.join("peers");
+    let a_ids = paired_client(&peers);
+    let b_ids = paired_client(&peers);
+    let src = d.join("console/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"data").unwrap();
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let a = session(&srv, &a_ids).await;
+    let b = session(&srv, &b_ids).await;
+
+    // A's upload, mapped and waiting for its bytes.
+    let up = [0x5bu8; 16];
+    let root = d.join("dest");
+    let mut la = a.job(up);
+    assert_eq!(open(&mut la, up, &root).await.status, 0);
+    let m = Manifest {
+        entries: vec![file("x", 2)],
+    };
+    send_manifest(&la, up, &m).await;
+    let map: JobMap = next_of(&mut la, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
+    // B opens a download under the same id: refused, and A's upload is untouched.
+    let mut lb = b.job(up);
+    lb.control.send(&download_msg(up, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_PROTOCOL, "{:?}", ack.message);
+    let lane = la.opener().unwrap().open().await.unwrap();
+    la.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 1, bundle(up, 0, b"ok"))
+        .await
+        .unwrap();
+    let (_, done) = until_done(&mut la).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("x")).unwrap(), b"ok");
+
+    // A's download, running on A's session: B cannot take it over...
+    let dl = [0x5au8; 16];
+    let mut la = a.job(dl);
+    la.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut la, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, 0, "{:?}", ack.message);
+    let mut lb = b.job(dl);
+    lb.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_UNKNOWN_JOB, "{:?}", ack.message);
+    drop(lb);
+    // ... A itself starts it over from another session (a reconnect)...
+    let a2 = session(&srv, &a_ids).await;
+    let mut la2 = a2.job(dl);
+    la2.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut la2, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, 0, "{:?}", ack.message);
+    // ... and once no session drives it, B may take it over.
+    drop(la2);
+    drop(a2);
+    let t = Instant::now();
+    loop {
+        let mut lb = b.job(dl);
+        lb.control.send(&download_msg(dl, &src)).await.unwrap();
+        let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+        if ack.status == 0 {
+            break;
+        }
+        assert!(
+            ack.status == gen::ERR_UNKNOWN_JOB || ack.status == gen::ERR_BUSY,
+            "{} {:?}",
+            ack.status,
+            ack.message
+        );
+        assert!(t.elapsed() < Duration::from_secs(20), "never parked");
+        drop(lb);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Every byte of file 0 (`big`) on `tx`, then its FileRoot.
+async fn send_big(link: &JobLink, tx: &ava1::router::ConnTx, job: [u8; 16], seq0: u32, big: &[u8]) {
+    let mut seq = seq0;
+    let mut off = 0;
+    while off < big.len() {
+        let end = (off + (1 << 20)).min(big.len());
+        tx.send_raw(Chunk::TYPE, 0, seq, chunk(job, 0, off, &big[off..end]))
+            .await
+            .unwrap();
+        seq += 1;
+        off = end;
+    }
+    link.control
+        .send(&FileRoot {
+            job_id: job,
+            file_id: 0,
+            root: *blake3::hash(big).as_bytes(),
+        })
+        .await
+        .unwrap();
+}
+
+/// S3: a commit that fails on a transient I/O error (here its rename into place) ends the job
+/// with ERR_IO, and a JobOpen of the same job takes it up again: the commit runs again and the
+/// job finishes. Pre-fix the journaled Done(ERR_IO) answered every resume with "all done" and the
+/// same failure, so the upload could never finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_that_failed_on_io_is_taken_up_again_by_a_reopen() {
+    let d = dir("wire-commit-io");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let job = [0x59u8; 16];
+    let big = big_data((2 << 20) + 3);
+    let m = Manifest {
+        entries: vec![file("big", big.len() as u64)],
+    };
+    let root = d.join("dest");
+    std::fs::create_dir_all(&root).unwrap(); // a merge: each large file is renamed into place
+    srv.knob("rename_fail", 1); // file 0's next rename into place answers EBUSY
+    {
+        let s = session(&srv, &ids).await;
+        let mut link = s.job(job);
+        assert_eq!(open(&mut link, job, &root).await.status, 0);
+        send_manifest(&link, job, &m).await;
+        let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+        assert_eq!(map.status, 0);
+        let lane = link.opener().unwrap().open().await.unwrap();
+        let tx = link.lane(lane).unwrap().tx;
+        send_big(&link, &tx, job, 1, &big).await;
+        let (_, done) = until_done(&mut link).await;
+        assert_eq!(done.status, gen::ERR_IO, "{:?}", done.message);
+    }
+    // The device tries again: the same job, a new session.
+    let s = session(&srv, &ids).await;
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &root).await.status, 0);
+    send_manifest(&link, job, &m).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    if map.done.is_empty() {
+        send_big(&link, &tx, job, 10, &big).await; // whatever the map still asks for, and the root again
+    }
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
+}
+
+/// S4: a FileRoot is 52 bytes, but its control frame may carry 64 KiB of extension. Waiting for the
+/// map in the job's inbox it is kept at its own size: pre-fix 600 of 60 KiB filled the inbox (32
+/// MiB) and the job ended; now they cost 52 bytes each and the job finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_roots_with_huge_extensions_waiting_for_the_map_are_kept_small() {
+    let d = dir("wire-huge-root");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x58u8; 16];
+    let big = big_data((2 << 20) + 3);
+    let m = Manifest {
+        entries: vec![file("big", big.len() as u64)],
+    };
+    let root = d.join("dest");
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &root).await.status, 0);
+    srv.set_map_delay_ms(3000); // the FileRoots below wait in the inbox for the map
+    send_manifest(&link, job, &m).await;
+    let mut body = FileRoot {
+        job_id: job,
+        file_id: 0,
+        root: *blake3::hash(&big).as_bytes(),
+    }
+    .to_bytes()
+    .unwrap();
+    // The encoder's empty extension block, replaced by one unknown extension of 60 KiB.
+    body.truncate(body.len() - 2);
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0x7777u16.to_le_bytes());
+    body.extend_from_slice(&(60u32 << 10).to_le_bytes());
+    body.resize(body.len() + (60 << 10), 0xee);
+    for _ in 0..600 {
+        link.control
+            .send_raw(FileRoot::TYPE, 0, 0, body.clone())
+            .await
+            .unwrap();
+    }
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    srv.set_map_delay_ms(0);
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    let mut off = 0;
+    let mut seq = 1;
+    while off < big.len() {
+        let end = (off + (1 << 20)).min(big.len());
+        tx.send_raw(Chunk::TYPE, 0, seq, chunk(job, 0, off, &big[off..end]))
+            .await
+            .unwrap();
+        seq += 1;
+        off = end;
+    }
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
+}
+
+/// A merge writes a file `x` through `x.ava-part` beside it: a manifest that also names `x.ava-part`
+/// (in any case) is refused with ERR_PATH before it is stored or journaled. Pre-fix it was taken,
+/// and `x`'s part file and the entry `x.ava-part` were one file. A staged upload has no such
+/// names and takes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_manifest_naming_a_files_part_name_is_refused_before_it_is_stored() {
+    let d = dir("wire-part-clash");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let root = d.join("dest");
+    std::fs::create_dir_all(&root).unwrap(); // a merge
+    for (k, part) in ["x.ava-part", "X.AVA-Part"].into_iter().enumerate() {
+        let job = [0x50 + k as u8; 16];
+        let m = Manifest {
+            entries: vec![file("x", 2 << 20), file(part, 2)],
+        };
+        let mut link = s.job(job);
+        assert_eq!(open(&mut link, job, &root).await.status, 0);
+        send_manifest(&link, job, &m).await;
+        let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+        assert_eq!(map.status, gen::ERR_PATH, "{part}: {:?}", map.message);
+        let jdir = d.join("jobs").join(ava1::hex::encode(&job));
+        assert!(
+            !jdir.join("manifest").exists(),
+            "{part}: the manifest was stored"
+        );
+        assert!(
+            !root.join("x.ava-part").exists(),
+            "{part}: a part file was made"
+        );
+    }
+    // Staged (a new destination): the part file is the file's own path in the staging tree.
+    let job = [0x4f; 16];
+    let m = Manifest {
+        entries: vec![file("x", 2 << 20), file("x.ava-part", 2)],
+    };
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &d.join("fresh")).await.status, 0);
+    send_manifest(&link, job, &m).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    // (and the job directory checked above is where a manifest is stored)
+    let jdir = d.join("jobs").join(ava1::hex::encode(&job));
+    assert!(jdir.join("manifest").exists());
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

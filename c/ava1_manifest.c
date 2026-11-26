@@ -396,3 +396,64 @@ void ava1_mstore_free(ava1_mstore_t *m) {
     free(m->arena);
     memset(m, 0, sizeof *m);
 }
+
+/* ---- part names (ava1_mstore_part_clash) ------------------------------------------- */
+
+#define PART_SUFFIX ".ava-part"
+#define PART_SUFFIX_LEN 9u
+
+static int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+static uint32_t fnv_ci(const char *s, size_t n) {
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) h = (h ^ (uint8_t)lower((uint8_t)s[i])) * 16777619u;
+    return h;
+}
+
+static int eq_ci(const char *a, const char *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (lower((uint8_t)a[i]) != lower((uint8_t)b[i])) return 0;
+    return 1;
+}
+
+int ava1_mstore_part_clash(const ava1_mstore_t *m, uint32_t *file, uint32_t *entry) {
+    uint32_t i, k = 0, cap = 1, *slot;
+    int found = 0;
+    /* Only the entries named like a part file go in the set: usually none at all. */
+    for (i = 0; i < m->n; i++) {
+        const char *p = ava1_mstore_path(m, i);
+        size_t l = strlen(p);
+        if (l > PART_SUFFIX_LEN && eq_ci(p + l - PART_SUFFIX_LEN, PART_SUFFIX, PART_SUFFIX_LEN)) k++;
+    }
+    if (!k) return 0;
+    while (cap < 2u * k + 2u) cap *= 2;
+    if (!(slot = calloc(cap, sizeof *slot))) return -1;
+    for (i = 0; i < m->n; i++) {
+        const char *p = ava1_mstore_path(m, i);
+        size_t l = strlen(p);
+        uint32_t h;
+        if (l <= PART_SUFFIX_LEN || !eq_ci(p + l - PART_SUFFIX_LEN, PART_SUFFIX, PART_SUFFIX_LEN)) continue;
+        h = fnv_ci(p, l - PART_SUFFIX_LEN) & (cap - 1);
+        while (slot[h]) h = (h + 1) & (cap - 1);
+        slot[h] = i + 1;
+    }
+    for (i = 0; i < m->n && !found; i++) {
+        const char *p = ava1_mstore_path(m, i);
+        size_t l = strlen(p);
+        uint32_t h, q;
+        if (m->e[i].kind != AVA1_ENTRY_FILE) continue;
+        for (h = fnv_ci(p, l) & (cap - 1); (q = slot[h]) != 0; h = (h + 1) & (cap - 1)) {
+            const char *qp = ava1_mstore_path(m, q - 1);
+            if (strlen(qp) == l + PART_SUFFIX_LEN && eq_ci(qp, p, l)) {
+                *file = i;
+                *entry = q - 1;
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(slot);
+    return found;
+}

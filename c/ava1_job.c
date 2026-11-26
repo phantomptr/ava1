@@ -523,6 +523,19 @@ int ava1_job_retire_parked(ava1_job_t *j) {
     return rc;
 }
 
+int ava1_job_unlist(ava1_job_t *j, int parked_only) {
+    int rc = 0;
+    pthread_mutex_lock(&T.mu);
+    if (!listed_locked(j)) rc = -2;
+    else if (parked_only && j->attached) rc = -1; /* `attached` is written under T.mu */
+    else {
+        unlist(j);
+        j->refs--; /* the table's: the caller still holds one */
+    }
+    pthread_mutex_unlock(&T.mu);
+    return rc;
+}
+
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {
     ava1_emit_fn fn;
     pthread_mutex_lock(&j->cmu);

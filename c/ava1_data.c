@@ -31,7 +31,7 @@ uint32_t ava1_data_test_map_delay_ms;
 int ava1_data_test_ack_fail;
 int ava1_data_test_feeder_fail;
 uint32_t ava1_data_test_feed_delay_ms;
-uint32_t ava1_data_test_feed_check_delay_ms, ava1_data_test_reprep_delay_ms;
+uint32_t ava1_data_test_feed_check_delay_ms, ava1_data_test_reprep_delay_ms, ava1_data_test_remap_delay_ms;
 int ava1_data_test_reserve_fail;
 int ava1_data_test_lane_alloc_fail;
 int ava1_data_test_fb_force;
@@ -392,7 +392,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     D.admitted = 0;
     __atomic_store_n(&g_unswept_total, 0, __ATOMIC_RELAXED); /* a new data layer holds no job's log bytes */
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
-    ava1_data_test_feed_check_delay_ms = ava1_data_test_reprep_delay_ms = 0;
+    ava1_data_test_feed_check_delay_ms = ava1_data_test_reprep_delay_ms = ava1_data_test_remap_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
     ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
@@ -690,6 +690,7 @@ static void feed_done(ava1_job_t *j) {
 void ava1_data_feed_hold(ava1_job_t *j, int hold) {
     pthread_mutex_lock(&j->mu);
     j->feed_hold = hold;
+    if (!hold) pthread_cond_broadcast(&j->cv); /* a FileRoot waits for the end of a hold (ava1_apply_root) */
     while (hold && j->feeding) pthread_cond_wait(&j->cv, &j->mu);
     pthread_mutex_unlock(&j->mu);
 }
@@ -825,9 +826,37 @@ static void *feed_main(void *arg) {
     return NULL;
 }
 
+/* A FileRoot, ManifestEnd or Resume has a fixed size, but its control frame may be 64 KiB: what
+ * waits in an inbox is the message re-encoded (unknown ext fields dropped, as the decoder drops
+ * them), not the frame. One that does not decode is kept empty: it fails to decode again where
+ * it is taken, as before. Other frames are kept as they came. */
+static size_t compact_ctl(uint8_t type, const uint8_t **body, size_t len, uint8_t *buf, size_t cap) {
+    ava1_w_t w;
+    int rc = -1;
+    ava1_w_init(&w, buf, cap);
+    if (type == AVA1_TYPE_FILE_ROOT) {
+        ava1_file_root_t r;
+        rc = ava1_file_root_decode(*body, len, &r) == 0 ? ava1_file_root_encode(&r, &w) : -1;
+    } else if (type == AVA1_TYPE_MANIFEST_END) {
+        ava1_manifest_end_t e;
+        rc = ava1_manifest_end_decode(*body, len, &e) == 0 ? ava1_manifest_end_encode(&e, &w) : -1;
+    } else if (type == AVA1_TYPE_RESUME) {
+        ava1_resume_t r;
+        rc = ava1_resume_decode(*body, len, &r) == 0 ? ava1_resume_encode(&r, &w) : -1;
+    } else {
+        return len;
+    }
+    *body = buf;
+    return rc == 0 ? w.len : 0;
+}
+
 static void inbox_add(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len) {
-    ava1_inframe_t *f = calloc(1, sizeof *f);
-    uint8_t *b = malloc(len ? len : 1);
+    uint8_t small[128];
+    ava1_inframe_t *f;
+    uint8_t *b;
+    len = compact_ctl(type, &body, len, small, sizeof small);
+    f = calloc(1, sizeof *f);
+    b = malloc(len ? len : 1);
     if (!f || !b) {
         free(f);
         free(b);

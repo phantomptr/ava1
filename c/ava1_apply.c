@@ -736,6 +736,15 @@ int ava1_apply_bundle_pooled(ava1_job_t *j, uint8_t *owned, size_t owned_len, si
 int ava1_apply_root(ava1_job_t *j, uint32_t file_id, const uint8_t root[32]) {
     int rc = 0;
     pthread_mutex_lock(&j->mu);
+    /* A FileRoot that follows a ManifestEnd names the new manifest's ids, and while the job thread
+     * adopts it the old large-file states are moved and freed without j->mu (remap): wait until
+     * the new manifest is the job's. Frames are taken in order, so one sent before that ManifestEnd
+     * was applied before it was handed over (ev_end). */
+    while ((j->ev_end || j->adopting || j->feed_hold) && !j->stopping) pthread_cond_wait(&j->cv, &j->mu);
+    if (j->stopping) {
+        pthread_mutex_unlock(&j->mu);
+        return 0; /* the job ends: the root goes with it */
+    }
     if (file_id >= j->m.n || j->m.e[file_id].kind != AVA1_ENTRY_FILE) {
         rc = AVA1_E_PROTO;
     } else {
@@ -3848,8 +3857,8 @@ static void commit_large(ava1_job_t *j, uint32_t id) {
                 return;
             }
         }
-        if (rename(part, fin) != 0) {
-            int e = errno;
+        if ((err = ava1_apply_fault ? ava1_apply_fault(j, AVA1_HOOK_RENAMED, id) : 0) != 0 || rename(part, fin) != 0) {
+            int e = err ? err : errno;
             if (in_the_way(e)) commit_fail(j, AVA1_ERR_EXISTS, "something is already where the file goes", e, 1);
             else commit_fail(j, AVA1_ERR_IO, "rename into place failed", e, 1);
             return;

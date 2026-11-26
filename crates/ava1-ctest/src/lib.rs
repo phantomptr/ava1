@@ -246,6 +246,7 @@ pub mod ffi {
         pub fn ava1_pl_spent(p: *const u8) -> c_int;
         pub fn ava1_pl_welcome_allowed(p: *mut u8, ip: u32, now_ms: u64) -> c_int;
         pub fn ava1_test_pair_requests() -> u32;
+        pub fn ava1_test_refuse_key(key: *const u8);
         pub fn ava1_test_last_pair_code() -> u32;
         pub fn ava1_test_logs() -> u32;
         pub fn ava1_server_open_pairing(seconds: u32);
@@ -941,6 +942,14 @@ impl CServer {
     /// Wrong guesses at the code since the window was last opened.
     pub fn pair_guesses(&self) -> u32 {
         unsafe { ffi::ava1_server_pair_guesses() }
+    }
+
+    /// The key the server's `refused` hook blocks (a device the user blocked), or none.
+    pub fn refuse_key(&self, key: Option<[u8; 32]>) {
+        match key {
+            Some(k) => unsafe { ffi::ava1_test_refuse_key(k.as_ptr()) },
+            None => unsafe { ffi::ava1_test_refuse_key(std::ptr::null()) },
+        }
     }
 
     pub fn pair_requests(&self) -> (u32, u32) {

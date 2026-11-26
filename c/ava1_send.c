@@ -12,12 +12,17 @@
 #include "ava1_apply.h"
 #include "ava1_b3.h"
 #include "ava1_events.h"
+#include "ava1_internal.h"
 #include "ava1_data.h"
 #include "ava1_platform.h"
 #include "ava1_server.h"
 #include "ava1_thread.h"
 
 #define READ_AHEAD (32u << 20)
+/* The most window the sender uses, whatever the receiver grants: frames in flight stay in memory
+ * until their Received, so the window is what bounds them. A version 1 receiver grants 64 MiB
+ * (SPEC.md §12.4); credit past this is left unused, never refused. */
+#define WINDOW_MAX (64ull << 20)
 
 static uint64_t now_us(void) {
     struct timespec t;
@@ -199,6 +204,7 @@ typedef struct sframe {
 
 typedef struct {
     uint64_t credit, queued;
+    uint64_t map_ids, map_ranges; /* what the map's pages named so far: bounded by the manifest */
     sframe_t *ready, *ready_tail, *inflight;
     uint32_t next_page;
     int pages_done, have_map, reading, stop, unsafe_read, single;
@@ -343,6 +349,12 @@ typedef struct {
 } wctx2_t;
 
 static uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+/* Adds to the window, at most WINDOW_MAX: the bytes are peer-controlled (no wrap, no unbounded
+ * read-ahead in flight). */
+static uint64_t window_add(uint64_t a, uint64_t b) {
+    uint64_t v = sat_add(a, b);
+    return v > WINDOW_MAX ? WINDOW_MAX : v;
+}
 
 static void unlink_inflight(snd_t *s, sframe_t *f) {
     sframe_t **pp;
@@ -413,7 +425,7 @@ static int settle_locked(snd_t *s, sframe_t *f, int rc) {
     if (rc != 0) {
         /* Never delivered: the charge comes back here, and the frame goes again. */
         unlink_inflight(s, f);
-        s->credit = sat_add(s->credit, f->len);
+        s->credit = window_add(s->credit, f->len);
         requeue_front(s, f);
     } else if (dead) {
         /* Sent on a lane that died meanwhile (the sweep left it to us): it may be on the
@@ -641,17 +653,45 @@ static sframe_t *received_locked(ava1_job_t *j, snd_t *s, uint32_t seq) {
 }
 
 /* More window from the receiver (caller holds mu). Credit frames are incremental (R2);
- * the bytes are peer-controlled, so the add saturates instead of wrapping. */
-static void credit_locked(snd_t *s, uint64_t n) { s->credit = sat_add(s->credit, n); }
+ * the bytes are peer-controlled, so the add saturates at WINDOW_MAX instead of wrapping. */
+static void credit_locked(snd_t *s, uint64_t n) { s->credit = window_add(s->credit, n); }
+
+/* One JobMap page against the manifest (caller holds mu): what a receiver may name is bounded by
+ * it, so pages cannot grow memory or work past it. A receiver's map names each done file once
+ * (disjoint runs) and, per unfinished file, disjoint durable ranges inside it that start on group
+ * boundaries: at most one per group. 0, or -1 for a map no receiver builds. */
+static int map_page_locked(ava1_job_t *j, snd_t *s, const ava1_job_map_t *m) {
+    ava1_r_t it;
+    ava1_file_run_t r;
+    ava1_file_range_t g;
+    int k;
+    ava1_r_init(&it, m->done, m->done_len);
+    while ((k = ava1_file_run_next(&it, &r)) == 1) {
+        uint64_t hi = (uint64_t)r.first + r.count, f;
+        if (hi > j->m.n || (s->map_ids += r.count) > j->m.n) return -1;
+        for (f = r.first; f < hi; f++) ava1_bits_set(&s->skip, (uint32_t)f);
+    }
+    if (k != 0) return -1;
+    ava1_r_init(&it, m->partial, m->partial_len);
+    while ((k = ava1_file_range_next(&it, &g)) == 1) {
+        uint64_t size, end;
+        if (g.file_id >= j->m.n || j->m.e[g.file_id].kind != AVA1_ENTRY_FILE) return -1;
+        size = j->m.e[g.file_id].size;
+        end = sat_add(g.offset, g.len);
+        if (end > size || ++s->map_ranges > j->m.bytes / AVA1_GROUP_LEN + j->m.n) return -1;
+        if (!s->durable[g.file_id]) s->durable[g.file_id] = calloc(1, sizeof(ava1_rset_t));
+        if (!s->durable[g.file_id]) continue; /* no memory: the bytes are sent again */
+        (void)ava1_rset_add(s->durable[g.file_id], g.offset, end);
+        if ((uint64_t)s->durable[g.file_id]->n > ava1_groups_of(size)) return -1;
+    }
+    return k == 0 ? 0 : -1;
+}
 
 static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len) {
     snd_t *s = S_(j);
     switch (type) {
     case AVA1_TYPE_JOB_MAP: {
         ava1_job_map_t m;
-        ava1_r_t it;
-        ava1_file_run_t r;
-        ava1_file_range_t g;
         if (ava1_job_map_decode(body, len, &m) != 0) return 1;
         if (m.status != AVA1_STATUS_OK) {
             /* A reader-thread hook never ends a job itself (C4): the job thread does. */
@@ -666,16 +706,10 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
             pthread_mutex_unlock(&j->mu);
             return 0;
         }
-        ava1_r_init(&it, m.done, m.done_len);
-        while (ava1_file_run_next(&it, &r) == 1) {
-            uint32_t f;
-            for (f = r.first; f < r.first + r.count && f < j->m.n; f++) ava1_bits_set(&s->skip, f);
-        }
-        ava1_r_init(&it, m.partial, m.partial_len);
-        while (ava1_file_range_next(&it, &g) == 1) {
-            if (g.file_id >= j->m.n) continue;
-            if (!s->durable[g.file_id]) s->durable[g.file_id] = calloc(1, sizeof(ava1_rset_t));
-            if (s->durable[g.file_id]) (void)ava1_rset_add(s->durable[g.file_id], g.offset, g.offset + g.len);
+        if (map_page_locked(j, s, &m) != 0) {
+            pthread_mutex_unlock(&j->mu);
+            ava1_data_fail_soon(j, AVA1_ERR_PROTOCOL, "the receiver's map names files or bytes the manifest does not have");
+            return 0;
         }
         if (m.last) s->have_map = 1;
         pthread_mutex_unlock(&j->mu);
@@ -856,7 +890,29 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
         snprintf(msg, cap, "%s: %s", root, strerror(errno));
         return NULL;
     }
-    ava1_job_free_one(o->job_id); /* a sender's state lives only in memory: start over */
+    /* A sender's state lives only in memory: a download of this id starts over. Only a download,
+     * and only this device's or one no session drives (as an upload moves to another device, #444):
+     * any other job under the id (an upload, a copy, a send to another console, a download another
+     * session is running) is not this JobOpen's to end. */
+    if ((j = ava1_job_find(o->job_id)) != NULL) {
+        int download, mine;
+        pthread_mutex_lock(&j->mu);
+        download = j->kind == AVA1_JOB_DOWNLOAD && !j->c2c;
+        mine = memcmp(j->owner, peer, 32) == 0;
+        pthread_mutex_unlock(&j->mu);
+        rc = download ? ava1_job_unlist(j, !mine) : 1;
+        ava1_job_put(j);
+        if (rc == 1) {
+            ack->status = AVA1_ERR_PROTOCOL;
+            snprintf(msg, cap, "another job is running under this id");
+            return NULL;
+        }
+        if (rc == -1) {
+            ack->status = AVA1_ERR_UNKNOWN_JOB;
+            snprintf(msg, cap, "this job belongs to another device");
+            return NULL;
+        }
+    }
     j = ava1_job_create(o->job_id, peer);
     s = j ? calloc(1, sizeof *s) : NULL;
     if (s) pthread_mutex_init(&s->pump_mu, NULL);
@@ -879,7 +935,7 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
     s->t_open = now_us();
     rc = s->single ? ava1_mstore_single(&j->m, root) : ava1_mstore_walk_deny(&j->m, root, AVA1_WALK_FOLLOW, cfg->refuse_link);
     s->walk_us = now_us() - s->t_open;
-    s->credit = o->has_credit ? o->credit : (16u << 20);
+    s->credit = window_add(0, o->has_credit ? o->credit : (16u << 20));
     if (rc != 0 || ava1_bits_init(&s->skip, j->m.n) != 0 ||
         !(s->durable = calloc((size_t)j->m.n + 1, sizeof *s->durable)) ||
         !(j->lf = calloc((size_t)j->m.n + 1, sizeof *j->lf)) || ava1_bits_init(&j->done, j->m.n) != 0) {

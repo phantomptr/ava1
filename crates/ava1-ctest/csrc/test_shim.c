@@ -145,6 +145,25 @@ size_t ava1_test_sizeof_pairlimit(void) { return sizeof(ava1_pairlimit_t); }
 
 size_t ava1_test_sizeof_opts(void) { return sizeof(ava1_test_opts_t); }
 
+/* The key the server's `refused` hook blocks (ava1_test_refuse_key; all zero: none, which no
+ * peer's public key is). */
+static uint8_t g_refused_key[32];
+static pthread_mutex_t g_refused_mu = PTHREAD_MUTEX_INITIALIZER;
+static int t_refused(const uint8_t key[32]) {
+    static const uint8_t zero[32];
+    int r;
+    pthread_mutex_lock(&g_refused_mu);
+    r = memcmp(g_refused_key, zero, 32) != 0 && memcmp(g_refused_key, key, 32) == 0;
+    pthread_mutex_unlock(&g_refused_mu);
+    return r;
+}
+void ava1_test_refuse_key(const uint8_t *key) {
+    pthread_mutex_lock(&g_refused_mu);
+    if (key) memcpy(g_refused_key, key, 32);
+    else memset(g_refused_key, 0, 32);
+    pthread_mutex_unlock(&g_refused_mu);
+}
+
 int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, const ava1_test_opts_t *o) {
     ava1_server_cfg_t cfg;
     int rc;
@@ -181,6 +200,8 @@ int ava1_test_server_start(const uint8_t secret[32], const char *peers_path, con
     cfg.on_pair_request = on_pair;
     cfg.log = on_log;
     cfg.rpc = rpc;
+    cfg.refused = t_refused;
+    ava1_test_refuse_key(NULL);
     __atomic_store_n(&g_logs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_pair_requests, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_last_code, 0, __ATOMIC_SEQ_CST);
@@ -1426,6 +1447,7 @@ uint32_t ava1_test_apply_commits_inflight(void) {
 void ava1_test_apply_trace(int on) { __atomic_store_n(&g_trace, on, __ATOMIC_SEQ_CST); }
 
 static uint32_t g_fault_id = UINT32_MAX - 1; /* no file: no fault */
+static uint32_t g_rename_fail;                /* file id + 1 whose next rename into place fails (EBUSY); 0 none */
 static int g_sweep_fail_n; /* sweeps' file syncs fail with EIO this many times (-1: until cleared) */
 int ava1_test_sweep_fail_left(void) { return __atomic_load_n(&g_sweep_fail_n, __ATOMIC_SEQ_CST); }
 void ava1_test_sweep_fail(int n) { __atomic_store_n(&g_sweep_fail_n, n, __ATOMIC_SEQ_CST); }
@@ -1444,6 +1466,11 @@ static int t_fault(ava1_job_t *j, int point, uint32_t id) {
     }
     if (point == AVA1_HOOK_BATCH_ALLOC && __atomic_exchange_n(&g_batch_alloc_fail, 0, __ATOMIC_SEQ_CST)) return ENOMEM;
     if (point == AVA1_HOOK_PREALLOC && id == __atomic_load_n(&g_prealloc_fault, __ATOMIC_SEQ_CST)) return ENOSPC;
+    if (point == AVA1_HOOK_RENAMED && id != UINT32_MAX) { /* one-shot: knob rename_fail = file id + 1 */
+        uint32_t want = id + 1;
+        if (__atomic_compare_exchange_n(&g_rename_fail, &want, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return EBUSY;
+        return 0;
+    }
     return point == AVA1_HOOK_DIR_SYNCED && id == __atomic_load_n(&g_fault_id, __ATOMIC_SEQ_CST) ? EIO : 0;
 }
 void ava1_test_apply_fail_dir_sync(uint32_t id) { __atomic_store_n(&g_fault_id, id, __ATOMIC_SEQ_CST); }
@@ -2054,6 +2081,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     __atomic_store_n(&ava1_send_test_fail_sends, 0, __ATOMIC_SEQ_CST); /* the download sender's knobs */
     __atomic_store_n(&ava1_send_test_fail_writer_starts, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_fault_id, UINT32_MAX - 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_rename_fail, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_crash_before_delete, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_delete_delay_ms, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_delete_active, 0, __ATOMIC_SEQ_CST);
@@ -2329,6 +2357,8 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "feed_delay_ms")) ava1_data_test_feed_delay_ms = v;
     else if (!strcmp(name, "feed_check_delay_ms")) ava1_data_test_feed_check_delay_ms = v;
     else if (!strcmp(name, "reprep_delay_ms")) ava1_data_test_reprep_delay_ms = v;
+    else if (!strcmp(name, "remap_delay_ms")) ava1_data_test_remap_delay_ms = v;
+    else if (!strcmp(name, "rename_fail")) __atomic_store_n(&g_rename_fail, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "store_save_delay_ms"))
         __atomic_store_n(&ava1_store_test_save_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;

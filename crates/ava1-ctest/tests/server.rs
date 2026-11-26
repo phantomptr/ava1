@@ -1050,6 +1050,70 @@ async fn the_c_server_refuses_a_client_without_its_pairing_nonce() {
     assert_eq!(shown, 1);
 }
 
+/// The handshake as `me`, its ClientInfo carrying `token`: the first sealed frame's type, and the
+/// Error's code when it is one.
+async fn hello_with_token(addr: &str, me: &Identity, token: Option<[u8; 16]>) -> (u8, u16) {
+    use ava1::wire::Message;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rh, wh) = stream.into_split();
+    let (mut r, mut w) = (FrameReader::new(rh), FrameWriter::new(wh));
+    let mut hs = ava1::keys::Handshake::initiator(me).unwrap();
+    let hello = gen::HelloInfo {
+        version_min: gen::PROTOCOL_VERSION,
+        version_max: gen::PROTOCOL_VERSION,
+        caps: 0,
+    };
+    let noise = hs.write(&hello.to_bytes().unwrap()).unwrap();
+    w.send_msg(0, &gen::Hs1 { noise }).await.unwrap();
+    let m2: gen::Hs2 = r.recv().await.unwrap().decode().unwrap();
+    hs.read(&m2.noise).unwrap();
+    let ci = gen::ClientInfo {
+        nonce_c: [3; 16],
+        name: Some("blocked".into()),
+        token,
+    };
+    let noise = hs.write(&ci.to_bytes().unwrap()).unwrap();
+    w.send_msg(0, &gen::Hs3 { noise }).await.unwrap();
+    let k = hs.finish();
+    r.set_key(ava1::keys::control_key(&k.s2c));
+    let f = tokio::time::timeout(Duration::from_secs(3), r.recv())
+        .await
+        .expect("no answer to message 3")
+        .expect("the connection closed with no answer");
+    let code = if f.ty == gen::Error::TYPE {
+        f.decode::<gen::Error>().unwrap().code
+    } else {
+        0
+    };
+    (f.ty, code)
+}
+
+/// S5: a device the user blocked stays blocked when its ClientInfo carries a `token`. Pre-fix any
+/// token skipped the `refused` hook (it was taken for another console's ticket), and a blocked
+/// device still in the trust store got a full session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_device_sending_a_token_is_still_refused() {
+    let d = dir("blocked-token");
+    let (me, peers) = paired_client(&d.join("peers"));
+    let srv = CServer::start_with(SECRET, &d.join("peers"), opts(0));
+    // Paired and not blocked: it gets in, with or without a token that is no ticket.
+    connect(&srv.addr(), me.clone(), peers.clone(), "c", fast())
+        .await
+        .unwrap();
+    let (ty, _) = hello_with_token(&srv.addr(), &me, Some([9; 16])).await;
+    assert_eq!(ty, gen::Welcome::TYPE);
+    srv.refuse_key(Some(me.public()));
+    for token in [None, Some([9; 16])] {
+        let (ty, code) = hello_with_token(&srv.addr(), &me, token).await;
+        assert_eq!(
+            (ty, code),
+            (gen::Error::TYPE, gen::ERR_PAIRING_CLOSED),
+            "token {token:?}"
+        );
+    }
+    srv.refuse_key(None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_c_server_notifies_only_once_welcome_is_sent() {
     let d = dir("notify-after-welcome");

@@ -645,6 +645,10 @@ size and mtime are unchanged, and restarts the others (never splicing old and ne
 manifest: the receiver answers `JobMap`, or `JobMap{status = ERR_UNKNOWN_JOB}` and the
 sender falls back to `JobOpen`. A map larger than one control frame is sent as several
 `JobMap` pages; `last = 1` marks the final one. `Durable` is never paged: each is complete.
+A map names only what the manifest has: each done file once, by its id (`FileRun`s that do not
+overlap), and for a file not done, durable ranges inside it that start on group boundaries (so no
+more ranges than the file has groups); a `Durable` names each of its files once. A sender ends the
+job with `ERR_PROTOCOL` on a map or `Durable` that names more, before it stores any of it.
 Clients reopen with `JobOpen` after any interruption; `Resume` is optional for senders that
 keep their manifest and credit state. A receiver answers `Resume` with the `JobMap` of a parked job
 of the same peer key whose stored manifest has that hash, else `JobMap{status = ERR_UNKNOWN_JOB}` —
@@ -665,7 +669,10 @@ grant; the sender's window is exactly that number either way. Tests: `crates/ava
 11.6 Staging: when the job root does not exist, the receiver writes the whole tree under
 `<root>.ava-part/` and, after the last file, renames it to `<root>` (same parent, `st_dev`
 checked; a device that cannot be read is refused with `ERR_IO`, never taken as the same). When the root exists, files are written in place; large files through
-`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. A staging
+`<name>.ava-part` and a same-directory rename. `JF_SINGLE_FILE` writes `<root>.ava-part`. So a
+merge refuses, with `ERR_PATH`, a manifest that names both a file `P` and `P.ava-part` (in any letter
+case: a drive may fold it), since the two would share one name; it refuses it before the manifest is
+stored or journaled. A staged job, which writes each file under its own name, takes it. A staging
 receiver takes `<root>` with `mkdir` before it journals the job (an existing `<root>` then
 refuses it, `ERR_EXISTS`) and records that in `JnlOpen.staged` bit 1, so on resume the empty
 `<root>` is its own; the final rename replaces only that empty folder (not empty: `ERR_EXISTS`).
@@ -757,7 +764,9 @@ would fail a healthy job.
 12.4 Credit: `JobOpenAck.credit` (uploads) or `JobOpen.ext credit` (downloads) is the
 number of lane-frame body bytes the sender may have outstanding — the window counts the whole
 body, so a `Chunk` costs its data plus 34 bytes of framing; `Credit{bytes}` returns space as the
-receiver frees buffers. A version 1 receiver grants 64 MiB, and never less than 8 MiB: a node whose
+receiver frees buffers. A version 1 receiver grants 64 MiB, and never less than 8 MiB; a sender may
+use less window than it is granted (the C sender uses at most 64 MiB: what it has in flight stays in
+memory until its `Received`), never more. A node whose
 global buffer budget cannot cover 8 MiB refuses the job with `ERR_BUSY`. A receiver that sees a
 lane frame exceed the credit still outstanding sends a sealed `Error{ERR_CREDIT}` on the offending
 lane and closes that lane only: the session, the job and its other lanes go on. Nothing of the frame is
