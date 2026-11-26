@@ -108,8 +108,9 @@ struct ava1_job {
     int attached, refs, stopping, finished, prepared;
     /* Under mu. feeding: the feeder is between its `prepared` check and the engine's queue (it reads
      * m and enqueues work against it); feed_hold: the job thread is about to replace m (a new manifest
-     * in the same session), so the feeder hands nothing more to the engine until it is done. */
-    int feeding, feed_hold;
+     * in the same session), so the feeder hands nothing more to the engine until it is done.
+     * adopting: the job thread took a ManifestEnd and has not answered it yet (ava1_apply_root waits). */
+    int feeding, feed_hold, adopting;
     int discard_parts;              /* a cancelled local copy: destroy removes the .ava-part files this job itself was writing */
     uint64_t parked_at_ms;
     uint64_t concluded_ms;          /* an upload or download: when its end went out (our JobDone) or came in (the peer's),

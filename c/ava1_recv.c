@@ -624,6 +624,7 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         ava1_mstore_free(&j->m_in);
         if (s->entries) (void)ava1_mstore_reserve(&j->m_in, s->entries);
         j->ev_end = j->ev_resume = 0;
+        pthread_cond_broadcast(&j->cv); /* a FileRoot waiting for that ManifestEnd (ava1_apply_root) */
         /* The new sender starts from what is free now. Credit freed while detached is
          * already counted here, so it must not also be flushed as a Credit message. */
         ack->credit = j->credit > j->outstanding ? j->credit - j->outstanding : 0;
@@ -832,12 +833,17 @@ static int remap(ava1_job_t *j, ava1_mstore_t *in, ava1_bits_t *changed) {
             drop_path(p, 1, d, &nd);
         }
     }
-    /* Second step of the outboard renames; drop the outboards nobody carried. */
+    /* Second step of the outboard renames; drop the outboards nobody carried. The states freed
+     * here are only safe to free because nothing else touches j->lf while the job thread
+     * re-prepares: the feeder hands no lane frame over (feed_hold) and a FileRoot waits for the
+     * new manifest (ava1_apply_root). */
     for (i = 0; i < j->m.n; i++) {
         snprintf(a, sizeof a, "%s/%u.ob", j->dir, i);
         (void)unlink(a);
         free_lf(j, i, j->lf[i]);
+        j->lf[i] = NULL;
     }
+    if (ava1_data_test_remap_delay_ms) ava1_platform_sleep_ms(ava1_data_test_remap_delay_ms);
     for (i = 0; i < in->n; i++)
         if (nlf[i]) {
             snprintf(a, sizeof a, "%s/%u.ob.m", j->dir, i);
@@ -1378,7 +1384,19 @@ static uint16_t adopt(ava1_job_t *j, ava1_mstore_t *in, const uint8_t hash[32], 
     return AVA1_STATUS_OK;
 }
 
+static void recv_events_take(ava1_job_t *j);
+
+/* `adopting` covers a ManifestEnd from the moment it is taken until its map is out: a FileRoot
+ * that follows it names the new manifest's ids, and remap frees the old large-file states. */
 static void recv_events(ava1_job_t *j) {
+    recv_events_take(j);
+    pthread_mutex_lock(&j->mu);
+    j->adopting = 0;
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void recv_events_take(ava1_job_t *j) {
     int end, res;
     ava1_mstore_t in;
     uint32_t efiles;
@@ -1390,6 +1408,7 @@ static void recv_events(ava1_job_t *j) {
     end = j->ev_end;
     res = j->ev_resume;
     j->ev_end = j->ev_resume = 0;
+    if (end) j->adopting = 1;
     in = j->m_in;
     memset(&j->m_in, 0, sizeof j->m_in);
     efiles = j->end_files;

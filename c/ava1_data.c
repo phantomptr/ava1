@@ -31,7 +31,7 @@ uint32_t ava1_data_test_map_delay_ms;
 int ava1_data_test_ack_fail;
 int ava1_data_test_feeder_fail;
 uint32_t ava1_data_test_feed_delay_ms;
-uint32_t ava1_data_test_feed_check_delay_ms, ava1_data_test_reprep_delay_ms;
+uint32_t ava1_data_test_feed_check_delay_ms, ava1_data_test_reprep_delay_ms, ava1_data_test_remap_delay_ms;
 int ava1_data_test_reserve_fail;
 int ava1_data_test_lane_alloc_fail;
 int ava1_data_test_fb_force;
@@ -392,7 +392,7 @@ int ava1_data_start(const ava1_data_cfg_t *cfg) {
     D.admitted = 0;
     __atomic_store_n(&g_unswept_total, 0, __ATOMIC_RELAXED); /* a new data layer holds no job's log bytes */
     ava1_data_test_open_delay_ms = ava1_data_test_map_delay_ms = ava1_data_test_feed_delay_ms = 0;
-    ava1_data_test_feed_check_delay_ms = ava1_data_test_reprep_delay_ms = 0;
+    ava1_data_test_feed_check_delay_ms = ava1_data_test_reprep_delay_ms = ava1_data_test_remap_delay_ms = 0;
     ava1_data_test_open_work_delay_ms = 0;
     ava1_data_test_ack_fail = ava1_data_test_feeder_fail = 0;
     ava1_data_test_reserve_fail = ava1_data_test_lane_alloc_fail = ava1_data_test_fb_force = 0;
@@ -690,6 +690,7 @@ static void feed_done(ava1_job_t *j) {
 void ava1_data_feed_hold(ava1_job_t *j, int hold) {
     pthread_mutex_lock(&j->mu);
     j->feed_hold = hold;
+    if (!hold) pthread_cond_broadcast(&j->cv); /* a FileRoot waits for the end of a hold (ava1_apply_root) */
     while (hold && j->feeding) pthread_cond_wait(&j->cv, &j->mu);
     pthread_mutex_unlock(&j->mu);
 }

@@ -724,6 +724,77 @@ async fn a_lane_frame_checked_before_a_new_manifest_is_queued_before_it_replaces
     }
 }
 
+/// S1: a FileRoot that arrives while a new manifest is being adopted waits for it. Pre-fix the
+/// feeder applied it at once, into the large-file state remap had just freed (a use-after-free
+/// ASan reports; without it the root was lost and the file never committed).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_root_during_a_new_manifest_waits_for_it_and_lands_on_the_new_file() {
+    let d = dir("wire-remanifest-root");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x5du8; 16];
+    let old = big_data(2 << 20);
+    let a = Manifest {
+        entries: vec![file("a", old.len() as u64)],
+    };
+    let root = d.join("dest");
+    let mut link = s.job(job);
+    let ack = open(&mut link, job, &root).await;
+    assert_eq!(ack.status, 0);
+    send_manifest(&link, job, &a).await;
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    // Half of "a": the job holds a large-file state for it.
+    tx.send_raw(Chunk::TYPE, 0, 1, chunk(job, 0, 0, &old[..1 << 20]))
+        .await
+        .unwrap();
+    let t = Instant::now();
+    loop {
+        if srv.job_counts(job).0 >= 1 << 20 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "the chunk never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A manifest without "a": remap frees its state, then takes its time.
+    let new = big_data((2 << 20) + 3);
+    let b = Manifest {
+        entries: vec![file("b", new.len() as u64)],
+    };
+    srv.knob("remap_delay_ms", 1000);
+    send_manifest(&link, job, &b).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    link.control
+        .send(&FileRoot {
+            job_id: job,
+            file_id: 0,
+            root: *blake3::hash(&new).as_bytes(),
+        })
+        .await
+        .unwrap();
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    srv.knob("remap_delay_ms", 0);
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    // The root was kept for "b" (file 0 of the new manifest): its bytes alone finish the job.
+    tx.send_raw(Chunk::TYPE, 0, 2, chunk(job, 0, 0, &new[..1 << 20]))
+        .await
+        .unwrap();
+    tx.send_raw(Chunk::TYPE, 0, 3, chunk(job, 0, 1 << 20, &new[1 << 20..]))
+        .await
+        .unwrap();
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("b")).unwrap(), new);
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

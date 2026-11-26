@@ -174,6 +174,7 @@ extern int ava1_data_test_feeder_fail;     /* a job's feeder thread "cannot star
 extern uint32_t ava1_data_test_feed_delay_ms; /* the feeder waits this long after taking lane frames */
 extern uint32_t ava1_data_test_feed_check_delay_ms; /* ... and this long between checking one and queuing it */
 extern uint32_t ava1_data_test_reprep_delay_ms;     /* a new manifest's re-prepare waits this long first */
+extern uint32_t ava1_data_test_remap_delay_ms;      /* ... and this long inside the remap, the old states freed */
 extern int ava1_data_test_reserve_fail;    /* ava1_apply_reserve "fails" for every lane frame */
 extern int ava1_data_test_lane_alloc_fail; /* the lane frame's calloc "fails" */
 extern int ava1_data_test_fb_force;   /* every Received goes through the waiting-send fallback */

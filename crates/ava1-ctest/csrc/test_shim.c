@@ -2329,6 +2329,7 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "feed_delay_ms")) ava1_data_test_feed_delay_ms = v;
     else if (!strcmp(name, "feed_check_delay_ms")) ava1_data_test_feed_check_delay_ms = v;
     else if (!strcmp(name, "reprep_delay_ms")) ava1_data_test_reprep_delay_ms = v;
+    else if (!strcmp(name, "remap_delay_ms")) ava1_data_test_remap_delay_ms = v;
     else if (!strcmp(name, "store_save_delay_ms"))
         __atomic_store_n(&ava1_store_test_save_delay_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;
