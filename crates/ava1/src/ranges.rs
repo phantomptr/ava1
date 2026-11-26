@@ -38,6 +38,16 @@ impl RangeSet {
         self.v.iter().copied()
     }
 
+    /// How many disjoint ranges the set holds.
+    pub fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    /// Whether the set holds no range.
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
     /// The number of bytes the set covers.
     pub fn covered(&self) -> u64 {
         self.v.iter().map(|r| r.1 - r.0).sum()
@@ -104,6 +114,14 @@ pub fn from_runs(runs: &[FileRun]) -> BTreeSet<u32> {
         .collect()
 }
 
+/// What the pages of one map named so far ([`Need::add_page_bounded`]).
+#[derive(Debug, Clone, Default)]
+pub struct MapSeen {
+    ids: u64,
+    ranges: u64,
+    range_cap: u64,
+}
+
 /// A receiver's answer to "what do you have": done files and durable ranges of the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Need {
@@ -163,7 +181,75 @@ impl Need {
         }
     }
 
+    /// [`Need::add_page`] for a map of the job whose manifest is `manifest`, as a sender reads
+    /// it: a receiver's pages can then hold no more than the manifest does. A receiver names each
+    /// done file once (disjoint runs, ids of the manifest) and, per unfinished file, disjoint
+    /// durable ranges inside it that start on group boundaries, so at most one per group; a page
+    /// past that is refused (`Err`), never stored. `seen` carries the count across the pages of
+    /// one map.
+    pub fn add_page_bounded(
+        &mut self,
+        m: &gen::JobMap,
+        manifest: &crate::manifest::Manifest,
+        seen: &mut MapSeen,
+    ) -> Result<(), String> {
+        let n = manifest.entries.len() as u64;
+        if seen.range_cap == 0 {
+            seen.range_cap = manifest
+                .entries
+                .iter()
+                .filter(|e| e.kind == gen::ENTRY_FILE)
+                .map(|e| crate::verify::groups(e.size))
+                .fold(0u64, u64::saturating_add)
+                .saturating_add(1);
+        }
+        if let Some(h) = m.held {
+            self.held = self.held.max(h);
+        }
+        for r in &m.done {
+            let end = r.first as u64 + r.count as u64;
+            seen.ids += r.count as u64;
+            if end > n || seen.ids > n {
+                return Err(format!(
+                    "the map names files {}..{end} past the manifest's {n} entries",
+                    r.first
+                ));
+            }
+            self.done.extend(r.first..end as u32);
+        }
+        for r in &m.partial {
+            let Some(e) = manifest
+                .entry(r.file_id)
+                .filter(|e| e.kind == gen::ENTRY_FILE)
+            else {
+                return Err(format!(
+                    "the map has durable bytes for {}, which is not a file of the manifest",
+                    r.file_id
+                ));
+            };
+            let end = r.offset.saturating_add(r.len);
+            seen.ranges += 1;
+            if end > e.size || seen.ranges > seen.range_cap {
+                return Err(format!(
+                    "the map has durable bytes {}..{end} of file {} ({} bytes)",
+                    r.offset, r.file_id, e.size
+                ));
+            }
+            let set = self.partial.entry(r.file_id).or_default();
+            set.insert(r.offset, end);
+            if set.len() as u64 > crate::verify::groups(e.size) {
+                return Err(format!(
+                    "the map has more durable ranges of file {} than it has groups",
+                    r.file_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Merges one JobMap page into this answer. `held` keeps the largest value any page reported.
+    /// Nothing bounds what it stores but the page: a sender reading a peer's map uses
+    /// [`Need::add_page_bounded`].
     pub fn add_page(&mut self, m: &gen::JobMap) {
         if let Some(h) = m.held {
             self.held = self.held.max(h);
@@ -231,6 +317,92 @@ mod tests {
         let mut absent = Need::default();
         absent.add_page(&none[0]);
         assert_eq!(absent.held, 0);
+    }
+
+    fn job(sizes: &[u64]) -> crate::manifest::Manifest {
+        crate::manifest::Manifest {
+            entries: sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| crate::manifest::Entry {
+                    kind: gen::ENTRY_FILE,
+                    mode: 0o644,
+                    size,
+                    mtime: 1,
+                    path: format!("f{i}"),
+                    root: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn page(done: Vec<FileRun>, partial: Vec<FileRange>, last: u8) -> gen::JobMap {
+        gen::JobMap {
+            job_id: [0; 16],
+            status: 0,
+            last,
+            done,
+            partial,
+            message: None,
+            held: None,
+        }
+    }
+
+    #[test]
+    fn a_bounded_map_takes_what_a_receiver_builds() {
+        // S4: every page a receiver writes for this manifest goes in unchanged.
+        let m = job(&[5 << 20, 3 << 20, 10, 7 << 20]);
+        let mut want = Need::default();
+        want.done.insert(2);
+        want.partial.entry(0).or_default().insert(0, 1 << 20);
+        want.partial.entry(0).or_default().insert(2 << 20, 4 << 20);
+        want.partial.entry(3).or_default().insert(6 << 20, 7 << 20);
+        let mut got = Need::default();
+        let mut seen = MapSeen::default();
+        for p in want.to_pages([0; 16], 0) {
+            got.add_page_bounded(&p, &m, &mut seen).unwrap();
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_bounded_map_refuses_what_no_receiver_builds() {
+        // S4: what would grow memory past the manifest is refused, never stored.
+        let m = job(&[3 << 20, 1 << 20]);
+        let run = |first, count| FileRun { first, count };
+        let range = |file_id, offset, len| FileRange {
+            file_id,
+            offset,
+            len,
+        };
+        let bad: Vec<Vec<gen::JobMap>> = vec![
+            // a run past the manifest (4 G ids)
+            vec![page(vec![run(0, u32::MAX)], vec![], 1)],
+            // the same files again, page after page
+            vec![
+                page(vec![run(0, 2)], vec![], 0),
+                page(vec![run(0, 2)], vec![], 1),
+            ],
+            // durable bytes past a file's end, or of no file
+            vec![page(vec![], vec![range(1, 0, 2 << 20)], 1)],
+            vec![page(vec![], vec![range(7, 0, 1)], 1)],
+            vec![page(vec![], vec![range(0, u64::MAX, u64::MAX)], 1)],
+            // more disjoint ranges of a file than it has groups
+            vec![page(
+                vec![],
+                (0..4).map(|k| range(0, k * 10, 1)).collect(),
+                1,
+            )],
+        ];
+        for (i, pages) in bad.iter().enumerate() {
+            let mut need = Need::default();
+            let mut seen = MapSeen::default();
+            let r = pages
+                .iter()
+                .try_for_each(|p| need.add_page_bounded(p, &m, &mut seen));
+            assert!(r.is_err(), "case {i} was taken");
+            assert!(need.done.len() <= 2 && need.partial.len() <= 2, "case {i}");
+        }
     }
 
     #[test]

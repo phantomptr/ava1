@@ -826,9 +826,37 @@ static void *feed_main(void *arg) {
     return NULL;
 }
 
+/* A FileRoot, ManifestEnd or Resume has a fixed size, but a frame may carry up to 16 MiB: what
+ * waits in an inbox is the message re-encoded (unknown ext fields dropped, as the decoder drops
+ * them), not the frame. One that does not decode is kept empty: it fails to decode again where
+ * it is taken, as before. Other frames are kept as they came. */
+static size_t compact_ctl(uint8_t type, const uint8_t **body, size_t len, uint8_t *buf, size_t cap) {
+    ava1_w_t w;
+    int rc = -1;
+    ava1_w_init(&w, buf, cap);
+    if (type == AVA1_TYPE_FILE_ROOT) {
+        ava1_file_root_t r;
+        rc = ava1_file_root_decode(*body, len, &r) == 0 ? ava1_file_root_encode(&r, &w) : -1;
+    } else if (type == AVA1_TYPE_MANIFEST_END) {
+        ava1_manifest_end_t e;
+        rc = ava1_manifest_end_decode(*body, len, &e) == 0 ? ava1_manifest_end_encode(&e, &w) : -1;
+    } else if (type == AVA1_TYPE_RESUME) {
+        ava1_resume_t r;
+        rc = ava1_resume_decode(*body, len, &r) == 0 ? ava1_resume_encode(&r, &w) : -1;
+    } else {
+        return len;
+    }
+    *body = buf;
+    return rc == 0 ? w.len : 0;
+}
+
 static void inbox_add(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len) {
-    ava1_inframe_t *f = calloc(1, sizeof *f);
-    uint8_t *b = malloc(len ? len : 1);
+    uint8_t small[128];
+    ava1_inframe_t *f;
+    uint8_t *b;
+    len = compact_ctl(type, &body, len, small, sizeof small);
+    f = calloc(1, sizeof *f);
+    b = malloc(len ? len : 1);
     if (!f || !b) {
         free(f);
         free(b);

@@ -958,6 +958,65 @@ async fn a_commit_that_failed_on_io_is_taken_up_again_by_a_reopen() {
     assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
 }
 
+/// S4: a FileRoot is 52 bytes, but its control frame may carry 64 KiB of extension. Waiting for the
+/// map in the job's inbox it is kept at its own size: pre-fix 600 of 60 KiB filled the inbox (32
+/// MiB) and the job ended; now they cost 52 bytes each and the job finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_roots_with_huge_extensions_waiting_for_the_map_are_kept_small() {
+    let d = dir("wire-huge-root");
+    let peers = d.join("peers");
+    let ids = paired_client(&peers);
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let s = session(&srv, &ids).await;
+    let job = [0x58u8; 16];
+    let big = big_data((2 << 20) + 3);
+    let m = Manifest {
+        entries: vec![file("big", big.len() as u64)],
+    };
+    let root = d.join("dest");
+    let mut link = s.job(job);
+    assert_eq!(open(&mut link, job, &root).await.status, 0);
+    srv.set_map_delay_ms(3000); // the FileRoots below wait in the inbox for the map
+    send_manifest(&link, job, &m).await;
+    let mut body = FileRoot {
+        job_id: job,
+        file_id: 0,
+        root: *blake3::hash(&big).as_bytes(),
+    }
+    .to_bytes()
+    .unwrap();
+    // The encoder's empty extension block, replaced by one unknown extension of 60 KiB.
+    body.truncate(body.len() - 2);
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0x7777u16.to_le_bytes());
+    body.extend_from_slice(&(60u32 << 10).to_le_bytes());
+    body.resize(body.len() + (60 << 10), 0xee);
+    for _ in 0..600 {
+        link.control
+            .send_raw(FileRoot::TYPE, 0, 0, body.clone())
+            .await
+            .unwrap();
+    }
+    let map: JobMap = next_of(&mut link, JobMap::TYPE).await.decode().unwrap();
+    srv.set_map_delay_ms(0);
+    assert_eq!(map.status, 0, "{:?}", map.message);
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let tx = link.lane(lane).unwrap().tx;
+    let mut off = 0;
+    let mut seq = 1;
+    while off < big.len() {
+        let end = (off + (1 << 20)).min(big.len());
+        tx.send_raw(Chunk::TYPE, 0, seq, chunk(job, 0, off, &big[off..end]))
+            .await
+            .unwrap();
+        seq += 1;
+        off = end;
+    }
+    let (_, done) = until_done(&mut link).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("big")).unwrap(), big);
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

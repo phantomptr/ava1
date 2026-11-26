@@ -21,7 +21,7 @@ use crate::gen::{
 };
 use crate::governor::{self, Class, Governor, GovernorOptions, JobSummary, Mode, Sample};
 use crate::manifest::Manifest;
-use crate::ranges::{from_runs, Need, RangeSet};
+use crate::ranges::{MapSeen, Need, RangeSet};
 use crate::router::{BoxFut, ConnTx, Inbound, JobLink, LaneOpener, LaneTx};
 use crate::source::{read_full_at, Source};
 use crate::verify::{self, FileHasher, Outboard, GROUP};
@@ -805,6 +805,7 @@ pub async fn open_upload(
         })
         .await?;
     let mut need = Need::default();
+    let mut seen = MapSeen::default();
     let mut credit = ack.credit;
     // The map may take a while (the receiver replays its journal first), but it is not allowed
     // to never come: the cancel is honoured and a receiver gone quiet ends the open.
@@ -857,7 +858,8 @@ pub async fn open_upload(
                 message: map.message.unwrap_or_default(),
             });
         }
-        need.add_page(&map);
+        need.add_page_bounded(&map, m, &mut seen)
+            .map_err(SendError::Protocol)?;
         if map.last == 1 {
             return Ok((credit, need));
         }
@@ -2063,8 +2065,20 @@ pub async fn run_upload(
                     },
                     Durable::TYPE => match f.decode::<Durable>() {
                         Ok(d) => {
+                            // The ids are the receiver's: only the manifest's count, and one
+                            // Durable names each at most once (disjoint runs), so a frame can
+                            // neither grow the set past the manifest nor make the loop long.
+                            let n = manifest.entries.len() as u64;
+                            let named: u64 = d.files.iter().map(|r| r.count as u64).sum();
+                            if named > n
+                                || d.files.iter().any(|r| r.first as u64 + r.count as u64 > n)
+                            {
+                                break Err(SendError::Protocol(format!(
+                                    "a Durable names files past the manifest's {n} entries"
+                                )));
+                            }
                             let mut s = sh.sched.lock().unwrap();
-                            for id in from_runs(&d.files) {
+                            for id in d.files.iter().flat_map(|r| r.first..r.first + r.count) {
                                 if durable_files.insert(id) {
                                     let size = manifest.entry(id).map_or(0, |e| e.size);
                                     pg.files_durable.fetch_add(1, Ordering::Relaxed);
@@ -2512,6 +2526,7 @@ async fn open_as_responder(
         .await
         .map_err(|e| SendError::Disconnected(e.to_string()))?;
     let mut need = Need::default();
+    let mut seen = MapSeen::default();
     loop {
         let f = next_ctl(link).await?;
         if f.ty != JobMap::TYPE {
@@ -2524,7 +2539,8 @@ async fn open_as_responder(
                 message: map.message.unwrap_or_default(),
             });
         }
-        need.add_page(&map);
+        need.add_page_bounded(&map, m, &mut seen)
+            .map_err(SendError::Protocol)?;
         if map.last == 1 {
             return Ok((open.credit.unwrap_or(16 << 20), need));
         }
@@ -3970,6 +3986,10 @@ mod tests {
         no_map: bool,
         /// Every lane frame's sequence number (its `channel`), in arrival order.
         seqs: Option<Arc<Mutex<Vec<u32>>>>,
+        /// The done runs the map reports (S4: a hostile one names files past the manifest).
+        map_done: Vec<gen::FileRun>,
+        /// A `Durable` sent right after the map.
+        durable_after_map: Option<Durable>,
     }
 
     impl Default for FakeReceiver {
@@ -3988,6 +4008,8 @@ mod tests {
                 cancel_seen: Arc::new(AtomicU32::new(0)),
                 no_map: false,
                 seqs: None,
+                map_done: vec![],
+                durable_after_map: None,
             }
         }
     }
@@ -4119,11 +4141,14 @@ mod tests {
                                 job_id: job,
                                 status: 0,
                                 last: 1,
-                                done: vec![],
+                                done: rcv.map_done.clone(),
                                 partial: vec![],
                                 message: None,
                                 held: None,
                             }).await.unwrap();
+                            if let Some(d) = &rcv.durable_after_map {
+                                let _ = peer_w.send_msg(0, d).await;
+                            }
                             if let Some(p) = rcv.pause_control {
                                 control_hold.as_mut().reset(tokio::time::Instant::now() + p);
                                 flood.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
@@ -5599,5 +5624,77 @@ mod tests {
             "{err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// S4: a hostile receiver's map or Durable names files the manifest does not have. Pre-fix
+    /// they were stored as they came (a run of 4 G ids, unbounded across pages); now the job
+    /// ends as a protocol error before anything is stored.
+    #[tokio::test]
+    async fn a_map_or_durable_naming_files_past_the_manifest_ends_the_job() {
+        for (tag, map_done, durable) in [
+            (
+                "map",
+                vec![gen::FileRun {
+                    first: 0,
+                    count: u32::MAX,
+                }],
+                None,
+            ),
+            (
+                "durable",
+                vec![],
+                Some(Durable {
+                    job_id: [0x7d; 16],
+                    files: vec![gen::FileRun {
+                        first: 1,
+                        count: u32::MAX - 1,
+                    }],
+                    ranges: vec![],
+                }),
+            ),
+        ] {
+            let size = 3 << 20;
+            let (mut link, _lane_seen, _keep) = fake_link(
+                FakeReceiver {
+                    credit: 64 << 20,
+                    credit_on_apply: true,
+                    done_when_complete: true,
+                    map_done,
+                    durable_after_map: durable,
+                    ..Default::default()
+                },
+                None,
+            );
+            let dir = std::env::temp_dir()
+                .join(format!("ava1-send-bogusmap-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("big"), vec![0x48u8; size]).unwrap();
+            let m = Arc::new(Manifest {
+                entries: vec![Entry {
+                    kind: gen::ENTRY_FILE,
+                    mode: 0o644,
+                    size: size as u64,
+                    mtime: 1,
+                    path: "big".into(),
+                    root: None,
+                }],
+            });
+            let r = tokio::time::timeout(
+                Duration::from_secs(20),
+                send_job(
+                    &mut link,
+                    m,
+                    Arc::new(crate::source::LocalSource::new(dir.clone())),
+                    SendOptions::upload("dest"),
+                ),
+            )
+            .await
+            .expect("the job ended within the bound");
+            assert!(
+                matches!(&r, Err(SendError::Protocol(msg)) if msg.contains("past the manifest")),
+                "{tag}: {r:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

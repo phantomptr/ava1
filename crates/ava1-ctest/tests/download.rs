@@ -436,12 +436,18 @@ fn a_received_during_the_send_leaves_the_frame_to_the_writer() {
     );
 }
 
-/// Minor 5: Credit.bytes is peer-controlled; a plain += wraps and shrinks the window.
+/// Minor 5: Credit.bytes is peer-controlled; a plain += wraps and shrinks the window. S4: and a
+/// window past 64 MiB is not used (frames in flight stay in memory until their Received).
 #[test]
-fn peer_credit_overflow_saturates_instead_of_wrapping() {
+fn peer_credit_overflow_saturates_at_the_window_cap_instead_of_wrapping() {
     let w = CSendWindow::new(u64::MAX / 2);
     w.credit(u64::MAX);
-    assert_eq!(w.state().credit, u64::MAX);
+    assert_eq!(w.state().credit, 64 << 20);
+    drop(w); // one window at a time (it holds the C sender's test state)
+    let w = CSendWindow::new(0);
+    w.credit(40 << 20);
+    w.credit(40 << 20);
+    assert_eq!(w.state().credit, 64 << 20);
 }
 
 /// Minor 6: a front frame larger than the credit no longer blocks a frame behind it
@@ -908,6 +914,97 @@ async fn a_job_map_after_the_last_page_changes_nothing() {
                 reason: 0,
             })
             .await;
+    })
+    .await
+    .expect("the test hung");
+}
+
+/// S4: the opener's map names files and bytes of the manifest the C sender sent, and nothing
+/// else. Pre-fix a run past the manifest was skipped silently and any number of pages of disjoint
+/// ranges was stored as it came (memory without bound); now such a map ends the job.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_map_past_the_manifest_ends_the_download() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        ava1_ctest::c_set_read_allowed(true);
+        let d = dir("dl-bad-map");
+        let src = d.join("console/tree");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![0x11u8; (2 << 20) + 5]).unwrap(); // 3 groups
+        let (me, mine) = paired_client(&d.join("peers"));
+        let srv = CServer::start_data(
+            SECRET,
+            &d.join("peers"),
+            &d.join("jobs"),
+            200,
+            2000,
+            2000,
+            0,
+        );
+        let s = connect(&srv.addr(), me, mine, "rust", calm())
+            .await
+            .unwrap();
+        let range = |offset, len| gen::FileRange {
+            file_id: 0,
+            offset,
+            len,
+        };
+        let bad: Vec<Vec<JobMap>> = vec![
+            vec![JobMap {
+                done: vec![gen::FileRun { first: 0, count: 2 }],
+                ..Default::default()
+            }],
+            vec![JobMap {
+                partial: vec![range(1 << 20, 2 << 20)],
+                ..Default::default()
+            }],
+            // four disjoint ranges of a three-group file, over two pages
+            vec![
+                JobMap {
+                    partial: vec![range(0, 1), range(10, 1)],
+                    ..Default::default()
+                },
+                JobMap {
+                    partial: vec![range(20, 1), range(30, 1)],
+                    ..Default::default()
+                },
+            ],
+        ];
+        for (i, pages) in bad.into_iter().enumerate() {
+            let job = [0x70 + i as u8; 16];
+            let mut link = s.job(job);
+            link.control
+                .send(&JobOpen {
+                    job_id: job,
+                    kind: gen::JOB_DOWNLOAD,
+                    root: src.to_str().unwrap().into(),
+                    credit: Some(64 << 20),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let ack: JobOpenAck = next_control_of(&mut link, JobOpenAck::TYPE)
+                .await
+                .decode()
+                .unwrap();
+            assert_eq!(ack.status, 0);
+            next_control_of(&mut link, ManifestEnd::TYPE).await;
+            let n = pages.len();
+            for (k, mut p) in pages.into_iter().enumerate() {
+                p.job_id = job;
+                p.last = u8::from(k + 1 == n);
+                link.control.send(&p).await.unwrap();
+            }
+            let done: gen::JobDone = next_control_of(&mut link, gen::JobDone::TYPE)
+                .await
+                .decode()
+                .unwrap();
+            assert_eq!(
+                done.status,
+                gen::ERR_PROTOCOL,
+                "case {i}: {:?}",
+                done.message
+            );
+        }
     })
     .await
     .expect("the test hung");
