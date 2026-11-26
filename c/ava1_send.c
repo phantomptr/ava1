@@ -856,7 +856,29 @@ ava1_job_t *ava1_send_open(const ava1_job_open_t *o, const uint8_t peer[32], ava
         snprintf(msg, cap, "%s: %s", root, strerror(errno));
         return NULL;
     }
-    ava1_job_free_one(o->job_id); /* a sender's state lives only in memory: start over */
+    /* A sender's state lives only in memory: a download of this id starts over. Only a download,
+     * and only this device's or one no session drives (as an upload moves to another device, #444):
+     * any other job under the id (an upload, a copy, a send to another console, a download another
+     * session is running) is not this JobOpen's to end. */
+    if ((j = ava1_job_find(o->job_id)) != NULL) {
+        int download, mine;
+        pthread_mutex_lock(&j->mu);
+        download = j->kind == AVA1_JOB_DOWNLOAD && !j->c2c;
+        mine = memcmp(j->owner, peer, 32) == 0;
+        pthread_mutex_unlock(&j->mu);
+        rc = download ? ava1_job_unlist(j, !mine) : 1;
+        ava1_job_put(j);
+        if (rc == 1) {
+            ack->status = AVA1_ERR_PROTOCOL;
+            snprintf(msg, cap, "another job is running under this id");
+            return NULL;
+        }
+        if (rc == -1) {
+            ack->status = AVA1_ERR_UNKNOWN_JOB;
+            snprintf(msg, cap, "this job belongs to another device");
+            return NULL;
+        }
+    }
     j = ava1_job_create(o->job_id, peer);
     s = j ? calloc(1, sizeof *s) : NULL;
     if (s) pthread_mutex_init(&s->pump_mu, NULL);

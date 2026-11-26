@@ -795,6 +795,99 @@ async fn a_file_root_during_a_new_manifest_waits_for_it_and_lands_on_the_new_fil
     assert_eq!(std::fs::read(root.join("b")).unwrap(), new);
 }
 
+fn download_msg(job: [u8; 16], src: &Path) -> JobOpen {
+    JobOpen {
+        job_id: job,
+        kind: gen::JOB_DOWNLOAD,
+        root: src.to_str().unwrap().into(),
+        ..Default::default()
+    }
+}
+
+/// S2: a download JobOpen starts over only a download of its id, and only the device's own or
+/// one no session drives. Pre-fix it freed whatever job had the id: another device's upload or
+/// running download.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_open_never_ends_another_job_under_its_id() {
+    ava1_ctest::c_set_read_allowed(true);
+    let d = dir("wire-dl-id");
+    let peers = d.join("peers");
+    let a_ids = paired_client(&peers);
+    let b_ids = paired_client(&peers);
+    let src = d.join("console/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"data").unwrap();
+    let srv = CServer::start_data(SECRET, &peers, &d.join("jobs"), 200, 2000, 2000, 0);
+    let a = session(&srv, &a_ids).await;
+    let b = session(&srv, &b_ids).await;
+
+    // A's upload, mapped and waiting for its bytes.
+    let up = [0x5bu8; 16];
+    let root = d.join("dest");
+    let mut la = a.job(up);
+    assert_eq!(open(&mut la, up, &root).await.status, 0);
+    let m = Manifest {
+        entries: vec![file("x", 2)],
+    };
+    send_manifest(&la, up, &m).await;
+    let map: JobMap = next_of(&mut la, JobMap::TYPE).await.decode().unwrap();
+    assert_eq!(map.status, 0);
+    // B opens a download under the same id: refused, and A's upload is untouched.
+    let mut lb = b.job(up);
+    lb.control.send(&download_msg(up, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_PROTOCOL, "{:?}", ack.message);
+    let lane = la.opener().unwrap().open().await.unwrap();
+    la.lane(lane)
+        .unwrap()
+        .tx
+        .send_raw(Bundle::TYPE, 0, 1, bundle(up, 0, b"ok"))
+        .await
+        .unwrap();
+    let (_, done) = until_done(&mut la).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(root.join("x")).unwrap(), b"ok");
+
+    // A's download, running on A's session: B cannot take it over...
+    let dl = [0x5au8; 16];
+    let mut la = a.job(dl);
+    la.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut la, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, 0, "{:?}", ack.message);
+    let mut lb = b.job(dl);
+    lb.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, gen::ERR_UNKNOWN_JOB, "{:?}", ack.message);
+    drop(lb);
+    // ... A itself starts it over from another session (a reconnect)...
+    let a2 = session(&srv, &a_ids).await;
+    let mut la2 = a2.job(dl);
+    la2.control.send(&download_msg(dl, &src)).await.unwrap();
+    let ack: JobOpenAck = next_of(&mut la2, JobOpenAck::TYPE).await.decode().unwrap();
+    assert_eq!(ack.status, 0, "{:?}", ack.message);
+    // ... and once no session drives it, B may take it over.
+    drop(la2);
+    drop(a2);
+    let t = Instant::now();
+    loop {
+        let mut lb = b.job(dl);
+        lb.control.send(&download_msg(dl, &src)).await.unwrap();
+        let ack: JobOpenAck = next_of(&mut lb, JobOpenAck::TYPE).await.decode().unwrap();
+        if ack.status == 0 {
+            break;
+        }
+        assert!(
+            ack.status == gen::ERR_UNKNOWN_JOB || ack.status == gen::ERR_BUSY,
+            "{} {:?}",
+            ack.status,
+            ack.message
+        );
+        assert!(t.elapsed() < Duration::from_secs(20), "never parked");
+        drop(lb);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// A manifest need not list a file's parent folders (SPEC.md §15.1). In a merge, a folder of the
 /// destination that is a symbolic link must not lead the job's files out of it (§15.5): the map
 /// refuses the job with ERR_PATH, and nothing lands where the link points.

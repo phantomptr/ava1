@@ -334,6 +334,10 @@ int ava1_job_retire(ava1_job_t *j);
  * caller's reference. 0 = retired; -1 = a session is attached to it; -2 = someone else holds
  * it for the moment or its files are still settling (try again). */
 int ava1_job_retire_parked(ava1_job_t *j);
+/* Unlists `j` itself (never another job that holds its id by then) and drops the table's
+ * reference; the caller's stays, and its ava1_job_put may free the job. parked_only: not while a
+ * session drives it. 0 = unlisted; -1 = a session is attached to it; -2 = it was no longer listed. */
+int ava1_job_unlist(ava1_job_t *j, int parked_only);
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 /* Control-frame bytes queued across all jobs (their inboxes and the frames behind a
